@@ -248,6 +248,20 @@ service cloud.firestore {
       allow delete: if isValidId(identityId) && isAdmin();
     }
 
+    // Encrypted biometric templates. Plain biometric vectors are never written to Firestore.
+    match /biometric_vault/{identityRef} {
+      allow get: if isValidId(identityRef) && isOperatorOrAbove();
+      allow list: if isOperatorOrAbove();
+      allow create, update: if isValidId(identityRef) && isOperatorOrAbove() &&
+        request.resource.data.keys().hasAll(['identityRef', 'encryptedPayload', 'updatedAt']) &&
+        request.resource.data.keys().hasOnly(['identityRef', 'encryptedPayload', 'updatedAt']) &&
+        request.resource.data.identityRef == identityRef &&
+        request.resource.data.encryptedPayload is string &&
+        request.resource.data.encryptedPayload.size() <= 900000 &&
+        request.resource.data.updatedAt is timestamp;
+      allow delete: if isValidId(identityRef) && isAdmin();
+    }
+
     match /verification_records/{verificationId} {
       allow get: if isValidId(verificationId) && (isAnalystOrAdmin() || (isVerifiedUser() && resource.data.operatorUid == request.auth.uid));
       allow list: if isAnalystOrAdmin() || (isVerifiedUser() && resource.data.operatorUid == request.auth.uid);
