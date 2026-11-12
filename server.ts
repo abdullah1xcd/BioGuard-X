@@ -3,8 +3,6 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
-import { initializeApp as initAdminApp, getApps as getAdminApps } from 'firebase-admin/app';
-import { getAuth as getAdminAuth, type DecodedIdToken } from 'firebase-admin/auth';
 import { GoogleGenAI } from '@google/genai';
 
 interface FirebaseConfig {
@@ -17,10 +15,6 @@ interface FirebaseConfig {
 const rootDir = process.cwd();
 const firebaseConfigPath = path.join(rootDir, 'firebase-applet-config.json');
 const firebaseConfig: FirebaseConfig = JSON.parse(fs.readFileSync(firebaseConfigPath, 'utf8'));
-
-if (getAdminApps().length === 0) {
-  initAdminApp({ projectId: firebaseConfig.projectId });
-}
 
 const FEATURE_VERSION = 'v1.1-classical-liveness';
 const BOOTSTRAPPED_ADMIN_EMAIL = 'abdullahmohamedharoon8@gmail.com';
@@ -475,7 +469,7 @@ interface AuthedRequest extends Request {
     role: Role;
     status: string;
     idToken: string;
-    decoded: DecodedIdToken;
+    decoded: { uid: string; email?: string; email_verified?: boolean };
   };
 }
 
@@ -512,7 +506,20 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
     return;
   }
   try {
-    const decoded = await getAdminAuth().verifyIdToken(idToken);
+    const lookup = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken }),
+    });
+    if (!lookup.ok) throw new Error('Firebase rejected the ID token.');
+    const lookupPayload = await lookup.json() as { users?: Array<{ localId: string; email?: string; emailVerified?: boolean }> };
+    const firebaseUser = lookupPayload.users?.[0];
+    if (!firebaseUser?.localId) throw new Error('Firebase user was not found for this ID token.');
+    const decoded = {
+      uid: firebaseUser.localId,
+      email: firebaseUser.email,
+      email_verified: firebaseUser.emailVerified === true,
+    };
     if (!decoded.email_verified) {
       res.status(403).json({ error: 'email_not_verified', message: 'Verified Google account email is required.' });
       return;
@@ -1245,4 +1252,8 @@ async function startServer() {
   });
 }
 
-startServer();
+if (process.env.VERCEL !== '1') {
+  void startServer();
+}
+
+export default app;
