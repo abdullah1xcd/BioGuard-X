@@ -1239,7 +1239,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distDir = path.join(rootDir, 'public');
+    const distDir = path.join(rootDir, 'dist');
     app.use(express.static(distDir));
     app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.join(distDir, 'index.html'));
