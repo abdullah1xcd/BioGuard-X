@@ -88,30 +88,19 @@ interface ModalityQualityInput {
   };
 }
 
-// AES-256-GCM Encrypted Server-Side Biometric Vault
-const dataDir = path.join(rootDir, 'data');
-const vaultFile = path.join(dataDir, 'biometric_vault.enc.json');
-const keyFile = path.join(dataDir, '.vault.key');
-
-function ensureVaultKey(): Buffer {
-  fs.mkdirSync(dataDir, { recursive: true });
-  const envSecret = process.env.BIOGUARD_VAULT_SECRET;
-  if (envSecret && envSecret.trim().length >= 16) {
-    return crypto.scryptSync(envSecret.trim(), 'bioguard-x-salt-v1', 32);
+// AES-256-GCM encrypted biometric templates stored durably in Firestore.
+// Vercel function filesystems are ephemeral; never persist biometric templates on local disk.
+function getVaultKey(): Buffer {
+  const envSecret = process.env.BIOGUARD_VAULT_SECRET?.trim();
+  if (!envSecret || envSecret.length < 32) {
+    throw new Error('BIOGUARD_VAULT_SECRET must be configured (at least 32 characters).');
   }
-  if (fs.existsSync(keyFile)) {
-    return Buffer.from(fs.readFileSync(keyFile, 'utf8').trim(), 'hex');
-  }
-  const generated = crypto.randomBytes(32);
-  fs.writeFileSync(keyFile, generated.toString('hex'), { mode: 0o600 });
-  return generated;
+  return crypto.scryptSync(envSecret, 'bioguard-x-salt-v1', 32);
 }
-
-const vaultKey = ensureVaultKey();
 
 function encryptVaultMap(map: Record<string, VaultEntry>): string {
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', vaultKey, iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', getVaultKey(), iv);
   const plaintext = Buffer.from(JSON.stringify(map), 'utf8');
   const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
@@ -127,7 +116,7 @@ function decryptVaultMap(raw: string): Record<string, VaultEntry> {
   const parsed = JSON.parse(raw) as { iv: string; tag: string; ciphertext: string };
   const decipher = crypto.createDecipheriv(
     'aes-256-gcm',
-    vaultKey,
+    getVaultKey(),
     Buffer.from(parsed.iv, 'base64')
   );
   decipher.setAuthTag(Buffer.from(parsed.tag, 'base64'));
@@ -138,18 +127,62 @@ function decryptVaultMap(raw: string): Record<string, VaultEntry> {
   return JSON.parse(dec.toString('utf8')) as Record<string, VaultEntry>;
 }
 
-function loadVault(): Record<string, VaultEntry> {
-  if (!fs.existsSync(vaultFile)) return {};
-  try {
-    return decryptVaultMap(fs.readFileSync(vaultFile, 'utf8'));
-  } catch {
-    return {};
+async function loadVault(idToken: string): Promise<Record<string, VaultEntry>> {
+  const url = `${firestoreDocUrl('biometric_vault')}?pageSize=1000`;
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${idToken}` } });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(`Firestore vault read failed (${response.status}): ${detail.slice(0, 300)}`);
   }
+  const payload = await response.json() as {
+    documents?: Array<{ fields?: { encryptedPayload?: { stringValue?: string } } }>;
+  };
+  const vault: Record<string, VaultEntry> = {};
+  for (const document of payload.documents || []) {
+    const encryptedPayload = document.fields?.encryptedPayload?.stringValue;
+    if (!encryptedPayload) continue;
+    Object.assign(vault, decryptVaultMap(encryptedPayload));
+  }
+  return vault;
 }
 
-function saveVault(map: Record<string, VaultEntry>): void {
-  fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(vaultFile, encryptVaultMap(map), { mode: 0o600 });
+async function saveVault(
+  map: Record<string, VaultEntry>,
+  idToken: string,
+  previous: Record<string, VaultEntry> = {}
+): Promise<void> {
+  const headers = {
+    Authorization: `Bearer ${idToken}`,
+    'Content-Type': 'application/json',
+  };
+  for (const [identityRef, entry] of Object.entries(map)) {
+    if (previous[identityRef] && JSON.stringify(previous[identityRef]) === JSON.stringify(entry)) continue;
+    const url = firestoreDocUrl(`biometric_vault/${encodeURIComponent(identityRef)}`);
+    const response = await fetch(url, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({
+        fields: {
+          identityRef: { stringValue: identityRef },
+          encryptedPayload: { stringValue: encryptVaultMap({ [identityRef]: entry }) },
+          updatedAt: { timestampValue: new Date().toISOString() },
+        },
+      }),
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(`Firestore vault write failed (${response.status}): ${detail.slice(0, 300)}`);
+    }
+  }
+  for (const identityRef of Object.keys(previous)) {
+    if (map[identityRef]) continue;
+    const url = firestoreDocUrl(`biometric_vault/${encodeURIComponent(identityRef)}`);
+    const response = await fetch(url, { method: 'DELETE', headers });
+    if (!response.ok && response.status !== 404) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(`Firestore vault delete failed (${response.status}): ${detail.slice(0, 300)}`);
+    }
+  }
 }
 
 // Classical Biometric Math (server-side authoritative matching)
@@ -528,15 +561,24 @@ function requireCapability(capability: string) {
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
+const asyncHandler = (
+  handler: (req: AuthedRequest, res: Response) => Promise<void>
+) => (req: Request, res: Response, next: NextFunction) => {
+  Promise.resolve(handler(req as AuthedRequest, res)).catch(next);
+};
+
+
+
 // 1. Health Endpoint
 app.get('/api/v1/health', (_req: Request, res: Response) => {
-  const vault = loadVault();
-  res.json({
-    status: 'ok',
+  const vaultConfigured = Boolean(process.env.BIOGUARD_VAULT_SECRET && process.env.BIOGUARD_VAULT_SECRET.trim().length >= 32);
+  res.status(vaultConfigured ? 200 : 503).json({
+    status: vaultConfigured ? 'ok' : 'degraded',
     service: 'bioguard-x-api',
     feature_version: FEATURE_VERSION,
-    vault_ready: true,
-    encrypted_identities: Object.keys(vault).length,
+    vault_ready: vaultConfigured,
+    storage: 'firestore-encrypted-templates',
+    encrypted_identities: null,
     firebase_project: firebaseConfig.projectId,
     firestore_database: firebaseConfig.firestoreDatabaseId,
     gemini_configured: Boolean(process.env.GEMINI_API_KEY),
@@ -562,7 +604,7 @@ app.post(
   requireAuth,
   requireCapability('create_identity'),
   rateLimit(25, 60_000),
-  (req: AuthedRequest, res: Response) => {
+  asyncHandler(async (req: AuthedRequest, res: Response) => {
     const requestId = `req_${crypto.randomUUID().slice(0, 12)}`;
     const body = req.body as {
       identityRef?: string;
@@ -617,7 +659,8 @@ app.post(
       return;
     }
 
-    const vault = loadVault();
+    const previousVault = await loadVault(req.auth!.idToken);
+    const vault = { ...previousVault };
     const existing = vault[identityRef];
     const now = new Date().toISOString();
     const entry: VaultEntry = existing || {
@@ -635,7 +678,7 @@ app.post(
     if (fpVec) entry.modalities.fingerprint = [...(entry.modalities.fingerprint || []).slice(-4), fpVec];
 
     vault[identityRef] = entry;
-    saveVault(vault);
+    await saveVault(vault, req.auth!.idToken, previousVault);
 
     const registeredModalities = Object.keys(entry.modalities).filter(
       (m) => (entry.modalities[m as keyof typeof entry.modalities]?.length || 0) > 0
@@ -651,7 +694,7 @@ app.post(
       encryptedAt: now,
       requestId,
     });
-  }
+  })
 );
 
 // 4. Multimodal Biometric Verification (Quality + Liveness + Fusion + Adaptive Risk Engine)
@@ -660,7 +703,7 @@ app.post(
   requireAuth,
   requireCapability('perform_verification'),
   rateLimit(40, 60_000),
-  (req: AuthedRequest, res: Response) => {
+  asyncHandler(async (req: AuthedRequest, res: Response) => {
     const requestId = `ver_${crypto.randomUUID().slice(0, 12)}`;
     const body = req.body as {
       identityRef?: string;
@@ -679,7 +722,7 @@ app.post(
       return;
     }
 
-    const vault = loadVault();
+    const vault = await loadVault(req.auth!.idToken);
     const entry = vault[identityRef];
     if (!entry) {
       res.status(404).json({
@@ -955,13 +998,13 @@ app.post(
       featureVersion: FEATURE_VERSION,
       requestId,
     });
-  }
+  })
 );
 
 // 5. Vault Identity Status & Admin Deletion
-app.get('/api/v1/identities/:identityRef/vault', requireAuth, requireCapability('view_identities'), (req: AuthedRequest, res: Response) => {
+app.get('/api/v1/identities/:identityRef/vault', requireAuth, requireCapability('view_identities'), asyncHandler(async (req: AuthedRequest, res: Response) => {
   const identityRef = String(req.params.identityRef || '');
-  const vault = loadVault();
+  const vault = await loadVault(req.auth!.idToken);
   const entry = vault[identityRef];
   if (!entry) {
     res.json({ identityRef, inVault: false, modalities: [] });
@@ -978,19 +1021,20 @@ app.get('/api/v1/identities/:identityRef/vault', requireAuth, requireCapability(
     updatedAt: entry.updatedAt,
     modalities,
   });
-});
+}));
 
-app.delete('/api/v1/identities/:identityRef', requireAuth, requireCapability('delete_identity'), (req: AuthedRequest, res: Response) => {
+app.delete('/api/v1/identities/:identityRef', requireAuth, requireCapability('delete_identity'), asyncHandler(async (req: AuthedRequest, res: Response) => {
   const identityRef = String(req.params.identityRef || '');
-  const vault = loadVault();
+  const previousVault = await loadVault(req.auth!.idToken);
+  const vault = { ...previousVault };
   if (!vault[identityRef]) {
     res.status(404).json({ error: 'not_found', message: 'Identity not present in biometric vault.' });
     return;
   }
   delete vault[identityRef];
-  saveVault(vault);
+  await saveVault(vault, req.auth!.idToken, previousVault);
   res.json({ status: 'deleted_from_vault', identityRef });
-});
+}));
 
 // 6. Server-Verified Admin Role & Status Management
 app.post(
@@ -1171,6 +1215,14 @@ app.post(
     }
   }
 );
+
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  console.error('BioGuard X API request failed:', err);
+  res.status(503).json({
+    error: 'backend_unavailable',
+    message: 'The backend could not complete this request. Check the Vercel function and Firestore configuration.',
+  });
+});
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
