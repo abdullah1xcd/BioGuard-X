@@ -1,0 +1,6 @@
+{
+  "name": "BioGuard X",
+  "description": "Intelligent Adaptive Multimodal Biometric Security & Automation Platform built with pure HTML, CSS, and JavaScript.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

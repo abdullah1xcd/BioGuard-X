@@ -1,0 +1,885 @@
+I’ll give you one **complete master prompt** to paste into **Google AI Studio Build mode (Gemini)**. It covers rebuilding and completing BioGuard X from the beginning, connecting Firebase, Google sign-in, Gemini AI, the database, and all application modules.
+
+I checked your actual GitHub branch. One important distinction: the existing project already has biometric enrollment and verification APIs, but several dashboard modules are currently UI previews without working backend endpoints. The prompt explicitly tells Gemini to implement those missing features instead of pretending they already work.
+
+**Source repository**  (Target branch)
+
+BioGuard X — ai-studio/import-compatibility
+
+## Master prompt — copy everything below
+
+\# BIOGUARD X — COMPLETE APPLICATION DEVELOPMENT MASTER PROMPT\
+\
+You are a senior full-stack software architect, AI engineer, biometric machine-learning engineer, Firebase specialist, cybersecurity engineer, and UI/UX designer.\
+\
+Your task is to inspect, rebuild, complete, integrate, test, and prepare \*\*BioGuard X — Hierarchical Multimodal Biometric Verification System\*\* as a fully functional, secure, modern web application.\
+\
+This is a real software engineering project, not a visual prototype.\
+\
+\## 1. SOURCE CODE AND PROJECT AUTHORITY\
+\
+Use this GitHub repository and branch as your primary source:\
+\
+Repository:\
+https\://github.com/abdullah1xcd/-BioGuard-X-Hierarchical-Multimodal-Biometric-Verification-System-\
+\
+Branch:\
+ai-studio/import-compatibility\
+\
+First:\
+\- Inspect the complete repository and all folders.\
+\- Read the README, API documentation, frontend integration contract, build status, ML pipeline documentation, and deployment configuration.\
+\- Understand the existing architecture before modifying anything.\
+\- Identify all existing features, unfinished features, broken integrations, and missing components.\
+\- Preserve working code and existing functionality.\
+\- Do not replace the existing project with a generic dashboard.\
+\- Do not delete existing biometric algorithms or silently replace them with mock implementations.\
+\
+The existing frontend uses Vanilla HTML, CSS, and JavaScript. The backend uses Python FastAPI and traditional machine-learning feature extraction.\
+\
+You may improve the architecture where necessary, but preserve compatibility with the original functionality.\
+\
+\## 2. MAIN OBJECTIVE\
+\
+Deliver a complete BioGuard X platform with:\
+\
+1\. Google account authentication.\
+2\. Firebase Authentication.\
+3\. Firebase Firestore database for application metadata.\
+4\. Secure user profiles and role-based permissions.\
+5\. Gemini AI integration.\
+6\. Biometric identity enrollment.\
+7\. Face verification.\
+8\. Voice verification.\
+9\. Fingerprint verification.\
+10\. Multimodal biometric fusion.\
+11\. Hierarchical verification workflow.\
+12\. Identity management.\
+13\. Security analytics.\
+14\. Threat intelligence.\
+15\. Automation center.\
+16\. Audit trail.\
+17\. Access control and permissions.\
+18\. Notifications.\
+19\. System settings.\
+20\. Responsive administration dashboard.\
+21\. Secure backend integration.\
+22\. Complete testing and deployment documentation.\
+\
+Every feature must have real functionality, appropriate backend integration, validation, loading states, error handling, and database persistence where applicable.\
+\
+Do not label an unfinished feature as completed.\
+\
+\## 3. GOOGLE ACCOUNT AND FIREBASE AUTHENTICATION\
+\
+Implement Firebase Authentication with Google Sign-In.\
+\
+Users must be able to:\
+\- Sign in using their Google account.\
+\- Sign out securely.\
+\- Maintain authenticated sessions.\
+\- View their account profile.\
+\- View their Google display name.\
+\- View their Google email address.\
+\- View their Google profile photo.\
+\- Update permitted application profile fields.\
+\- Change their application preferences.\
+\- See their assigned application role.\
+\- Access only the pages and records their role permits.\
+\
+Use Firebase Authentication as the identity provider.\
+\
+Use only the Google account information explicitly provided by Firebase Authentication after the user authorizes sign-in.\
+\
+Do not attempt to access Gmail, Google Drive, contacts, private Google account data, or unrelated Google services.\
+\
+Implement:\
+\- Authentication state management.\
+\- Protected routes/pages.\
+\- Session persistence.\
+\- Login and logout.\
+\- Unauthorized-access handling.\
+\- User provisioning after first login.\
+\- Admin-controlled user roles.\
+\- Account status management.\
+\
+Roles:\
+\- Super Admin\
+\- Administrator\
+\- Security Analyst\
+\- Operator\
+\- Viewer\
+\
+Use server-verified Firebase ID tokens for protected backend operations.\
+\
+Never trust a role or permission sent by the browser. Verify authorization on the server.\
+\
+Do not allow users to assign themselves administrator privileges.\
+\
+\## 4. FIREBASE DATABASE ARCHITECTURE\
+\
+Use Firebase Firestore as the primary application metadata database.\
+\
+Design a structured and scalable database.\
+\
+Suggested collections:\
+\
+users\
+\- uid\
+\- displayName\
+\- email\
+\- photoURL\
+\- role\
+\- status\
+\- createdAt\
+\- lastLoginAt\
+\- preferences\
+\
+organizations\
+\- organizationId\
+\- name\
+\- status\
+\- createdAt\
+\
+identities\
+\- identityId\
+\- identityRef\
+\- displayName\
+\- email\
+\- status\
+\- registeredModalities\
+\- createdBy\
+\- createdAt\
+\- updatedAt\
+\
+verification_records\
+\- verificationId\
+\- identityRef\
+\- modalities\
+\- outcome\
+\- policyDecision\
+\- reasonCode\
+\- operatorUid\
+\- createdAt\
+\
+audit_logs\
+\- eventId\
+\- actorUid\
+\- action\
+\- resourceType\
+\- resourceId\
+\- result\
+\- timestamp\
+\- requestId\
+\
+notifications\
+\- notificationId\
+\- userUid\
+\- title\
+\- message\
+\- type\
+\- read\
+\- createdAt\
+\
+security_alerts\
+\- alertId\
+\- severity\
+\- category\
+\- description\
+\- status\
+\- assignedTo\
+\- createdAt\
+\
+automation_workflows\
+\- workflowId\
+\- name\
+\- description\
+\- enabled\
+\- trigger\
+\- actions\
+\- createdAt\
+\
+system_settings\
+\- settingId\
+\- configuration\
+\- updatedAt\
+\- updatedBy\
+\
+These are proposed application metadata schemas. Inspect the actual project and adapt them without breaking existing API contracts.\
+\
+\### Critical biometric database security\
+\
+Do not store raw face images, voice recordings, fingerprint images, biometric feature vectors, or encryption keys in Firestore.\
+\
+The existing Python API encrypts biometric feature templates and stores them in persistent database storage.\
+\
+Preserve this architecture.\
+\
+Keep encrypted biometric templates in the existing secure backend database unless a separately reviewed migration architecture is implemented.\
+\
+Use Firestore for application metadata, account profiles, roles, notifications, dashboard records, and non-sensitive operational information.\
+\
+Never store:\
+\- Firebase Admin private keys in frontend code.\
+\- Gemini API keys in frontend code.\
+\- Database passwords in frontend code.\
+\- Biometric encryption keys in Firestore.\
+\- Operator bearer tokens in Firestore.\
+\- Raw biometric samples in audit logs.\
+\
+\## 5. FIREBASE SECURITY\
+\
+Configure:\
+\- Firebase Authentication.\
+\- Cloud Firestore.\
+\- Firestore Security Rules.\
+\- Firebase Admin SDK on the trusted server.\
+\- Server-side role validation.\
+\- Ownership validation.\
+\- Protected database operations.\
+\- Input validation.\
+\- Rate limiting for sensitive operations.\
+\- Audit logging.\
+\- Secure environment variables.\
+\
+Use deny-by-default Firestore rules.\
+\
+Users must only access records they are authorized to access.\
+\
+Administrative permissions must be checked server-side.\
+\
+Do not use public Firestore rules such as allow read, write: if true.\
+\
+If Firebase App Check is appropriate for the selected frontend and backend architecture, implement it.\
+\
+Explain any Firebase project setup steps that require the project owner.\
+\
+\## 6. GEMINI AI INTEGRATION\
+\
+Integrate the Gemini API using a secure server-side implementation.\
+\
+Use Gemini for legitimate administrative and analytical assistance.\
+\
+Create a BioGuard AI Assistant that can:\
+\- Explain platform status.\
+\- Summarize security events.\
+\- Summarize audit records.\
+\- Explain verification results.\
+\- Explain system health.\
+\- Identify operational anomalies in available metadata.\
+\- Help administrators understand system configuration.\
+\- Generate reports from authorized records.\
+\- Answer questions about BioGuard X functionality.\
+\- Assist security analysts with investigation summaries.\
+\
+Create an AI assistant interface inside the dashboard.\
+\
+Include:\
+\- Chat interface.\
+\- Conversation history.\
+\- Loading states.\
+\- Error handling.\
+\- Clear AI-generated content labels.\
+\- Context-aware responses based on the authenticated user's permissions.\
+\
+Gemini must never:\
+\- Invent biometric verification results.\
+\- Change a verification result.\
+\- Grant or deny physical access.\
+\- Override authorization rules.\
+\- Access unauthorized user data.\
+\- Claim a model is accurate without real evaluation evidence.\
+\
+Keep Gemini API keys server-side.\
+\
+Use a supported Gemini model available to the configured Google AI project. Do not hardcode an obsolete model name.\
+\
+If a model is unavailable, provide a clear configuration error instead of silently substituting a fake response.\
+\
+\## 7. BIOMETRIC ENROLLMENT\
+\
+Complete the existing identity enrollment workflow.\
+\
+Support:\
+\
+\### Face\
+\- Upload face image.\
+\- Validate file format and size.\
+\- Validate that the image is decodable.\
+\- Extract the existing HOG and LBP features.\
+\- Encrypt the extracted feature vector.\
+\- Store the encrypted template using the existing backend.\
+\
+\### Voice\
+\- Upload or record voice sample where supported.\
+\- Validate audio format.\
+\- Validate duration and sample rate.\
+\- Extract the existing MFCC-style, ZCR, and RMS features.\
+\- Encrypt the extracted feature vector.\
+\- Store the encrypted template.\
+\
+\### Fingerprint\
+\- Upload fingerprint image.\
+\- Validate image format and size.\
+\- Extract the existing Gabor texture features.\
+\- Encrypt the extracted feature vector.\
+\- Store the encrypted template.\
+\
+Support selecting one, two, or three modalities.\
+\
+Require appropriate consent and authorization.\
+\
+Show:\
+\- Enrollment progress.\
+\- Selected modalities.\
+\- Validation results.\
+\- API response.\
+\- Enrollment reference.\
+\- Error messages.\
+\- Audit confirmation.\
+\
+Do not claim that an identity was enrolled unless the backend confirms it.\
+\
+\## 8. BIOMETRIC VERIFICATION\
+\
+Complete the existing multimodal verification workflow.\
+\
+Support:\
+\- Face verification.\
+\- Voice verification.\
+\- Fingerprint verification.\
+\- Face + voice.\
+\- Face + fingerprint.\
+\- Voice + fingerprint.\
+\- Face + voice + fingerprint.\
+\
+Preserve the existing feature extraction and model compatibility.\
+\
+Implement the actual backend integration rather than frontend-only calculations.\
+\
+The existing API routes are:\
+\
+GET /api/v1/health\
+\
+POST /api/v1/identities/enroll\
+\
+POST /api/v1/verification/multimodal\
+\
+Follow the actual request and response contract documented in the repository.\
+\
+Use authenticated requests.\
+\
+Handle:\
+\- Invalid credentials.\
+\- Missing identity.\
+\- Invalid sample.\
+\- Unsupported modality.\
+\- Missing enrollment template.\
+\- Feature version mismatch.\
+\- Missing model artifact.\
+\- Database errors.\
+\- Timeout.\
+\- Server errors.\
+\
+Only display confirmed API results.\
+\
+The current backend may return:\
+\- match\
+\- no_match\
+\- not_evaluated\
+\
+Keep policy_decision as pending.\
+\
+Never turn an experimental model result into a physical access grant or denial.\
+\
+\## 9. MACHINE LEARNING AND BIOMETRIC ENGINE\
+\
+Preserve the existing traditional machine-learning implementation.\
+\
+Existing feature extraction:\
+\
+\- Face: HOG + LBP.\
+\- Voice: MFCC-style statistics + Zero Crossing Rate + RMS.\
+\- Fingerprint: Gabor texture statistics.\
+\
+Existing model concepts:\
+\- SVM.\
+\- Random Forest.\
+\- Early fusion.\
+\- Hierarchical verification.\
+\- Optional three-modality fusion.\
+\
+Inspect:\
+src/bioguard_ml.py\
+\
+Preserve the existing feature-version compatibility.\
+\
+Implement or improve:\
+\- Training pipeline.\
+\- Model evaluation.\
+\- Validation.\
+\- Feature extraction consistency.\
+\- Model artifact version checks.\
+\- Evaluation reports.\
+\- Confusion matrix.\
+\- Precision.\
+\- Recall.\
+\- F1 score.\
+\- ROC/AUC when appropriate.\
+\- FAR and FRR when valid test data permits.\
+\- EER when valid test data permits.\
+\
+Do not fabricate accuracy values.\
+\
+Do not generate fake training results.\
+\
+Clearly distinguish synthetic test data from real biometric evaluation.\
+\
+Do not load untrusted joblib model artifacts.\
+\
+Do not introduce deep-learning identity models unless explicitly justified, separately implemented, and properly evaluated.\
+\
+\## 10. IDENTITY MANAGEMENT\
+\
+Implement a complete identity directory.\
+\
+Features:\
+\- List identities.\
+\- Search identities.\
+\- Filter identities.\
+\- View identity profiles.\
+\- View registered modalities.\
+\- View enrollment date.\
+\- View identity status.\
+\- View relevant audit history.\
+\- Update permitted metadata.\
+\- Deactivate identities.\
+\- Reactivate identities where authorized.\
+\- Delete records only through a controlled, audited deletion workflow.\
+\
+Support pagination and proper empty states.\
+\
+Do not expose biometric templates to ordinary dashboard users.\
+\
+\## 11. SECURITY ANALYTICS\
+\
+Implement a functional analytics module.\
+\
+Display actual database-backed information:\
+\- Total identities.\
+\- Total verification requests.\
+\- Successful experimental matches.\
+\- No-match results.\
+\- Not-evaluated results.\
+\- Verification trends.\
+\- Modality usage.\
+\- Enrollment activity.\
+\- Recent operational events.\
+\
+Include date filters and export options where authorized.\
+\
+Never calculate fake statistics from hardcoded arrays.\
+\
+Clearly identify missing or insufficient data.\
+\
+\## 12. THREAT INTELLIGENCE\
+\
+Implement a security investigation workspace.\
+\
+Features:\
+\- Security alerts.\
+\- Severity levels.\
+\- Alert status.\
+\- Assignment to analysts.\
+\- Investigation notes.\
+\- Timestamps.\
+\- Related audit events.\
+\- Search and filters.\
+\
+AI may summarize available information but must not invent threats or claim that a threat has been confirmed without evidence.\
+\
+\## 13. AUTOMATION CENTER\
+\
+Implement an automation management module.\
+\
+Features:\
+\- Create workflows.\
+\- Edit workflows.\
+\- Enable and disable workflows.\
+\- Configure triggers.\
+\- Configure permitted actions.\
+\- View workflow execution history.\
+\- View execution errors.\
+\- Audit workflow changes.\
+\
+Do not implement dangerous automatic access decisions.\
+\
+Require appropriate administrator authorization for sensitive workflow changes.\
+\
+\## 14. AUDIT TRAIL\
+\
+Implement searchable, persistent audit records.\
+\
+Record:\
+\- User sign-ins.\
+\- Sign-outs where available.\
+\- Enrollment operations.\
+\- Verification requests.\
+\- Verification outcomes.\
+\- Administrative actions.\
+\- Permission changes.\
+\- Account status changes.\
+\- Settings changes.\
+\- Automation changes.\
+\- Security events.\
+\
+Include:\
+\- Actor.\
+\- Timestamp.\
+\- Action.\
+\- Resource.\
+\- Outcome.\
+\- Request ID.\
+\
+Protect audit records from unauthorized modification.\
+\
+Never record raw biometric samples, secrets, encryption keys, bearer tokens, or unnecessary sensitive personal information.\
+\
+\## 15. ACCESS CONTROL\
+\
+Implement role-based access control.\
+\
+Create a permission matrix for:\
+\
+\- Viewing identities.\
+\- Creating identities.\
+\- Editing identities.\
+\- Deactivating identities.\
+\- Performing verification.\
+\- Viewing analytics.\
+\- Viewing audit logs.\
+\- Managing security alerts.\
+\- Managing workflows.\
+\- Managing users.\
+\- Managing roles.\
+\- Changing system configuration.\
+\
+Enforce permissions in the backend, not just by hiding frontend buttons.\
+\
+\## 16. NOTIFICATIONS\
+\
+Implement:\
+\- In-app notifications.\
+\- Unread count.\
+\- Mark as read.\
+\- Mark all as read.\
+\- Notification history.\
+\- Relevant security alerts.\
+\- Enrollment and operational notifications.\
+\
+Do not send external emails or messages unless an authorized service is explicitly configured.\
+\
+\## 17. USER INTERFACE AND EXPERIENCE\
+\
+Preserve the existing BioGuard X visual identity.\
+\
+Design direction:\
+\- Premium enterprise cybersecurity dashboard.\
+\- Dark navy background.\
+\- Modern security-focused interface.\
+\- Cyan, violet, and teal accents.\
+\- Clean typography.\
+\- Professional charts.\
+\- Responsive layouts.\
+\- Consistent spacing.\
+\- Accessible controls.\
+\- Clear visual hierarchy.\
+\
+Maintain the existing sidebar navigation:\
+\
+\- Overview\
+\- Verification\
+\- Identity Enrollment\
+\- Identities\
+\- Analytics\
+\- Threat Intelligence\
+\- Automation Center\
+\- Audit Trail\
+\- Access Control\
+\- AI Assistant\
+\- Settings\
+\
+Add:\
+\- Google account profile.\
+\- User avatar.\
+\- Account menu.\
+\- Notifications.\
+\- System health indicator.\
+\- Responsive mobile navigation.\
+\
+Every button and navigation item must work.\
+\
+Do not leave dead buttons, fake charts, or non-functional forms.\
+\
+\## 18. SETTINGS\
+\
+Implement:\
+\- Account settings.\
+\- Profile preferences.\
+\- Theme settings.\
+\- Notification preferences.\
+\- Organization settings.\
+\- Security settings.\
+\- API connection status.\
+\- Firebase connection status.\
+\- Gemini connection status.\
+\- Backend health status.\
+\
+Never show private credentials in the settings interface.\
+\
+\## 19. ARCHITECTURE AND DEPLOYMENT\
+\
+Use an architecture compatible with Google AI Studio and Firebase.\
+\
+Preferred architecture:\
+\
+Frontend:\
+Existing Vanilla HTML/CSS/JavaScript, unless a migration is necessary and justified.\
+\
+Application authentication:\
+Firebase Authentication.\
+\
+Application metadata:\
+Cloud Firestore.\
+\
+Trusted server operations:\
+Server-side Node.js or the existing Python FastAPI service, according to the integration requirements.\
+\
+AI:\
+Gemini API through a secure server-side integration.\
+\
+Biometric processing:\
+Existing Python FastAPI and machine-learning implementation.\
+\
+Encrypted biometric template persistence:\
+Existing persistent backend database.\
+\
+Hosting:\
+Use Google AI Studio's supported deployment workflow and Firebase Hosting or another compatible hosting target where appropriate.\
+\
+Do not assume Google AI Studio automatically provisions Firebase resources.\
+\
+Do not assume that the Python FastAPI backend can run inside a Node-only application runtime.\
+\
+Keep the biometric API deployable independently if required.\
+\
+Use environment variables and separate development/production configurations.\
+\
+\## 20. TESTING AND QUALITY ASSURANCE\
+\
+Test the entire application.\
+\
+Frontend:\
+\- Navigation.\
+\- Responsive design.\
+\- Forms.\
+\- Validation.\
+\- Authentication state.\
+\- Loading states.\
+\- Error handling.\
+\
+Firebase:\
+\- Google sign-in.\
+\- Sign-out.\
+\- User provisioning.\
+\- Firestore reads.\
+\- Firestore writes.\
+\- Security rules.\
+\- Unauthorized access.\
+\
+Backend:\
+\- Health endpoint.\
+\- Enrollment.\
+\- Verification.\
+\- Authorization.\
+\- Database persistence.\
+\- Encryption.\
+\- Error responses.\
+\
+Machine learning:\
+\- Feature extraction.\
+\- Feature parity.\
+\- Model loading.\
+\- Model version validation.\
+\- Training pipeline.\
+\- Evaluation.\
+\
+Integration:\
+\- Frontend to backend.\
+\- Firebase authentication to backend.\
+\- Firestore persistence.\
+\- Gemini API.\
+\- Full end-to-end workflows.\
+\
+Do not claim tests passed unless they were actually executed.\
+\
+Do not claim deployment succeeded unless the deployed application was tested.\
+\
+\## 21. REQUIRED CONFIGURATION FROM THE PROJECT OWNER\
+\
+When a configuration requires access to an external account, guide the project owner through the actual setup.\
+\
+Required owner-side setup may include:\
+\
+1\. Firebase project creation or selection.\
+2\. Registering the web application.\
+3\. Enabling Google Authentication.\
+4\. Configuring authorized domains.\
+5\. Creating Firestore.\
+6\. Deploying Firestore security rules.\
+7\. Creating a Firebase service account for trusted backend use.\
+8\. Configuring Gemini API access.\
+9\. Setting server-side environment variables.\
+10\. Configuring persistent database access.\
+11\. Configuring production hosting.\
+\
+Use placeholders in documentation.\
+\
+Never ask the user to paste private passwords, private keys, service-account JSON, database passwords, or API secrets into public source code or browser-visible files.\
+\
+If the user needs to provide configuration, clearly explain which values are public Firebase web configuration and which are private server secrets.\
+\
+\## 22. EXECUTION RULES\
+\
+Work directly on the imported GitHub project.\
+\
+Do not stop after generating a plan.\
+\
+Start by inspecting the complete codebase.\
+\
+Then implement the project in controlled phases:\
+\
+Phase 1: Repository inspection and architecture.\
+\
+Phase 2: Build and runtime stability.\
+\
+Phase 3: Firebase Authentication and Google sign-in.\
+\
+Phase 4: Firestore database and security rules.\
+\
+Phase 5: Secure backend authentication and role management.\
+\
+Phase 6: Existing biometric API integration.\
+\
+Phase 7: Identity directory and operational database modules.\
+\
+Phase 8: Analytics, audit, threat intelligence, and automation.\
+\
+Phase 9: Gemini AI Assistant.\
+\
+Phase 10: Notifications and settings.\
+\
+Phase 11: Full testing and bug fixing.\
+\
+Phase 12: Deployment and documentation.\
+\
+After every phase:\
+\- Run relevant tests.\
+\- Fix discovered errors.\
+\- Preserve existing functionality.\
+\- Update the documentation.\
+\- Report exactly what was completed.\
+\- Identify remaining configuration requirements.\
+\
+Do not overwrite the original branch without authorization.\
+\
+Use a dedicated implementation branch and make small, reviewable commits.\
+\
+If a feature requires an external credential or a cloud resource that you cannot create, implement the integration code, provide the exact setup instructions, and mark it as awaiting owner configuration.\
+\
+\## 23. FINAL ACCEPTANCE CRITERIA\
+\
+BioGuard X is complete only when:\
+\
+\- The application builds successfully.\
+\- The application starts successfully.\
+\- Google sign-in works.\
+\- Firebase authentication works.\
+\- Firestore reads and writes work.\
+\- Firestore security rules are tested.\
+\- User roles are enforced server-side.\
+\- Gemini AI responds through a secure backend.\
+\- Existing biometric enrollment works against the real API.\
+\- Existing biometric verification works against the real API.\
+\- Face, voice, and fingerprint workflows are validated.\
+\- Identity management is functional.\
+\- Analytics use real persisted data.\
+\- Audit records are persisted and searchable.\
+\- Threat intelligence works.\
+\- Automation workflows work within authorized limits.\
+\- Notifications work.\
+\- Settings work.\
+\- No existing biometric algorithm has been silently replaced.\
+\- No fake biometric success results exist.\
+\- No private credentials are exposed.\
+\- Automated tests pass.\
+\- Deployment is verified.\
+\
+At the end, provide:\
+\
+1\. Complete architecture.\
+2\. List of implemented features.\
+3\. List of remaining owner-side configuration steps.\
+4\. Firebase setup instructions.\
+5\. Gemini setup instructions.\
+6\. Environment variable documentation.\
+7\. Database schema documentation.\
+8\. Security rules.\
+9\. Test results.\
+10\. Deployment URL and actual deployment status.\
+\
+IMPORTANT FINAL INSTRUCTION:\
+\
+Build a genuinely functional, secure, maintainable BioGuard X system. Do not merely redesign its appearance. Do not simulate backend functionality. Do not fabricate data or test results. Preserve the existing research implementation and clearly distinguish experimental biometric results from real-world identity assurance.\
+
+## Before you start: important Google/Firebase setup
+
+**1. Firebase Console**
+
+Create or select your Firebase project, enable Google as a sign-in provider, register the web app, and create Firestore.
+
+Open Firebase Console
+
+---
+
+**2. Google AI Studio**
+
+Configure Gemini API access. Keep the API key on the server, never in browser JavaScript.
+
+Open Google AI Studio
+
+---
+
+**3. Google Cloud**
+
+Use the same Google Cloud project where appropriate for Firebase, API configuration, IAM, and deployment.
+
+Open Google Cloud Console
+
+## One important architectural decision
+
+I recommend keeping these responsibilities separate:
+
+| Service                 | Responsibility                                         |
+| ----------------------- | ------------------------------------------------------ |
+| Firebase Authentication | Google account sign-in                                 |
+| Firestore               | Users, roles, identities metadata, logs, notifications |
+| Gemini                  | AI assistant and security summaries                    |
+| Python FastAPI          | Actual biometric processing                            |
+| PostgreSQL              | Encrypted biometric templates and backend records      |
+
+**Do not migrate encrypted biometric templates into Firestore just to make the architecture look unified.** Your existing backend has a specific encryption and persistence design that should be preserved.
+
+Also, your current project is a research prototype: it does not yet have real-data validation, liveness detection, or production-grade biometric authorization. The prompt deliberately prevents Gemini from inventing these capabilities.
+
+**My recommendation:** Import the branch, paste the master prompt, and make Gemini finish the application in phases rather than attempting to rewrite the entire project in one operation.

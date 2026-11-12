@@ -1,0 +1,218 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated BioGuard X user profile and role metadata",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "email": { "type": "string", "minLength": 3, "maxLength": 180 },
+        "photoURL": { "type": "string", "maxLength": 500 },
+        "role": { "type": "string", "enum": ["super_admin", "administrator", "security_analyst", "operator", "viewer"] },
+        "status": { "type": "string", "enum": ["active", "suspended"] },
+        "theme": { "type": "string", "enum": ["dark", "light"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "lastLoginAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "email", "role", "status", "createdAt", "lastLoginAt"]
+    },
+    "AdminGrant": {
+      "title": "AdminGrant",
+      "description": "Trusted administrator membership document",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "role": { "type": "string", "enum": ["super_admin", "administrator"] },
+        "grantedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "role", "grantedBy", "createdAt"]
+    },
+    "BiometricIdentity": {
+      "title": "BiometricIdentity",
+      "description": "Enrolled identity metadata (templates remain encrypted in backend vault, never in Firestore)",
+      "type": "object",
+      "properties": {
+        "identityId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "identityRef": { "type": "string", "minLength": 2, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "status": { "type": "string", "enum": ["active", "inactive"] },
+        "registeredModalities": { "type": "array", "description": "Max 3 modalities: face, voice, fingerprint" },
+        "featureVersion": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "consentRecorded": { "type": "boolean" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["identityId", "identityRef", "displayName", "status", "registeredModalities", "consentRecorded", "createdBy", "createdAt", "updatedAt"]
+    },
+    "VerificationRecord": {
+      "title": "VerificationRecord",
+      "description": "Multimodal biometric verification outcome record (policyDecision remains pending)",
+      "type": "object",
+      "properties": {
+        "verificationId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "identityRef": { "type": "string", "minLength": 2, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "modalities": { "type": "array" },
+        "pipeline": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "outcome": { "type": "string", "enum": ["match", "no_match", "not_evaluated"] },
+        "policyDecision": { "type": "string", "enum": ["pending"] },
+        "reasonCode": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "score": { "type": "number" },
+        "riskScore": { "type": "number" },
+        "riskLevel": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+        "livenessPassed": { "type": "boolean" },
+        "livenessScore": { "type": "number" },
+        "adaptiveApplied": { "type": "boolean" },
+        "operatorUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["verificationId", "identityRef", "modalities", "outcome", "policyDecision", "reasonCode", "operatorUid", "createdAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Append-only operational audit record without raw biometric samples or secrets",
+      "type": "object",
+      "properties": {
+        "eventId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "actorUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "action": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "resourceType": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "resourceId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "result": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["eventId", "actorUid", "action", "resourceType", "resourceId", "result", "requestId", "timestamp"]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "In-app user notification record",
+      "type": "object",
+      "properties": {
+        "notificationId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "title": { "type": "string", "minLength": 1, "maxLength": 140 },
+        "message": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "type": { "type": "string", "enum": ["info", "warning", "security", "success"] },
+        "read": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["notificationId", "userUid", "title", "message", "type", "read", "createdAt"]
+    },
+    "SecurityAlert": {
+      "title": "SecurityAlert",
+      "description": "Threat intelligence investigation alert",
+      "type": "object",
+      "properties": {
+        "alertId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "severity": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+        "category": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 600 },
+        "status": { "type": "string", "enum": ["open", "investigating", "resolved"] },
+        "assignedTo": { "type": "string", "maxLength": 128 },
+        "notes": { "type": "string", "maxLength": 1000 },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["alertId", "severity", "category", "description", "status", "createdBy", "createdAt", "updatedAt"]
+    },
+    "AutomationWorkflow": {
+      "title": "AutomationWorkflow",
+      "description": "Authorized event-driven workflow metadata",
+      "type": "object",
+      "properties": {
+        "workflowId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "description": { "type": "string", "maxLength": 400 },
+        "enabled": { "type": "boolean" },
+        "trigger": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "actions": { "type": "array" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["workflowId", "name", "enabled", "trigger", "actions", "createdBy", "createdAt", "updatedAt"]
+    },
+    "SystemSettings": {
+      "title": "SystemSettings",
+      "description": "System configuration metadata (no secrets)",
+      "type": "object",
+      "properties": {
+        "settingId": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "organizationName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "faceThreshold": { "type": "number" },
+        "voiceThreshold": { "type": "number" },
+        "fingerprintThreshold": { "type": "number" },
+        "threeModalThreshold": { "type": "number" },
+        "maxHoldHours": { "type": "number" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "required": ["settingId", "organizationName", "faceThreshold", "voiceThreshold", "fingerprintThreshold", "threeModalThreshold", "maxHoldHours", "updatedAt", "updatedBy"]
+    },
+    "ApprovalRequest": {
+      "title": "ApprovalRequest",
+      "description": "Authorized approval workflow record for sensitive biometric actions such as deletion requests",
+      "type": "object",
+      "properties": {
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "requestType": { "type": "string", "enum": ["biometric_deletion", "identity_status_change", "policy_review"] },
+        "targetIdentityRef": { "type": "string", "minLength": 2, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "requestedBy": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "requestedByEmail": { "type": "string", "minLength": 3, "maxLength": 180 },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "reviewedBy": { "type": "string", "maxLength": 128 },
+        "reviewNotes": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["requestId", "requestType", "targetIdentityRef", "reason", "requestedBy", "requestedByEmail", "status", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User profiles indexed by Firebase Auth UID"
+    },
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminGrant" },
+      "description": "Privileged administrator registry"
+    },
+    "/identities/{identityId}": {
+      "schema": { "$ref": "#/entities/BiometricIdentity" },
+      "description": "Enrolled biometric identity metadata (no raw templates or keys)"
+    },
+    "/verification_records/{verificationId}": {
+      "schema": { "$ref": "#/entities/VerificationRecord" },
+      "description": "Verification event metadata records"
+    },
+    "/audit_logs/{eventId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Append-only operational audit logs"
+    },
+    "/notifications/{notificationId}": {
+      "schema": { "$ref": "#/entities/Notification" },
+      "description": "User-scoped notifications"
+    },
+    "/security_alerts/{alertId}": {
+      "schema": { "$ref": "#/entities/SecurityAlert" },
+      "description": "Security analyst threat alerts"
+    },
+    "/automation_workflows/{workflowId}": {
+      "schema": { "$ref": "#/entities/AutomationWorkflow" },
+      "description": "Automation center workflow configurations"
+    },
+    "/system_settings/{settingId}": {
+      "schema": { "$ref": "#/entities/SystemSettings" },
+      "description": "Organization and threshold configuration"
+    },
+    "/approval_requests/{requestId}": {
+      "schema": { "$ref": "#/entities/ApprovalRequest" },
+      "description": "Sensitive action approval workflow requests"
+    }
+  }
+}

@@ -1,0 +1,353 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Deny everything by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core Reusable Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() && request.auth.token.email == 'abdullahmohamedharoon8@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() || (
+        isVerifiedUser() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function userRole() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
+        : 'viewer';
+    }
+
+    function isAnalystOrAdmin() {
+      return isAdmin() || (isVerifiedUser() && userRole() in ['super_admin', 'administrator', 'security_analyst']);
+    }
+
+    function isOperatorOrAbove() {
+      return isAdmin() || (isVerifiedUser() && userRole() in ['super_admin', 'administrator', 'security_analyst', 'operator']);
+    }
+
+    // Entity Validation Blueprints
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'email', 'role', 'status', 'createdAt', 'lastLoginAt']) &&
+        data.keys().hasOnly(['uid', 'displayName', 'email', 'photoURL', 'role', 'status', 'theme', 'createdAt', 'lastLoginAt']) &&
+        isValidId(data.uid) &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 180 &&
+        (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 500)) &&
+        data.role in ['super_admin', 'administrator', 'security_analyst', 'operator', 'viewer'] &&
+        data.status in ['active', 'suspended'] &&
+        (!('theme' in data) || data.theme in ['dark', 'light']) &&
+        data.createdAt is timestamp &&
+        data.lastLoginAt is timestamp;
+    }
+
+    function isValidAdminGrant(data) {
+      return data.keys().hasAll(['uid', 'role', 'grantedBy', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'role', 'grantedBy', 'createdAt']) &&
+        isValidId(data.uid) &&
+        data.role in ['super_admin', 'administrator'] &&
+        data.grantedBy is string && data.grantedBy.size() >= 1 && data.grantedBy.size() <= 128 &&
+        data.createdAt == request.time;
+    }
+
+    function isValidBiometricIdentity(data) {
+      return data.keys().hasAll(['identityId', 'identityRef', 'displayName', 'status', 'registeredModalities', 'consentRecorded', 'createdBy', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['identityId', 'identityRef', 'displayName', 'status', 'registeredModalities', 'featureVersion', 'consentRecorded', 'createdBy', 'createdAt', 'updatedAt']) &&
+        isValidId(data.identityId) &&
+        data.identityRef is string && data.identityRef.size() >= 2 && data.identityRef.size() <= 64 && data.identityRef.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+        data.status in ['active', 'inactive'] &&
+        data.registeredModalities is list && data.registeredModalities.size() >= 1 && data.registeredModalities.size() <= 3 &&
+        data.registeredModalities[0] is string &&
+        (!('featureVersion' in data) || (data.featureVersion is string && data.featureVersion.size() >= 1 && data.featureVersion.size() <= 32)) &&
+        data.consentRecorded == true &&
+        data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 128 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidVerificationRecord(data) {
+      return data.keys().hasAll(['verificationId', 'identityRef', 'modalities', 'outcome', 'policyDecision', 'reasonCode', 'operatorUid', 'createdAt']) &&
+        data.keys().hasOnly(['verificationId', 'identityRef', 'modalities', 'pipeline', 'outcome', 'policyDecision', 'reasonCode', 'score', 'riskScore', 'riskLevel', 'livenessPassed', 'livenessScore', 'adaptiveApplied', 'operatorUid', 'createdAt']) &&
+        isValidId(data.verificationId) &&
+        data.identityRef is string && data.identityRef.size() >= 2 && data.identityRef.size() <= 64 && data.identityRef.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.modalities is list && data.modalities.size() >= 1 && data.modalities.size() <= 3 &&
+        data.modalities[0] is string &&
+        (!('pipeline' in data) || (data.pipeline is string && data.pipeline.size() <= 64)) &&
+        data.outcome in ['match', 'no_match', 'not_evaluated'] &&
+        data.policyDecision == 'pending' &&
+        data.reasonCode is string && data.reasonCode.size() >= 1 && data.reasonCode.size() <= 80 &&
+        (!('score' in data) || (data.score is number && data.score >= 0 && data.score <= 1)) &&
+        (!('riskScore' in data) || (data.riskScore is number && data.riskScore >= 0 && data.riskScore <= 100)) &&
+        (!('riskLevel' in data) || data.riskLevel in ['low', 'medium', 'high', 'critical']) &&
+        (!('livenessPassed' in data) || data.livenessPassed is bool) &&
+        (!('livenessScore' in data) || (data.livenessScore is number && data.livenessScore >= 0 && data.livenessScore <= 1)) &&
+        (!('adaptiveApplied' in data) || data.adaptiveApplied is bool) &&
+        data.operatorUid == request.auth.uid &&
+        data.createdAt == request.time;
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['eventId', 'actorUid', 'action', 'resourceType', 'resourceId', 'result', 'requestId', 'timestamp']) &&
+        data.keys().hasOnly(['eventId', 'actorUid', 'action', 'resourceType', 'resourceId', 'result', 'requestId', 'timestamp']) &&
+        isValidId(data.eventId) &&
+        data.actorUid == request.auth.uid &&
+        data.action is string && data.action.size() >= 1 && data.action.size() <= 80 &&
+        data.resourceType is string && data.resourceType.size() >= 1 && data.resourceType.size() <= 64 &&
+        data.resourceId is string && data.resourceId.size() >= 1 && data.resourceId.size() <= 128 &&
+        data.result is string && data.result.size() >= 1 && data.result.size() <= 240 &&
+        data.requestId is string && data.requestId.size() >= 1 && data.requestId.size() <= 128 &&
+        data.timestamp == request.time;
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll(['notificationId', 'userUid', 'title', 'message', 'type', 'read', 'createdAt']) &&
+        data.keys().hasOnly(['notificationId', 'userUid', 'title', 'message', 'type', 'read', 'createdAt']) &&
+        isValidId(data.notificationId) &&
+        isValidId(data.userUid) &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 140 &&
+        data.message is string && data.message.size() >= 1 && data.message.size() <= 500 &&
+        data.type in ['info', 'warning', 'security', 'success'] &&
+        data.read is bool &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidSecurityAlert(data) {
+      return data.keys().hasAll(['alertId', 'severity', 'category', 'description', 'status', 'createdBy', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['alertId', 'severity', 'category', 'description', 'status', 'assignedTo', 'notes', 'createdBy', 'createdAt', 'updatedAt']) &&
+        isValidId(data.alertId) &&
+        data.severity in ['low', 'medium', 'high', 'critical'] &&
+        data.category is string && data.category.size() >= 1 && data.category.size() <= 80 &&
+        data.description is string && data.description.size() >= 1 && data.description.size() <= 600 &&
+        data.status in ['open', 'investigating', 'resolved'] &&
+        (!('assignedTo' in data) || (data.assignedTo is string && data.assignedTo.size() <= 128)) &&
+        (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000)) &&
+        data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 128 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidWorkflow(data) {
+      return data.keys().hasAll(['workflowId', 'name', 'enabled', 'trigger', 'actions', 'createdBy', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['workflowId', 'name', 'description', 'enabled', 'trigger', 'actions', 'createdBy', 'createdAt', 'updatedAt']) &&
+        isValidId(data.workflowId) &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        (!('description' in data) || (data.description is string && data.description.size() <= 400)) &&
+        data.enabled is bool &&
+        data.trigger is string && data.trigger.size() >= 1 && data.trigger.size() <= 80 &&
+        data.actions is list && data.actions.size() >= 1 && data.actions.size() <= 10 &&
+        data.actions[0] is string &&
+        data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 128 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidSettings(data) {
+      return data.keys().hasAll(['settingId', 'organizationName', 'faceThreshold', 'voiceThreshold', 'fingerprintThreshold', 'threeModalThreshold', 'maxHoldHours', 'updatedAt', 'updatedBy']) &&
+        data.keys().hasOnly(['settingId', 'organizationName', 'faceThreshold', 'voiceThreshold', 'fingerprintThreshold', 'threeModalThreshold', 'maxHoldHours', 'updatedAt', 'updatedBy']) &&
+        isValidId(data.settingId) &&
+        data.organizationName is string && data.organizationName.size() >= 1 && data.organizationName.size() <= 120 &&
+        data.faceThreshold is number && data.faceThreshold >= 0.3 && data.faceThreshold <= 0.98 &&
+        data.voiceThreshold is number && data.voiceThreshold >= 0.3 && data.voiceThreshold <= 0.98 &&
+        data.fingerprintThreshold is number && data.fingerprintThreshold >= 0.3 && data.fingerprintThreshold <= 0.98 &&
+        data.threeModalThreshold is number && data.threeModalThreshold >= 0.3 && data.threeModalThreshold <= 0.98 &&
+        data.maxHoldHours is number && data.maxHoldHours >= 1 && data.maxHoldHours <= 4 &&
+        data.updatedAt == request.time &&
+        data.updatedBy == request.auth.uid;
+    }
+
+    function isValidApprovalRequest(data) {
+      return data.keys().hasAll(['requestId', 'requestType', 'targetIdentityRef', 'reason', 'requestedBy', 'requestedByEmail', 'status', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['requestId', 'requestType', 'targetIdentityRef', 'reason', 'requestedBy', 'requestedByEmail', 'status', 'reviewedBy', 'reviewNotes', 'createdAt', 'updatedAt']) &&
+        isValidId(data.requestId) &&
+        data.requestType in ['biometric_deletion', 'identity_status_change', 'policy_review'] &&
+        data.targetIdentityRef is string && data.targetIdentityRef.size() >= 2 && data.targetIdentityRef.size() <= 64 && data.targetIdentityRef.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.reason is string && data.reason.size() >= 1 && data.reason.size() <= 500 &&
+        isValidId(data.requestedBy) &&
+        data.requestedByEmail is string && data.requestedByEmail.size() >= 3 && data.requestedByEmail.size() <= 180 &&
+        data.status in ['pending', 'approved', 'rejected'] &&
+        (!('reviewedBy' in data) || (data.reviewedBy is string && data.reviewedBy.size() <= 128)) &&
+        (!('reviewNotes' in data) || (data.reviewNotes is string && data.reviewNotes.size() <= 500)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Collection Rules
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+      allow create: if isValidId(userId) && isVerifiedUser() && isOwner(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().lastLoginAt == request.time &&
+        incoming().status == 'active' &&
+        (incoming().role == 'viewer' || (isBootstrappedAdmin() && incoming().role == 'super_admin'));
+      allow update: if isValidId(userId) && isVerifiedUser() && isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        (
+          (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'theme', 'lastLoginAt']) && incoming().lastLoginAt == request.time) ||
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['role', 'status', 'displayName', 'theme', 'lastLoginAt']))
+        );
+      allow delete: if false;
+    }
+
+    match /admins/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(userId) && isValidAdminGrant(incoming()) && (isAdmin() || (isBootstrappedAdmin() && isOwner(userId)));
+      allow update, delete: if isValidId(userId) && isAdmin() && userId != request.auth.uid;
+    }
+
+    match /identities/{identityId} {
+      allow get: if isValidId(identityId) && (isOperatorOrAbove() || (isVerifiedUser() && resource.data.createdBy == request.auth.uid));
+      allow list: if isOperatorOrAbove() || (isVerifiedUser() && resource.data.createdBy == request.auth.uid);
+      allow create: if isValidId(identityId) && isOperatorOrAbove() && isValidBiometricIdentity(incoming()) &&
+        incoming().identityId == identityId &&
+        incoming().createdBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(identityId) && isOperatorOrAbove() && isValidBiometricIdentity(incoming()) &&
+        incoming().identityId == existing().identityId &&
+        incoming().identityRef == existing().identityRef &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'status', 'registeredModalities', 'featureVersion', 'updatedAt']);
+      allow delete: if isValidId(identityId) && isAdmin();
+    }
+
+    match /verification_records/{verificationId} {
+      allow get: if isValidId(verificationId) && (isAnalystOrAdmin() || (isVerifiedUser() && resource.data.operatorUid == request.auth.uid));
+      allow list: if isAnalystOrAdmin() || (isVerifiedUser() && resource.data.operatorUid == request.auth.uid);
+      allow create: if isValidId(verificationId) && isOperatorOrAbove() && isValidVerificationRecord(incoming()) &&
+        incoming().verificationId == verificationId &&
+        exists(/databases/$(database)/documents/identities/$(incoming().identityRef));
+      allow update, delete: if false;
+    }
+
+    match /audit_logs/{eventId} {
+      allow get: if isValidId(eventId) && (isAnalystOrAdmin() || (isVerifiedUser() && resource.data.actorUid == request.auth.uid));
+      allow list: if isAnalystOrAdmin() || (isVerifiedUser() && resource.data.actorUid == request.auth.uid);
+      allow create: if isValidId(eventId) && isVerifiedUser() && isValidAuditLog(incoming()) &&
+        incoming().eventId == eventId;
+      allow update, delete: if false;
+    }
+
+    match /notifications/{notificationId} {
+      allow get: if isValidId(notificationId) && (isAdmin() || (isVerifiedUser() && resource.data.userUid == request.auth.uid));
+      allow list: if isAdmin() || (isVerifiedUser() && resource.data.userUid == request.auth.uid);
+      allow create: if isValidId(notificationId) && isVerifiedUser() && isValidNotification(incoming()) &&
+        incoming().notificationId == notificationId &&
+        incoming().createdAt == request.time &&
+        (incoming().userUid == request.auth.uid || isAdmin());
+      allow update: if isValidId(notificationId) && isVerifiedUser() && isValidNotification(incoming()) &&
+        (existing().userUid == request.auth.uid || isAdmin()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['read']) &&
+        incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(notificationId) && (isAdmin() || (isVerifiedUser() && resource.data.userUid == request.auth.uid));
+    }
+
+    match /security_alerts/{alertId} {
+      allow get: if isValidId(alertId) && isAnalystOrAdmin();
+      allow list: if isAnalystOrAdmin();
+      allow create: if isValidId(alertId) && isAnalystOrAdmin() && isValidSecurityAlert(incoming()) &&
+        incoming().alertId == alertId &&
+        incoming().createdBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(alertId) && isAnalystOrAdmin() && isValidSecurityAlert(incoming()) &&
+        incoming().alertId == existing().alertId &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          isAdmin() ||
+          (existing().status != 'resolved' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'assignedTo', 'notes', 'updatedAt']))
+        );
+      allow delete: if isValidId(alertId) && isAdmin();
+    }
+
+    match /automation_workflows/{workflowId} {
+      allow get: if isValidId(workflowId) && isAnalystOrAdmin();
+      allow list: if isAnalystOrAdmin();
+      allow create: if isValidId(workflowId) && isAdmin() && isValidWorkflow(incoming()) &&
+        incoming().workflowId == workflowId &&
+        incoming().createdBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(workflowId) && isAdmin() && isValidWorkflow(incoming()) &&
+        incoming().workflowId == existing().workflowId &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'enabled', 'trigger', 'actions', 'updatedAt']);
+      allow delete: if isValidId(workflowId) && isAdmin();
+    }
+
+    match /system_settings/{settingId} {
+      allow get: if isValidId(settingId) && isVerifiedUser();
+      allow list: if isAdmin();
+      allow create, update: if isValidId(settingId) && isAdmin() && isValidSettings(incoming()) &&
+        incoming().settingId == settingId;
+      allow delete: if false;
+    }
+
+    match /approval_requests/{requestId} {
+      allow get: if isValidId(requestId) && (isAdmin() || (isVerifiedUser() && resource.data.requestedBy == request.auth.uid));
+      allow list: if isAdmin() || (isVerifiedUser() && resource.data.requestedBy == request.auth.uid);
+      allow create: if isValidId(requestId) && isVerifiedUser() && isValidApprovalRequest(incoming()) &&
+        incoming().requestId == requestId &&
+        incoming().requestedBy == request.auth.uid &&
+        incoming().status == 'pending' &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        !('reviewedBy' in incoming()) &&
+        exists(/databases/$(database)/documents/identities/$(incoming().targetIdentityRef));
+      allow update: if isValidId(requestId) && isAdmin() && isValidApprovalRequest(incoming()) &&
+        existing().status == 'pending' &&
+        incoming().status in ['approved', 'rejected'] &&
+        incoming().requestId == existing().requestId &&
+        incoming().requestType == existing().requestType &&
+        incoming().targetIdentityRef == existing().targetIdentityRef &&
+        incoming().requestedBy == existing().requestedBy &&
+        incoming().requestedByEmail == existing().requestedByEmail &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().reviewedBy == request.auth.uid &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'reviewedBy', 'reviewNotes', 'updatedAt']);
+      allow delete: if false;
+    }
+  }
+}

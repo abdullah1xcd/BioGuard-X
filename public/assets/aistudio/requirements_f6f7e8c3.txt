@@ -1,0 +1,14 @@
+numpy
+pandas
+scipy
+scikit-learn
+scikit-image
+opencv-python
+matplotlib
+plotly
+joblib
+librosa
+soundfile
+streamlit
+pytest
+sounddevice   # optional: server-side microphone recording
