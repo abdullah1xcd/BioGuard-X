@@ -11,10 +11,10 @@ export default defineConfig(() => {
       },
     },
     build: {
-      outDir: 'public',
+      outDir: 'dist',
       assetsDir: 'build',
-      emptyOutDir: false,
-      copyPublicDir: false,
+      emptyOutDir: true,
+      publicDir: false,
     },
     server: {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
