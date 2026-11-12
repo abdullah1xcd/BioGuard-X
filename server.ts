@@ -1,9 +1,9 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { GoogleGenAI } from '@google/genai';
+import firebaseConfigJson from './firebase-applet-config.json' with { type: 'json' };
 
 interface FirebaseConfig {
   projectId: string;
@@ -13,8 +13,7 @@ interface FirebaseConfig {
 }
 
 const rootDir = process.cwd();
-const firebaseConfigPath = path.join(rootDir, 'firebase-applet-config.json');
-const firebaseConfig: FirebaseConfig = JSON.parse(fs.readFileSync(firebaseConfigPath, 'utf8'));
+const firebaseConfig = firebaseConfigJson as FirebaseConfig;
 
 const FEATURE_VERSION = 'v1.1-classical-liveness';
 const BOOTSTRAPPED_ADMIN_EMAIL = 'abdullahmohamedharoon8@gmail.com';
@@ -1240,7 +1239,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distDir = path.join(rootDir, 'dist');
+    const distDir = path.join(rootDir, 'public');
     app.use(express.static(distDir));
     app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.join(distDir, 'index.html'));
