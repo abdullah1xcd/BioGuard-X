@@ -575,6 +575,13 @@ const asyncHandler = (
 
 
 
+// Serve the Vite-built frontend from Vercel's public CDN.
+// Express receives GET / when no static index route is selected, so redirect it
+// to the generated index.html. API routes remain under /api/v1/*.
+app.get('/', (_req: Request, res: Response) => {
+  res.redirect(302, '/index.html');
+});
+
 // 1. Health Endpoint
 app.get('/api/v1/health', (_req: Request, res: Response) => {
   const vaultConfigured = Boolean(process.env.BIOGUARD_VAULT_SECRET && process.env.BIOGUARD_VAULT_SECRET.trim().length >= 32);
@@ -1239,10 +1246,10 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distDir = path.join(rootDir, 'dist');
-    app.use(express.static(distDir));
+    const publicDir = path.join(rootDir, 'public');
+    app.use(express.static(publicDir));
     app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.join(distDir, 'index.html'));
+      res.sendFile(path.join(publicDir, 'index.html'));
     });
   }
 
