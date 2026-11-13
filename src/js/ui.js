@@ -294,13 +294,31 @@ export function encodeWavBlobUrl(samples, sampleRate = 16000) {
 // Record audio from browser microphone with live elapsed/RMS progress & WAV playback URL
 export async function recordMicrophonePCM(durationMs = 2400, onProgress) {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    throw new Error('Microphone API is unavailable in this browser context.');
+    throw new Error('Microphone API is unavailable in this browser context. Open over HTTPS or install as an app.');
   }
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
-  });
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) {
+    throw new Error('Web Audio API is unavailable in this browser.');
+  }
   const ctx = new AudioCtx();
+  if (ctx.state === 'suspended') {
+    await ctx.resume().catch(() => null);
+  }
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+    });
+  } catch {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      await ctx.close().catch(() => null);
+      throw err;
+    }
+  }
+
   const source = ctx.createMediaStreamSource(stream);
   const processor = ctx.createScriptProcessor(4096, 1, 1);
   const chunks = [];
@@ -339,3 +357,40 @@ export async function recordMicrophonePCM(durationMs = 2400, onProgress) {
   const wavUrl = encodeWavBlobUrl(out, sampleRate);
   return { samples: out, sampleRate, wavUrl };
 }
+
+export async function openCameraStream() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error('Camera API is unavailable in this browser context. Use HTTPS or install the app.');
+  }
+  const attempts = [
+    { video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false },
+    { video: { facingMode: 'user' }, audio: false },
+    { video: true, audio: false },
+  ];
+  let lastErr;
+  for (const constraints of attempts) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (err) {
+      lastErr = err;
+      if (err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError') {
+        throw new Error('Camera permission was denied. Allow camera access in your browser/device settings.');
+      }
+    }
+  }
+  throw lastErr || new Error('Unable to access device camera.');
+}
+
+export async function createLiveVideoElement(stream) {
+  const v = document.createElement('video');
+  v.autoplay = true;
+  v.playsInline = true;
+  v.muted = true;
+  v.setAttribute('autoplay', '');
+  v.setAttribute('playsinline', '');
+  v.setAttribute('muted', '');
+  v.srcObject = stream;
+  await v.play().catch(() => null);
+  return v;
+}
+

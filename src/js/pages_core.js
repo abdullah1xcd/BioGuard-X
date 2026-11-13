@@ -29,6 +29,7 @@ import {
   FUSION_POLICIES,
   slugifyIdentityRef,
   recommendPipelineForModalities,
+  isDevTestingModeActive,
 } from './config.js';
 import { drawWaveform } from './charts.js';
 import {
@@ -41,6 +42,8 @@ import {
   renderSampleFingerprintCanvas,
   synthesizeSampleVoicePCM,
   recordMicrophonePCM,
+  openCameraStream,
+  createLiveVideoElement,
 } from './ui.js';
 
 function fmtFsTime(ts) {
@@ -97,19 +100,18 @@ export function renderOverview(container, { appState, navigate }) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <h1 class="page-title">Security Operations Dashboard</h1>
-        <p class="page-subtitle">Real-time overview of enrolled identities, multimodal similarity &amp; confidence, liveness, risk telemetry, and platform services.</p>
+        <h1 class="page-title">Dashboard</h1>
+        <p class="page-subtitle">Overview of enrolled biometric identities, verification activity, security risk, and platform health.</p>
       </div>
       <div class="page-actions">
         ${permissions.includes('create_identity') ? `<button class="btn btn-secondary" type="button" data-goto="enrollment">Enroll Identity</button>` : ''}
         ${permissions.includes('perform_verification') ? `<button class="btn btn-primary" type="button" data-goto="verification">Verify Identity</button>` : ''}
-        ${permissions.includes('perform_verification') ? `<button class="btn btn-secondary" type="button" data-goto="compare">1:1 &amp; 1:N Compare</button>` : ''}
       </div>
     </div>
 
     <div class="kpi-strip">
       <div class="kpi-cell">
-        <span class="kpi-label">Total Enrolled Identities</span>
+        <span class="kpi-label">Enrolled Identities</span>
         <span class="kpi-value">${identities.length}</span>
         <span class="kpi-meta">${identities.filter((i) => i.status === 'active').length} active in encrypted vault</span>
       </div>
@@ -124,9 +126,9 @@ export function renderOverview(container, { appState, navigate }) {
         <span class="kpi-meta"><span class="${riskCls}">${riskLabel} Risk</span> · ${openAlerts} open alert(s)</span>
       </div>
       <div class="kpi-cell">
-        <span class="kpi-label">Live Engine &amp; Latency</span>
+        <span class="kpi-label">Platform Readiness</span>
         <span class="kpi-value" style="font-size:21px;">${systemOk ? 'Operational' : 'Degraded'}</span>
-        <span class="kpi-meta">${avgLatencyMs !== null ? `Avg match: ${avgLatencyMs} ms` : 'No timing data yet'} · AI: ${health?.gemini_configured ? 'Ready' : 'Off'}</span>
+        <span class="kpi-meta">${avgLatencyMs !== null ? `Avg verification: ${avgLatencyMs} ms` : 'Awaiting verification timing'}</span>
       </div>
     </div>
 
@@ -136,8 +138,8 @@ export function renderOverview(container, { appState, navigate }) {
       <section class="panel stack-md">
         <div class="panel-header">
           <div>
-            <h2 class="panel-title">Quick-Start Workflow</h2>
-            <p class="panel-subtitle">Enroll an identity with pretrained v2.0 extractors, run multimodal verification or 1:1/1:N matching, and inspect genuine statistics</p>
+            <h2 class="panel-title">Getting Started</h2>
+            <p class="panel-subtitle">Enroll a biometric profile, verify identity claims with adaptive fusion, and monitor security analytics</p>
           </div>
         </div>
         <div class="quickstart-grid">
@@ -145,25 +147,25 @@ export function renderOverview(container, { appState, navigate }) {
             <div class="stack-sm" style="gap:4px;">
               <span class="quickstart-num">01. Enroll</span>
               <strong>Register Biometric Profile</strong>
-              <p style="font-size:13px;color:var(--text-secondary);">FaceRes-1024D neural embeddings, 16kHz CMVN Voice-96D, and Gabor+Minutiae templates.</p>
+              <p style="font-size:13px;color:var(--text-secondary);">Capture face, voice, or fingerprint samples with real-time quality checks and explicit consent.</p>
             </div>
             ${permissions.includes('create_identity') ? `<button type="button" class="btn btn-secondary btn-sm" data-goto="enrollment" style="align-self:flex-start;">Open Enrollment</button>` : '<span class="meta-line">Requires Operator role</span>'}
           </div>
           <div class="quickstart-step">
             <div class="stack-sm" style="gap:4px;">
-              <span class="quickstart-num">02. Verify &amp; Compare</span>
-              <strong>Adaptive Fusion &amp; 1:N Search</strong>
-              <p style="font-size:13px;color:var(--text-secondary);">Quality-weighted fusion, cross-modality conflict blocking, anti-spoof checks, and confidence scoring.</p>
+              <span class="quickstart-num">02. Verify &amp; Search</span>
+              <strong>Identity Verification</strong>
+              <p style="font-size:13px;color:var(--text-secondary);">Verify 1:1 identity claims with liveness screening or search across the encrypted vault (1:N).</p>
             </div>
             ${permissions.includes('perform_verification') ? `<button type="button" class="btn btn-secondary btn-sm" data-goto="verification" style="align-self:flex-start;">Open Verification</button>` : '<span class="meta-line">Requires Operator role</span>'}
           </div>
           <div class="quickstart-step">
             <div class="stack-sm" style="gap:4px;">
-              <span class="quickstart-num">03. Evaluate &amp; Investigate</span>
-              <strong>Validated Metrics &amp; AI Analyst</strong>
-              <p style="font-size:13px;color:var(--text-secondary);">Inspect FAR/FRR/EER from ground-truth trials and investigate alerts in AI Security Analyst.</p>
+              <span class="quickstart-num">03. Monitor</span>
+              <strong>Accuracy &amp; Threat Review</strong>
+              <p style="font-size:13px;color:var(--text-secondary);">Review measured FAR/FRR/EER metrics in Analytics &amp; Reports and investigate alerts with AI Analyst.</p>
             </div>
-            ${permissions.includes('use_ai_analyst') ? `<button type="button" class="btn btn-secondary btn-sm" data-goto="ai_analyst" style="align-self:flex-start;">Open AI Analyst</button>` : '<button type="button" class="btn btn-secondary btn-sm" data-goto="analytics" style="align-self:flex-start;">Open Analytics</button>'}
+            <button type="button" class="btn btn-secondary btn-sm" data-goto="analytics" style="align-self:flex-start;">Open Analytics</button>
           </div>
         </div>
       </section>`
@@ -237,13 +239,13 @@ export function renderOverview(container, { appState, navigate }) {
       <section class="panel stack-md">
         <div class="panel-header">
           <div>
-            <h2 class="panel-title">Live System Status</h2>
-            <p class="panel-subtitle">Connected security, biometric models, storage, and AI subsystems</p>
+            <h2 class="panel-title">Platform Status</h2>
+            <p class="panel-subtitle">Core security, database, vault encryption, and AI services</p>
           </div>
         </div>
         <div class="divider-list" style="font-size:13.5px;">
           <div class="divider-row">
-            <span>Firebase Authentication</span>
+            <span>Authentication &amp; Role</span>
             <span class="state-text state-success">Signed In (${escapeHtml(appState.profile?.role || 'viewer')})</span>
           </div>
           <div class="divider-row">
@@ -255,26 +257,20 @@ export function renderOverview(container, { appState, navigate }) {
             <span class="state-text ${health?.vault_ready ? 'state-success' : 'state-warning'}">${health?.vault_ready ? 'AES-256-GCM Active' : 'Unavailable'}</span>
           </div>
           <div class="divider-row">
-            <span>Face Recognition Engine</span>
-            <span class="mono" style="font-size:12px;">BlazeFace+FaceRes-1024D</span>
-          </div>
-          <div class="divider-row">
-            <span>Voice &amp; Fingerprint Engines</span>
-            <span class="mono" style="font-size:12px;">CMVN-96D · Minutiae-RANSAC</span>
-          </div>
-          <div class="divider-row">
-            <span>AI Security Analyst (Gemini)</span>
-            <span class="state-text ${health?.gemini_configured ? 'state-success' : 'state-warning'}">${health?.gemini_configured ? 'Ready (Server-Side)' : 'Not Configured'}</span>
-          </div>
-          <div class="divider-row">
-            <span>Engine Version</span>
-            <span class="mono">${escapeHtml(health?.feature_version || 'v2.0-multimodal')}</span>
-          </div>
-          <div class="divider-row">
-            <span>Fusion Policy &amp; Thresholds</span>
-            <span class="mono">${escapeHtml(appState.settings?.fusionPolicy || 'hierarchical_adaptive')} · F:${appState.settings?.faceThreshold ?? 0.72}</span>
+            <span>AI Security Analyst</span>
+            <span class="state-text ${health?.gemini_configured ? 'state-success' : 'state-warning'}">${health?.gemini_configured ? 'Ready' : 'Not Configured'}</span>
           </div>
         </div>
+
+        <details class="advanced-details">
+          <summary>Advanced Details (Models &amp; Policy)</summary>
+          <div class="advanced-details-body" style="font-size:12.5px;">
+            <div class="row-between"><span>Face Engine</span><span class="mono">BlazeFace + FaceRes-1024D</span></div>
+            <div class="row-between"><span>Voice &amp; Print Engines</span><span class="mono">CMVN-96D · Minutiae-RANSAC</span></div>
+            <div class="row-between"><span>Feature Version</span><span class="mono">${escapeHtml(health?.feature_version || 'v2.0-multimodal')}</span></div>
+            <div class="row-between"><span>Active Fusion Policy</span><span class="mono">${escapeHtml(appState.settings?.fusionPolicy || 'hierarchical_adaptive')} (F:${appState.settings?.faceThreshold ?? 0.72})</span></div>
+          </div>
+        </details>
       </section>
     </div>
   `;
@@ -311,92 +307,122 @@ export function renderEnrollment(container, { appState, navigate }) {
     }
   };
 
+  const devMode = isDevTestingModeActive(appState);
+
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h1 class="page-title">Biometric Enrollment</h1>
-        <p class="page-subtitle">Pretrained FaceRes-1024D neural embeddings, 16kHz CMVN Voice-96D, and Gabor+Minutiae templates validated before encrypted vault storage.</p>
+        <p class="page-subtitle">Capture Face, Voice, or Fingerprint biometrics with automated quality screening and explicit subject consent.</p>
       </div>
-      <div class="page-actions">
-        <button type="button" class="btn btn-secondary" id="be-fill-all">Fill All QA Test Samples</button>
-      </div>
+      ${
+        devMode
+          ? `<div class="page-actions"><button type="button" class="btn btn-secondary" id="be-fill-all">Fill All QA Test Samples</button></div>`
+          : ''
+      }
     </div>
+
+    ${
+      devMode
+        ? `<div class="dev-mode-strip">
+            <div><strong>Developer / Testing Mode Active</strong> — Synthetic QA samples are for authorized validation only and are tagged as synthetic probes.</div>
+          </div>`
+        : ''
+    }
 
     <form id="be-form" class="stack-lg">
       <section class="panel stack-md">
         <div class="panel-header">
           <div>
-            <h2 class="panel-title">1. Profile &amp; Consent</h2>
-            <p class="panel-subtitle">Enter subject details—an Identity Reference ID is generated automatically</p>
+            <h2 class="panel-title">1. Subject Details &amp; Explicit Consent</h2>
+            <p class="panel-subtitle">Identify the subject and confirm informed biometric storage consent</p>
           </div>
         </div>
         <div class="form-grid">
           <div class="form-field">
-            <label class="field-label" for="be-name">Display Name</label>
+            <label class="field-label" for="be-name">Display Name (Required)</label>
             <input class="input" id="be-name" required maxlength="120" placeholder="Amira Al-Mansoor" />
           </div>
           <div class="form-field">
-            <label class="field-label" for="be-ref">Identity Reference ID</label>
+            <label class="field-label" for="be-ref">Identity Reference ID (Required)</label>
             <input class="input mono" id="be-ref" required pattern="^[a-zA-Z0-9_-]{2,64}$" placeholder="amira_al_mansoor" />
           </div>
           <div class="form-field full">
             <label class="checkbox-row">
               <input type="checkbox" id="be-consent" required />
-              <span>Explicit biometric enrollment consent obtained and verified under operator authorization.</span>
+              <span><strong>Explicit Biometric Consent:</strong> I confirm the subject has granted explicit consent to extract and encrypt their biometric templates in the AES-256-GCM vault under operator governance.</span>
             </label>
           </div>
         </div>
       </section>
 
-      <div class="grid-3">
-        <section class="panel stack-md">
-          <div class="panel-header">
-            <div><h2 class="panel-title">Face</h2><p class="panel-subtitle">BlazeFace + FaceMesh + FaceRes 1024-D</p></div>
-            <span id="be-face-st" class="state-text state-neutral">Optional</span>
+      <section class="stack-md">
+        <div class="row-between">
+          <div>
+            <h2 class="panel-title">2. Biometric Modalities</h2>
+            <p class="panel-subtitle">At least one modality is required (Face recommended as primary; Voice and Fingerprint optional secondary)</p>
           </div>
-          <div class="preview-frame" id="be-face-prev">No face image</div>
-          <div id="be-face-q" class="meta-line">Single-face alignment, lighting &amp; anti-spoof check ready</div>
-          <div class="row-wrap">
-            <button type="button" class="btn btn-secondary btn-sm" id="be-cam-start">Webcam</button>
-            <button type="button" class="btn btn-primary btn-sm" id="be-cam-snap" disabled>Capture Live</button>
-            <label class="btn btn-secondary btn-sm" style="cursor:pointer;">Upload Photo<input type="file" id="be-face-file" accept="image/*" hidden /></label>
-            <button type="button" class="btn btn-ghost btn-sm" id="be-face-sample">QA Sample</button>
-          </div>
-        </section>
+        </div>
 
-        <section class="panel stack-md">
-          <div class="panel-header">
-            <div><h2 class="panel-title">Voice</h2><p class="panel-subtitle">16kHz CMVN MFCC+Delta+F0 (96-D)</p></div>
-            <span id="be-voice-st" class="state-text state-neutral">Optional</span>
-          </div>
-          <canvas class="waveform-canvas" id="be-voice-wave" width="380" height="86"></canvas>
-          <div id="be-voice-audio-slot" hidden><audio id="be-voice-player" controls style="width:100%;height:34px;"></audio></div>
-          <div id="be-voice-q" class="meta-line">Record 2.4s clear speech or upload WAV/MP3/M4A</div>
-          <div class="row-wrap">
-            <button type="button" class="btn btn-secondary btn-sm" id="be-mic-rec">Record Mic</button>
-            <label class="btn btn-secondary btn-sm" style="cursor:pointer;">Upload Audio<input type="file" id="be-voice-file" accept="audio/*" hidden /></label>
-            <button type="button" class="btn btn-ghost btn-sm" id="be-voice-sample">QA Sample</button>
-          </div>
-        </section>
+        <div class="grid-3">
+          <section class="panel stack-md">
+            <div class="panel-header">
+              <div><h3 class="panel-title">Face</h3><p class="panel-subtitle">Recommended primary modality</p></div>
+              <span id="be-face-st" class="state-text state-neutral">Primary / Any 1+</span>
+            </div>
+            <div class="preview-frame" id="be-face-prev">No face image</div>
+            <p style="font-size:12.5px;color:var(--text-secondary);">Look straight at the camera in even lighting with no obstructions, or upload a sharp front-facing photo.</p>
+            <div id="be-face-q" class="meta-line">Quality check runs automatically upon capture or upload</div>
+            <div class="row-wrap">
+              <button type="button" class="btn btn-secondary btn-sm" id="be-cam-start">Live Camera</button>
+              <button type="button" class="btn btn-primary btn-sm" id="be-cam-snap" disabled>Capture Photo</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="be-cam-stop" hidden>Stop</button>
+              <label class="btn btn-secondary btn-sm" style="cursor:pointer;">Upload Photo<input type="file" id="be-face-file" accept="image/*" hidden /></label>
+              ${devMode ? `<button type="button" class="btn btn-ghost btn-sm" id="be-face-sample">QA Sample</button>` : ''}
+            </div>
+          </section>
 
-        <section class="panel stack-md">
-          <div class="panel-header">
-            <div><h2 class="panel-title">Fingerprint</h2><p class="panel-subtitle">Gabor Ridge + Zhang-Suen Minutiae</p></div>
-            <span id="be-fp-st" class="state-text state-neutral">Optional</span>
-          </div>
-          <div class="preview-frame fingerprint-frame" id="be-fp-prev" style="margin:0 auto;">No print image</div>
-          <div id="be-fp-q" class="meta-line">Upload a clear fingerprint ridge scan (optical/capacitive image)</div>
-          <div class="row-wrap">
-            <label class="btn btn-secondary btn-sm" style="cursor:pointer;">Upload Print<input type="file" id="be-fp-file" accept="image/*" hidden /></label>
-            <button type="button" class="btn btn-ghost btn-sm" id="be-fp-sample">QA Sample</button>
-          </div>
-        </section>
-      </div>
+          <section class="panel stack-md">
+            <div class="panel-header">
+              <div><h3 class="panel-title">Voice</h3><p class="panel-subtitle">Optional secondary modality</p></div>
+              <span id="be-voice-st" class="state-text state-neutral">Optional</span>
+            </div>
+            <canvas class="waveform-canvas" id="be-voice-wave" width="380" height="86"></canvas>
+            <div id="be-voice-audio-slot" hidden><audio id="be-voice-player" controls style="width:100%;height:34px;"></audio></div>
+            <p style="font-size:12.5px;color:var(--text-secondary);">Speak naturally for 2.4 seconds in a quiet environment, or upload a clear WAV, MP3, or M4A sample.</p>
+            <div id="be-voice-q" class="meta-line">Speech duration &amp; noise validation runs on capture</div>
+            <div class="row-wrap">
+              <button type="button" class="btn btn-secondary btn-sm" id="be-mic-rec">Record Mic</button>
+              <label class="btn btn-secondary btn-sm" style="cursor:pointer;">Upload Audio<input type="file" id="be-voice-file" accept="audio/*" hidden /></label>
+              ${devMode ? `<button type="button" class="btn btn-ghost btn-sm" id="be-voice-sample">QA Sample</button>` : ''}
+            </div>
+          </section>
 
-      <div class="panel row-between">
-        <div id="be-summary" class="meta-line">Add at least one biometric modality above to enroll.</div>
-        <button type="submit" class="btn btn-primary" id="be-submit">Enroll Identity</button>
-      </div>
+          <section class="panel stack-md">
+            <div class="panel-header">
+              <div><h3 class="panel-title">Fingerprint</h3><p class="panel-subtitle">Optional secondary modality</p></div>
+              <span id="be-fp-st" class="state-text state-neutral">Optional</span>
+            </div>
+            <div class="preview-frame fingerprint-frame" id="be-fp-prev" style="margin:0 auto;">No print image</div>
+            <p style="font-size:12.5px;color:var(--text-secondary);">Upload a high-contrast optical or capacitive fingerprint ridge image with clear central ridges.</p>
+            <div id="be-fp-q" class="meta-line">Ridge clarity &amp; minutiae validation runs on upload</div>
+            <div class="row-wrap">
+              <label class="btn btn-secondary btn-sm" style="cursor:pointer;">Upload Print<input type="file" id="be-fp-file" accept="image/*" hidden /></label>
+              ${devMode ? `<button type="button" class="btn btn-ghost btn-sm" id="be-fp-sample">QA Sample</button>` : ''}
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="panel stack-md">
+        <div class="row-between">
+          <div class="stack-sm" style="gap:4px;">
+            <strong style="font-size:14px;">3. Pre-Submission Quality &amp; Readiness Check</strong>
+            <div id="be-summary" class="meta-line">Capture or upload at least one biometric modality above to enroll.</div>
+          </div>
+          <button type="submit" class="btn btn-primary" id="be-submit">Enroll Identity</button>
+        </div>
+      </section>
     </form>
 
     <div id="be-result"></div>
@@ -404,11 +430,13 @@ export function renderEnrollment(container, { appState, navigate }) {
 
   const nameInput = container.querySelector('#be-name');
   const refInput = container.querySelector('#be-ref');
+  const consentInput = container.querySelector('#be-consent');
   const summaryEl = container.querySelector('#be-summary');
   const facePrev = container.querySelector('#be-face-prev');
   const faceSt = container.querySelector('#be-face-st');
   const faceQEl = container.querySelector('#be-face-q');
   const camSnap = container.querySelector('#be-cam-snap');
+  const camStopBtn = container.querySelector('#be-cam-stop');
   const voiceWave = container.querySelector('#be-voice-wave');
   const voiceSt = container.querySelector('#be-voice-st');
   const voiceQEl = container.querySelector('#be-voice-q');
@@ -418,15 +446,24 @@ export function renderEnrollment(container, { appState, navigate }) {
   const fpSt = container.querySelector('#be-fp-st');
   const fpQEl = container.querySelector('#be-fp-q');
 
+  const haltCameraUI = () => {
+    stopCamera();
+    camSnap.disabled = true;
+    camStopBtn.hidden = true;
+  };
+
   const updateSummary = () => {
     const ready = [];
-    if (faceVec) ready.push('Face (1024-D)');
-    if (voiceVec) ready.push('Voice (96-D)');
-    if (fpTemplate) ready.push('Fingerprint (Minutiae)');
+    if (faceVec) ready.push(`Face (Q:${faceQuality?.faceQualityScore ?? '—'}/100)`);
+    if (voiceVec) ready.push(`Voice (Q:${voiceQuality?.voiceQualityScore ?? '—'}/100)`);
+    if (fpTemplate) ready.push(`Fingerprint (Q:${fpQuality?.qualityScore ?? '—'}/100)`);
+    const consentStatus = consentInput.checked ? 'Consent confirmed' : 'Consent required';
     summaryEl.textContent = ready.length
-      ? `Ready to enroll: ${ready.join(' + ')} (${ready.length} modality/modalities)`
-      : 'Add at least one biometric modality above to enroll.';
+      ? `${ready.join(' · ')} — ${consentStatus}`
+      : `Add at least one biometric modality above (${consentStatus}).`;
   };
+
+  consentInput.addEventListener('change', updateSummary);
 
   refInput.addEventListener('input', () => {
     refEditedManually = refInput.value.trim().length > 0;
@@ -438,10 +475,10 @@ export function renderEnrollment(container, { appState, navigate }) {
     }
   });
 
-  const setFaceReal = async (source, label = 'FaceRes-1024D Ready', extraQuality = {}) => {
+  const setFaceReal = async (source, label = 'Ready', extraQuality = {}) => {
     faceSt.className = 'state-text state-warning';
     faceSt.textContent = 'Analyzing...';
-    faceQEl.textContent = 'Running BlazeFace + FaceMesh + FaceRes-1024D & anti-spoof...';
+    faceQEl.textContent = 'Checking face alignment, lighting quality, and anti-spoofing...';
     try {
       const res = await extractFaceFeatures(source, extraQuality);
       faceVec = res.vector;
@@ -453,10 +490,10 @@ export function renderEnrollment(container, { appState, navigate }) {
       facePrev.appendChild(c);
 
       faceSt.className = `state-text ${faceQuality.spoofRiskFlag ? 'state-warning' : 'state-success'}`;
-      faceSt.textContent = faceQuality.spoofRiskFlag ? 'Spoof Warning' : label;
-      faceQEl.textContent = `Q:${faceQuality.faceQualityScore}/100 · Yaw:${faceQuality.poseYawDeg}° · Sharp:${faceQuality.sharpness}${
-        typeof faceQuality.antispoofScore === 'number' ? ` · Real:${Math.round(faceQuality.antispoofScore * 100)}%` : ''
-      }${typeof faceQuality.frameMotionScore === 'number' ? ` · Motion:${faceQuality.frameMotionScore}` : ''}`;
+      faceSt.textContent = faceQuality.spoofRiskFlag ? 'Quality Warning' : label;
+      faceQEl.textContent = `Quality: ${faceQuality.faceQualityScore}/100 · Yaw ${faceQuality.poseYawDeg}° · Sharpness ${faceQuality.sharpness}${
+        typeof faceQuality.antispoofScore === 'number' ? ` · Liveness ${Math.round(faceQuality.antispoofScore * 100)}%` : ''
+      }`;
       updateSummary();
     } catch (err) {
       faceVec = null;
@@ -486,12 +523,12 @@ export function renderEnrollment(container, { appState, navigate }) {
       model: 'synthetic-qa-1024d',
     };
     faceSt.className = 'state-text state-neutral';
-    faceSt.textContent = 'QA Sample (1024-D)';
-    faceQEl.textContent = 'Synthetic deterministic QA probe (marked non-camera)';
+    faceSt.textContent = 'QA Sample';
+    faceQEl.textContent = 'Synthetic deterministic QA probe (non-camera)';
     updateSummary();
   };
 
-  const setVoice = (samples, rate, label = 'Ready (96-D)', captureSource = 'upload', wavUrl = null) => {
+  const setVoice = (samples, rate, label = 'Ready', captureSource = 'upload', wavUrl = null) => {
     try {
       const res = extractVoiceFeaturesFromPCM(samples, rate, captureSource);
       voiceVec = res.vector;
@@ -509,8 +546,8 @@ export function renderEnrollment(container, { appState, navigate }) {
 
       const spoofCount = (voiceQuality.spoofSignals || []).length;
       voiceSt.className = `state-text ${spoofCount ? 'state-warning' : 'state-success'}`;
-      voiceSt.textContent = spoofCount ? 'Replay Risk' : label;
-      voiceQEl.textContent = `${voiceQuality.durationSec}s · ${voiceQuality.speechSegments} seg · Q:${voiceQuality.voiceQualityScore}/100 · SNR:${voiceQuality.snrEstimateDb}dB · F0:${voiceQuality.f0MedianHz || '—'}Hz`;
+      voiceSt.textContent = spoofCount ? 'Quality Warning' : label;
+      voiceQEl.textContent = `Quality: ${voiceQuality.voiceQualityScore}/100 · ${voiceQuality.durationSec}s speech · SNR ${voiceQuality.snrEstimateDb}dB`;
       updateSummary();
     } catch (err) {
       voiceVec = null;
@@ -523,7 +560,7 @@ export function renderEnrollment(container, { appState, navigate }) {
     }
   };
 
-  const setFp = (source, label = 'Minutiae Ready', captureSource = 'upload') => {
+  const setFp = (source, label = 'Ready', captureSource = 'upload') => {
     try {
       const res = extractFingerprintFeatures(source, captureSource);
       fpTemplate = res.template;
@@ -536,7 +573,7 @@ export function renderEnrollment(container, { appState, navigate }) {
 
       fpSt.className = `state-text ${fpQuality.validPrint ? 'state-success' : 'state-warning'}`;
       fpSt.textContent = fpQuality.validPrint ? label : 'Low Clarity';
-      fpQEl.textContent = `Minutiae:${fpQuality.minutiaeHeuristicCount} · Coherence:${fpQuality.meanCoherence} · Q:${fpQuality.qualityScore}/100`;
+      fpQEl.textContent = `Quality: ${fpQuality.qualityScore}/100 · ${fpQuality.minutiaeHeuristicCount} minutiae · Coherence ${fpQuality.meanCoherence}`;
       updateSummary();
     } catch (err) {
       fpTemplate = null;
@@ -549,8 +586,8 @@ export function renderEnrollment(container, { appState, navigate }) {
     }
   };
 
-  container.querySelector('#be-fill-all').addEventListener('click', () => {
-    stopCamera();
+  container.querySelector('#be-fill-all')?.addEventListener('click', () => {
+    haltCameraUI();
     if (!nameInput.value.trim()) nameInput.value = 'Demo Subject';
     if (!refInput.value.trim()) {
       refInput.value = slugifyIdentityRef(nameInput.value) || `subject_${Date.now().toString().slice(-4)}`;
@@ -558,30 +595,30 @@ export function renderEnrollment(container, { appState, navigate }) {
     const seed = refInput.value.trim();
     setFaceSyntheticSample(seed);
     const p = synthesizeSampleVoicePCM(seed, 3);
-    setVoice(p.samples, p.sampleRate, 'QA Sample (96-D)', 'test_sample');
-    setFp(renderSampleFingerprintCanvas(seed), 'QA Sample (Minutiae)', 'test_sample');
-    container.querySelector('#be-consent').checked = true;
+    setVoice(p.samples, p.sampleRate, 'QA Sample', 'test_sample');
+    setFp(renderSampleFingerprintCanvas(seed), 'QA Sample', 'test_sample');
+    consentInput.checked = true;
+    updateSummary();
     showToast('Loaded synthetic QA test samples across all 3 modalities.', 'neutral');
   });
 
   container.querySelector('#be-cam-start').addEventListener('click', async () => {
     try {
-      stopCamera();
+      haltCameraUI();
       faceSt.className = 'state-text state-warning';
-      faceSt.textContent = 'Loading ML...';
-      faceQEl.textContent = 'Loading BlazeFace + FaceMesh + FaceRes-1024D models...';
+      faceSt.textContent = 'Starting Camera...';
+      faceQEl.textContent = 'Initializing face detection models...';
       await ensureFaceEngineReady();
 
-      activeStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } } });
+      activeStream = await openCameraStream();
       const wrap = document.createElement('div');
       wrap.className = 'face-guide-wrap';
-      const v = document.createElement('video');
-      v.autoplay = true; v.playsInline = true; v.muted = true; v.srcObject = activeStream;
+      const v = await createLiveVideoElement(activeStream);
       const oval = document.createElement('div');
       oval.className = 'face-guide-oval';
       const msgBadge = document.createElement('div');
       msgBadge.className = 'face-guide-status';
-      msgBadge.textContent = 'Position face inside guide oval...';
+      msgBadge.textContent = 'Center face inside oval guide...';
 
       wrap.appendChild(v);
       wrap.appendChild(oval);
@@ -591,6 +628,7 @@ export function renderEnrollment(container, { appState, navigate }) {
       faceSt.className = 'state-text state-neutral';
       faceSt.textContent = 'Live Preview';
       camSnap.disabled = false;
+      camStopBtn.hidden = false;
 
       guidanceTimer = setInterval(async () => {
         if (!activeStream) return;
@@ -611,22 +649,31 @@ export function renderEnrollment(container, { appState, navigate }) {
           await new Promise((r) => setTimeout(r, 280));
           const frame2 = snapVideoFrameCanvas(v);
           const motion = computeFrameMotion(frame1, frame2);
-          stopCamera();
-          await setFaceReal(frame2, 'Live Capture', {
+          haltCameraUI();
+          await setFaceReal(frame2, 'Captured ✓', {
             isLiveCapture: true,
             frameMotionScore: motion,
             captureSource: 'webcam',
           });
         } finally {
-          camSnap.textContent = 'Capture Live';
-          stopCamera();
+          camSnap.textContent = 'Capture Photo';
+          haltCameraUI();
         }
       };
     } catch (err) {
+      haltCameraUI();
       faceSt.className = 'state-text state-danger';
       faceSt.textContent = 'Camera Error';
       showToast(`Camera error: ${err.message}`, 'warning');
     }
+  });
+
+  camStopBtn.addEventListener('click', () => {
+    haltCameraUI();
+    facePrev.textContent = 'No face image';
+    faceSt.className = 'state-text state-neutral';
+    faceSt.textContent = 'Primary / Any 1+';
+    faceQEl.textContent = 'Camera stopped';
   });
 
   container.querySelector('#be-face-file').addEventListener('change', async (e) => {
@@ -634,15 +681,15 @@ export function renderEnrollment(container, { appState, navigate }) {
     if (!f) return;
     if (f.size > 8 * 1024 * 1024) { showToast('Face image exceeds 8 MB limit.', 'danger'); return; }
     try {
-      stopCamera();
-      await setFaceReal(await loadImageFile(f), 'FaceRes-1024D Ready', { captureSource: 'upload' });
+      haltCameraUI();
+      await setFaceReal(await loadImageFile(f), 'Uploaded ✓', { captureSource: 'upload' });
     } catch (err) {
       showToast(err.message, 'danger');
     }
   });
 
-  container.querySelector('#be-face-sample').addEventListener('click', () => {
-    stopCamera();
+  container.querySelector('#be-face-sample')?.addEventListener('click', () => {
+    haltCameraUI();
     const ref = refInput.value.trim() || 'sample_id';
     setFaceSyntheticSample(ref);
   });
@@ -654,7 +701,7 @@ export function renderEnrollment(container, { appState, navigate }) {
       const p = await recordMicrophonePCM(2400, ({ elapsedSec, totalSec }) => {
         btn.textContent = `Recording ${elapsedSec.toFixed(1)}/${totalSec.toFixed(1)}s...`;
       });
-      setVoice(p.samples, p.sampleRate, 'Mic Ready (96-D)', 'microphone', p.wavUrl);
+      setVoice(p.samples, p.sampleRate, 'Recorded ✓', 'microphone', p.wavUrl);
     } catch (err) {
       showToast(`Mic error: ${err.message}`, 'warning');
     } finally {
@@ -668,35 +715,35 @@ export function renderEnrollment(container, { appState, navigate }) {
     if (!f) return;
     try {
       const p = await decodeAudioFileToPCM(f);
-      setVoice(p.samples, p.sampleRate, 'Uploaded (96-D)', 'upload');
+      setVoice(p.samples, p.sampleRate, 'Uploaded ✓', 'upload');
     } catch (err) {
       showToast(err.message, 'danger');
     }
   });
 
-  container.querySelector('#be-voice-sample').addEventListener('click', () => {
+  container.querySelector('#be-voice-sample')?.addEventListener('click', () => {
     const ref = refInput.value.trim() || 'sample_id';
     const p = synthesizeSampleVoicePCM(ref, 3);
-    setVoice(p.samples, p.sampleRate, 'QA Sample (96-D)', 'test_sample');
+    setVoice(p.samples, p.sampleRate, 'QA Sample', 'test_sample');
   });
 
   container.querySelector('#be-fp-file').addEventListener('change', async (e) => {
     const f = e.target.files?.[0];
     if (!f) return;
-    try { setFp(await loadImageFile(f), 'Minutiae Ready', 'upload'); }
+    try { setFp(await loadImageFile(f), 'Uploaded ✓', 'upload'); }
     catch (err) { showToast(err.message, 'danger'); }
   });
 
-  container.querySelector('#be-fp-sample').addEventListener('click', () => {
+  container.querySelector('#be-fp-sample')?.addEventListener('click', () => {
     const ref = refInput.value.trim() || 'sample_id';
-    setFp(renderSampleFingerprintCanvas(ref), 'QA Sample (Minutiae)', 'test_sample');
+    setFp(renderSampleFingerprintCanvas(ref), 'QA Sample', 'test_sample');
   });
 
   container.querySelector('#be-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const identityRef = refInput.value.trim();
     const displayName = nameInput.value.trim();
-    const consentRecorded = container.querySelector('#be-consent').checked;
+    const consentRecorded = consentInput.checked;
     const submitBtn = container.querySelector('#be-submit');
 
     const samples = {};
@@ -715,7 +762,11 @@ export function renderEnrollment(container, { appState, navigate }) {
     }
 
     if (!Object.keys(samples).length) {
-      showToast('Provide at least one biometric sample before enrolling.', 'warning');
+      showToast('Provide at least one biometric modality before enrolling.', 'warning');
+      return;
+    }
+    if (!consentRecorded) {
+      showToast('Explicit biometric consent must be checked before enrollment.', 'warning');
       return;
     }
 
@@ -742,26 +793,55 @@ export function renderEnrollment(container, { appState, navigate }) {
         type: 'success',
       });
 
+      const usedSynthetic =
+        faceQuality?.captureSource === 'test_sample' ||
+        voiceQuality?.captureSource === 'test_sample' ||
+        fpQuality?.captureSource === 'test_sample';
+
       const warnHtml = (apiRes.qualityWarnings || []).length
-        ? `<div style="margin-top:4px;font-size:12.5px;color:var(--status-warning);">Warnings: ${escapeHtml(apiRes.qualityWarnings.join(' · '))}</div>`
+        ? `<div style="font-size:12.5px;color:var(--status-warning);">Quality notes: ${escapeHtml(apiRes.qualityWarnings.join(' · '))}</div>`
         : '';
 
       const resContainer = container.querySelector('#be-result');
       resContainer.innerHTML = `
-        <div class="notice-strip success" style="align-items:center;">
-          <div>
-            <strong>Enrollment Confirmed &amp; Quality Verified (${apiRes.processingTimeMs} ms)</strong>
-            <div>Identity <span class="mono">${escapeHtml(apiRes.identityRef)}</span> encrypted in AES-256-GCM vault with <span class="mono">${escapeHtml(apiRes.registeredModalities.join(', '))}</span> (${escapeHtml(apiRes.featureVersion)}).</div>
-            ${warnHtml}
+        <section class="panel stack-md" style="border-color:rgba(20, 184, 166, 0.4);">
+          <div class="row-between">
+            <div class="stack-sm" style="gap:2px;">
+              <span class="state-text state-success">Enrollment Complete</span>
+              <h3 class="panel-title">${escapeHtml(displayName)} (<span class="mono">${escapeHtml(apiRes.identityRef)}</span>)</h3>
+            </div>
+            <div class="row-wrap">
+              <button type="button" class="btn btn-primary btn-sm" id="be-verify-now">Verify This Identity</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="be-view-list">View Identities</button>
+            </div>
           </div>
-          <button type="button" class="btn btn-primary btn-sm" id="be-verify-now">Verify This Identity</button>
-        </div>
+
+          <div class="divider-list" style="font-size:13.5px;">
+            <div class="divider-row">
+              <span>Enrolled Modalities</span>
+              <span class="mono" style="text-transform:capitalize;">${escapeHtml(apiRes.registeredModalities.join(', '))}</span>
+            </div>
+            <div class="divider-row">
+              <span>Vault Storage &amp; Consent</span>
+              <span class="state-text state-success">AES-256-GCM Encrypted · Explicit Consent Recorded</span>
+            </div>
+            <div class="divider-row">
+              <span>Pre-Submission Quality</span>
+              <span class="mono">Passed (${apiRes.processingTimeMs} ms)</span>
+            </div>
+          </div>
+          ${usedSynthetic ? `<div class="notice-strip warning"><div><strong>Developer QA Sample Notice</strong><div>This enrollment includes synthetic QA test data and should not be treated as a real subject biometric record.</div></div></div>` : ''}
+          ${warnHtml}
+        </section>
       `;
       resContainer.querySelector('#be-verify-now')?.addEventListener('click', () => {
         navigate('verification', { identityRef: apiRes.identityRef });
       });
+      resContainer.querySelector('#be-view-list')?.addEventListener('click', () => {
+        navigate('identities');
+      });
       showToast(`Identity "${identityRef}" enrolled.`, 'success');
-      stopCamera();
+      haltCameraUI();
     } catch (err) {
       container.querySelector('#be-result').innerHTML = `<div class="notice-strip danger"><div><strong>Enrollment Quality / Validation Rejected</strong><div>${escapeHtml(err.message)}</div></div></div>`;
       showToast(err.message, 'danger');
@@ -816,12 +896,13 @@ export function renderVerification(container, { appState, navigate }) {
     : 'hierarchical';
 
   const defaultPolicy = appState.settings?.fusionPolicy || 'hierarchical_adaptive';
+  const devMode = isDevTestingModeActive(appState);
 
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <h1 class="page-title">Verification Center</h1>
-        <p class="page-subtitle">Runs signal quality gating, anti-spoofing liveness, quality-weighted multimodal fusion, conflict detection, and adaptive risk enforcement.</p>
+        <h1 class="page-title">Verification</h1>
+        <p class="page-subtitle">Verify an identity claim using live capture or uploaded biometric probes with liveness and risk screening.</p>
       </div>
       ${
         identities.length === 0 && appState.permissions.includes('create_identity')
@@ -831,12 +912,28 @@ export function renderVerification(container, { appState, navigate }) {
     </div>
 
     ${
+      devMode
+        ? `<div class="dev-mode-strip">
+            <div><strong>Developer / Testing Mode Active</strong> — Synthetic QA probe loaders are enabled below (tagged <span class="mono">isTestProbe=true</span>).</div>
+            ${
+              identities.length > 0
+                ? `<div class="row-wrap">
+                    <button type="button" class="btn btn-secondary btn-sm" id="mv-load-match">Load Matching QA Probes</button>
+                    <button type="button" class="btn btn-ghost btn-sm" id="mv-load-impostor">Load Impostor QA Probes</button>
+                  </div>`
+                : ''
+            }
+          </div>`
+        : ''
+    }
+
+    ${
       identities.length === 0
-        ? `<section class="panel"><div class="empty-state"><div class="empty-title">No active identities enrolled yet</div><div class="empty-desc">Enroll at least one biometric identity first before running verification checks.</div></div></section>`
+        ? `<section class="panel"><div class="empty-state"><div class="empty-title">No active identities enrolled yet</div><div class="empty-desc">Enroll at least one biometric identity before running verification checks.</div></div></section>`
         : `
       <div class="panel stack-md">
-        <div class="row-between" style="align-items:flex-start;">
-          <div class="form-field" style="min-width:250px;flex:1;max-width:380px;">
+        <div class="form-grid">
+          <div class="form-field">
             <label class="field-label" for="mv-id">Claimed Identity</label>
             <select class="select" id="mv-id">
               ${identities
@@ -849,43 +946,49 @@ export function renderVerification(container, { appState, navigate }) {
             <span id="mv-enrolled-info" class="meta-line"></span>
           </div>
 
-          <div class="form-field" style="min-width:220px;flex:1;max-width:300px;">
-            <label class="field-label" for="mv-policy">Fusion Policy</label>
-            <select class="select" id="mv-policy">
-              ${FUSION_POLICIES.map((fp) => `<option value="${fp.id}" ${fp.id === defaultPolicy ? 'selected' : ''}>${escapeHtml(fp.label)}</option>`).join('')}
-            </select>
-            <span id="mv-policy-desc" class="meta-line"></span>
-          </div>
-
-          <div class="form-field" style="min-width:200px;flex:1;max-width:240px;">
-            <label class="field-label" for="mv-gt">Ground Truth Label</label>
-            <select class="select" id="mv-gt">
-              <option value="unlabeled">Unlabeled (Operational)</option>
-              <option value="genuine">Genuine Trial (Known Same Subject)</option>
-              <option value="impostor">Impostor Trial (Known Different Subject)</option>
-            </select>
-            <span class="meta-line">Labeled trials power FAR/FRR/EER</span>
+          <div class="form-field" style="justify-content:flex-end;">
+            <span class="field-label">Active Evaluation Mode</span>
+            <div id="mv-active-summary" class="meta-line" style="min-height:40px;align-items:center;"></div>
           </div>
         </div>
 
-        <div class="stack-sm" style="gap:6px;">
-          <span class="field-label">Verification Pipeline</span>
-          <div class="segmented" id="mv-tabs">
-            ${PIPELINE_CATALOG.map((p) => `<button type="button" class="segmented-btn" data-pipe="${p.key}">${escapeHtml(p.label)}</button>`).join('')}
-          </div>
-          <span id="mv-pipe-desc" class="meta-line"></span>
-        </div>
+        <details class="advanced-details" id="mv-options-details">
+          <summary>Advanced Options (Pipeline, Fusion Policy &amp; Evaluation Label)</summary>
+          <div class="advanced-details-body">
+            <div class="form-grid">
+              <div class="form-field">
+                <label class="field-label" for="mv-policy">Fusion Policy</label>
+                <select class="select" id="mv-policy">
+                  ${FUSION_POLICIES.map((fp) => `<option value="${fp.id}" ${fp.id === defaultPolicy ? 'selected' : ''}>${escapeHtml(fp.label)}</option>`).join('')}
+                </select>
+                <span id="mv-policy-desc" class="meta-line"></span>
+              </div>
 
-        <div class="row-between" style="padding-top:8px;border-top:1px solid var(--border-hairline);">
-          <label class="checkbox-row">
-            <input type="checkbox" id="mv-adaptive" checked />
-            <span>Adaptive Risk Enforcement (tighten threshold or require MFA when risk score ≥ 50)</span>
-          </label>
-          <div class="row-wrap">
-            <button type="button" class="btn btn-secondary btn-sm" id="mv-load-match">Load Matching QA Probes</button>
-            <button type="button" class="btn btn-ghost btn-sm" id="mv-load-impostor">Load Impostor QA Probes</button>
+              <div class="form-field">
+                <label class="field-label" for="mv-gt">Evaluation Trial Label</label>
+                <select class="select" id="mv-gt">
+                  <option value="unlabeled">Unlabeled (Operational)</option>
+                  <option value="genuine">Genuine Trial (Known Same Subject)</option>
+                  <option value="impostor">Impostor Trial (Known Different Subject)</option>
+                </select>
+                <span class="meta-line">Labeled trials feed FAR, FRR, and EER accuracy reports</span>
+              </div>
+            </div>
+
+            <div class="stack-sm" style="gap:6px;">
+              <span class="field-label">Verification Pipeline</span>
+              <div class="segmented" id="mv-tabs">
+                ${PIPELINE_CATALOG.map((p) => `<button type="button" class="segmented-btn" data-pipe="${p.key}">${escapeHtml(p.label)}</button>`).join('')}
+              </div>
+              <span id="mv-pipe-desc" class="meta-line"></span>
+            </div>
+
+            <label class="checkbox-row">
+              <input type="checkbox" id="mv-adaptive" checked />
+              <span>Adaptive Risk Enforcement (tighten threshold or require MFA when risk score &ge; 50)</span>
+            </label>
           </div>
-        </div>
+        </details>
 
         <div class="grid-3">
           <div class="probe-card" id="mv-card-face">
@@ -897,13 +1000,18 @@ export function renderVerification(container, { appState, navigate }) {
               <span id="mv-face-st" class="state-text state-neutral">Empty</span>
             </div>
             <div id="mv-face-live-wrap" class="preview-frame" style="max-height:175px;" hidden></div>
-            <div id="mv-face-q" class="meta-line"></div>
+            <div id="mv-face-q" class="meta-line">Live camera or photo upload</div>
             <div class="row-wrap">
-              <button type="button" class="btn btn-secondary btn-sm" id="mv-face-cam">Live Webcam</button>
-              <button type="button" class="btn btn-primary btn-sm" id="mv-face-snap" hidden>Capture (Liveness)</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="mv-face-cam">Live Camera</button>
+              <button type="button" class="btn btn-primary btn-sm" id="mv-face-snap" hidden>Capture</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="mv-face-stop" hidden>Stop</button>
               <label class="btn btn-secondary btn-sm" style="cursor:pointer;">Upload<input type="file" id="mv-face-file" accept="image/*" hidden /></label>
-              <button type="button" class="btn btn-ghost btn-sm" id="mv-face-gen">Match QA</button>
-              <button type="button" class="btn btn-ghost btn-sm" id="mv-face-imp">Impostor QA</button>
+              ${
+                devMode
+                  ? `<button type="button" class="btn btn-ghost btn-sm" id="mv-face-gen">Match QA</button>
+                     <button type="button" class="btn btn-ghost btn-sm" id="mv-face-imp">Impostor QA</button>`
+                  : ''
+              }
             </div>
           </div>
 
@@ -916,12 +1024,16 @@ export function renderVerification(container, { appState, navigate }) {
               <span id="mv-voice-st" class="state-text state-neutral">Empty</span>
             </div>
             <div id="mv-voice-audio-slot" hidden><audio id="mv-voice-player" controls style="width:100%;height:34px;"></audio></div>
-            <div id="mv-voice-q" class="meta-line"></div>
+            <div id="mv-voice-q" class="meta-line">Record 2.4s microphone or audio upload</div>
             <div class="row-wrap">
               <button type="button" class="btn btn-secondary btn-sm" id="mv-voice-mic">Mic (2.4s)</button>
               <label class="btn btn-secondary btn-sm" style="cursor:pointer;">Upload<input type="file" id="mv-voice-file" accept="audio/*" hidden /></label>
-              <button type="button" class="btn btn-ghost btn-sm" id="mv-voice-gen">Match QA</button>
-              <button type="button" class="btn btn-ghost btn-sm" id="mv-voice-imp">Impostor QA</button>
+              ${
+                devMode
+                  ? `<button type="button" class="btn btn-ghost btn-sm" id="mv-voice-gen">Match QA</button>
+                     <button type="button" class="btn btn-ghost btn-sm" id="mv-voice-imp">Impostor QA</button>`
+                  : ''
+              }
             </div>
           </div>
 
@@ -933,17 +1045,21 @@ export function renderVerification(container, { appState, navigate }) {
               </div>
               <span id="mv-fp-st" class="state-text state-neutral">Empty</span>
             </div>
-            <div id="mv-fp-q" class="meta-line"></div>
+            <div id="mv-fp-q" class="meta-line">Upload optical or capacitive ridge image</div>
             <div class="row-wrap">
               <label class="btn btn-secondary btn-sm" style="cursor:pointer;">Upload Print<input type="file" id="mv-fp-file" accept="image/*" hidden /></label>
-              <button type="button" class="btn btn-ghost btn-sm" id="mv-fp-gen">Match QA</button>
-              <button type="button" class="btn btn-ghost btn-sm" id="mv-fp-imp">Impostor QA</button>
+              ${
+                devMode
+                  ? `<button type="button" class="btn btn-ghost btn-sm" id="mv-fp-gen">Match QA</button>
+                     <button type="button" class="btn btn-ghost btn-sm" id="mv-fp-imp">Impostor QA</button>`
+                  : ''
+              }
             </div>
           </div>
         </div>
 
         <div class="row-between">
-          <span class="meta-line">Evaluated server-side against AES-256-GCM templates; model similarity is never treated as identity probability.</span>
+          <span class="meta-line">Matched securely server-side against encrypted AES-256-GCM vault templates.</span>
           <button type="button" class="btn btn-primary" id="mv-run">Verify Identity</button>
         </div>
       </div>
@@ -959,6 +1075,7 @@ export function renderVerification(container, { appState, navigate }) {
   const idSel = container.querySelector('#mv-id');
   const policySel = container.querySelector('#mv-policy');
   const policyDescEl = container.querySelector('#mv-policy-desc');
+  const activeSummaryEl = container.querySelector('#mv-active-summary');
   const gtSel = container.querySelector('#mv-gt');
   const enrolledInfoEl = container.querySelector('#mv-enrolled-info');
   const pipeDescEl = container.querySelector('#mv-pipe-desc');
@@ -966,6 +1083,7 @@ export function renderVerification(container, { appState, navigate }) {
   const faceQEl = container.querySelector('#mv-face-q');
   const faceLiveWrap = container.querySelector('#mv-face-live-wrap');
   const faceSnapBtn = container.querySelector('#mv-face-snap');
+  const faceStopBtn = container.querySelector('#mv-face-stop');
   const voiceSt = container.querySelector('#mv-voice-st');
   const voiceQEl = container.querySelector('#mv-voice-q');
   const voiceAudioSlot = container.querySelector('#mv-voice-audio-slot');
@@ -975,9 +1093,18 @@ export function renderVerification(container, { appState, navigate }) {
 
   const getSelectedIdentity = () => identities.find((i) => i.identityRef === idSel.value) || identities[0];
 
+  const syncActiveSummary = () => {
+    const activePipe = PIPELINE_CATALOG.find((p) => p.key === selectedPipeline) || PIPELINE_CATALOG[0];
+    const activePol = FUSION_POLICIES.find((p) => p.id === policySel.value);
+    if (activeSummaryEl) {
+      activeSummaryEl.textContent = `${activePipe.label} · ${activePol?.label || policySel.value}`;
+    }
+  };
+
   const syncPolicyDesc = () => {
     const def = FUSION_POLICIES.find((p) => p.id === policySel.value);
     if (policyDescEl && def) policyDescEl.textContent = def.summary;
+    syncActiveSummary();
   };
   syncPolicyDesc();
   policySel.addEventListener('change', syncPolicyDesc);
@@ -985,7 +1112,7 @@ export function renderVerification(container, { appState, navigate }) {
   const syncAdaptiveUI = () => {
     const idObj = getSelectedIdentity();
     const enrolled = new Set(idObj?.registeredModalities || []);
-    enrolledInfoEl.textContent = `Enrolled: ${[...enrolled].join(', ') || 'none'} · ${idObj?.featureVersion || 'v2.0-multimodal'}`;
+    enrolledInfoEl.textContent = `Enrolled: ${[...enrolled].join(', ') || 'none'}`;
 
     const compatible = PIPELINE_CATALOG.filter((p) => p.requires.every((m) => enrolled.has(m)));
     if (!compatible.some((p) => p.key === selectedPipeline)) {
@@ -1002,6 +1129,7 @@ export function renderVerification(container, { appState, navigate }) {
 
     const activeDef = PIPELINE_CATALOG.find((p) => p.key === selectedPipeline) || PIPELINE_CATALOG[0];
     pipeDescEl.textContent = activeDef.description;
+    syncActiveSummary();
 
     const updateCard = (mod, cardSel, reqSel) => {
       const card = container.querySelector(cardSel);
@@ -1010,7 +1138,7 @@ export function renderVerification(container, { appState, navigate }) {
       const isOpt = activeDef.optional.includes(mod) && enrolled.has(mod);
       card.classList.toggle('required-active', isReq);
       card.classList.toggle('inactive', !isReq && !isOpt);
-      req.textContent = isReq ? 'Required for pipeline' : isOpt ? 'Optional Stage 2 fallback' : 'Not used in selected pipeline';
+      req.textContent = isReq ? 'Required' : isOpt ? 'Optional secondary' : 'Not used in pipeline';
     };
     updateCard('face', '#mv-card-face', '#mv-face-req');
     updateCard('voice', '#mv-card-voice', '#mv-voice-req');
@@ -1185,7 +1313,7 @@ export function renderVerification(container, { appState, navigate }) {
     fpQEl.textContent = `Synthetic impostor print (${fpTemplate.minutiae.length} minutiae)`;
   };
 
-  container.querySelector('#mv-load-match').addEventListener('click', () => {
+  container.querySelector('#mv-load-match')?.addEventListener('click', () => {
     const idObj = getSelectedIdentity();
     const enrolled = new Set(idObj?.registeredModalities || []);
     const def = PIPELINE_CATALOG.find((p) => p.key === selectedPipeline) || PIPELINE_CATALOG[0];
@@ -1196,7 +1324,7 @@ export function renderVerification(container, { appState, navigate }) {
     showToast('Loaded matching QA probes (labeled Genuine Trial).', 'neutral');
   });
 
-  container.querySelector('#mv-load-impostor').addEventListener('click', () => {
+  container.querySelector('#mv-load-impostor')?.addEventListener('click', () => {
     const idObj = getSelectedIdentity();
     const enrolled = new Set(idObj?.registeredModalities || []);
     const def = PIPELINE_CATALOG.find((p) => p.key === selectedPipeline) || PIPELINE_CATALOG[0];
@@ -1207,18 +1335,24 @@ export function renderVerification(container, { appState, navigate }) {
     showToast('Loaded impostor QA probes (labeled Impostor Trial).', 'warning');
   });
 
+  const haltProbeCamera = () => {
+    stopCamera();
+    faceSnapBtn.hidden = true;
+    faceStopBtn.hidden = true;
+    faceLiveWrap.hidden = true;
+  };
+
   container.querySelector('#mv-face-cam').addEventListener('click', async () => {
     try {
-      stopCamera();
+      haltProbeCamera();
       faceSt.className = 'state-text state-warning';
-      faceSt.textContent = 'Loading ML...';
+      faceSt.textContent = 'Starting Camera...';
       await ensureFaceEngineReady();
 
-      activeStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } } });
+      activeStream = await openCameraStream();
       const wrap = document.createElement('div');
       wrap.className = 'face-guide-wrap';
-      const v = document.createElement('video');
-      v.autoplay = true; v.playsInline = true; v.muted = true; v.srcObject = activeStream;
+      const v = await createLiveVideoElement(activeStream);
       const oval = document.createElement('div');
       oval.className = 'face-guide-oval';
       const msgBadge = document.createElement('div');
@@ -1232,6 +1366,7 @@ export function renderVerification(container, { appState, navigate }) {
       faceLiveWrap.appendChild(wrap);
       faceLiveWrap.hidden = false;
       faceSnapBtn.hidden = false;
+      faceStopBtn.hidden = false;
       faceSt.className = 'state-text state-neutral';
       faceSt.textContent = 'Live Preview';
 
@@ -1254,35 +1389,40 @@ export function renderVerification(container, { appState, navigate }) {
           await new Promise((r) => setTimeout(r, 280));
           const f2 = snapVideoFrameCanvas(v);
           const motion = computeFrameMotion(f1, f2);
-          stopCamera();
-          await setFaceRealProbe(f2, 'Live Webcam', {
+          haltProbeCamera();
+          await setFaceRealProbe(f2, 'Live Capture ✓', {
             isLiveCapture: true,
             frameMotionScore: motion,
             captureSource: 'webcam',
           });
         } finally {
           faceSnapBtn.disabled = false;
-          faceSnapBtn.textContent = 'Capture (Liveness)';
-          faceSnapBtn.hidden = true;
-          faceLiveWrap.hidden = true;
-          stopCamera();
+          faceSnapBtn.textContent = 'Capture';
+          haltProbeCamera();
         }
       };
     } catch (err) {
+      haltProbeCamera();
       faceSt.className = 'state-text state-danger';
       faceSt.textContent = 'Camera Error';
-      showToast(`Webcam error: ${err.message}`, 'warning');
+      showToast(`Camera error: ${err.message}`, 'warning');
     }
+  });
+
+  faceStopBtn.addEventListener('click', () => {
+    haltProbeCamera();
+    faceSt.className = 'state-text state-neutral';
+    faceSt.textContent = faceVec ? 'Ready' : 'Empty';
   });
 
   container.querySelector('#mv-face-file').addEventListener('change', async (e) => {
     const f = e.target.files?.[0];
     if (!f) return;
-    try { stopCamera(); await setFaceRealProbe(await loadImageFile(f), 'Uploaded', { captureSource: 'upload' }); }
+    try { haltProbeCamera(); await setFaceRealProbe(await loadImageFile(f), 'Uploaded ✓', { captureSource: 'upload' }); }
     catch (err) { showToast(err.message, 'danger'); }
   });
-  container.querySelector('#mv-face-gen').addEventListener('click', loadFaceMatch);
-  container.querySelector('#mv-face-imp').addEventListener('click', loadFaceImpostor);
+  container.querySelector('#mv-face-gen')?.addEventListener('click', loadFaceMatch);
+  container.querySelector('#mv-face-imp')?.addEventListener('click', loadFaceImpostor);
 
   container.querySelector('#mv-voice-mic').addEventListener('click', async (e) => {
     const b = e.currentTarget; b.disabled = true;
@@ -1290,7 +1430,7 @@ export function renderVerification(container, { appState, navigate }) {
       const p = await recordMicrophonePCM(2400, ({ elapsedSec, totalSec }) => {
         b.textContent = `${elapsedSec.toFixed(1)}/${totalSec.toFixed(1)}s`;
       });
-      setVoiceProbe(p.samples, p.sampleRate, 'Mic Captured', 'microphone', p.wavUrl);
+      setVoiceProbe(p.samples, p.sampleRate, 'Recorded ✓', 'microphone', p.wavUrl);
     } catch (err) { showToast(err.message, 'warning'); }
     finally { b.disabled = false; b.textContent = 'Mic (2.4s)'; }
   });
@@ -1299,20 +1439,20 @@ export function renderVerification(container, { appState, navigate }) {
     if (!f) return;
     try {
       const p = await decodeAudioFileToPCM(f);
-      setVoiceProbe(p.samples, p.sampleRate, 'Uploaded', 'upload');
+      setVoiceProbe(p.samples, p.sampleRate, 'Uploaded ✓', 'upload');
     } catch (err) { showToast(err.message, 'danger'); }
   });
-  container.querySelector('#mv-voice-gen').addEventListener('click', loadVoiceMatch);
-  container.querySelector('#mv-voice-imp').addEventListener('click', loadVoiceImpostor);
+  container.querySelector('#mv-voice-gen')?.addEventListener('click', loadVoiceMatch);
+  container.querySelector('#mv-voice-imp')?.addEventListener('click', loadVoiceImpostor);
 
   container.querySelector('#mv-fp-file').addEventListener('change', async (e) => {
     const f = e.target.files?.[0];
     if (!f) return;
-    try { setFpProbe(await loadImageFile(f), 'Uploaded', 'upload'); }
+    try { setFpProbe(await loadImageFile(f), 'Uploaded ✓', 'upload'); }
     catch (err) { showToast(err.message, 'danger'); }
   });
-  container.querySelector('#mv-fp-gen').addEventListener('click', loadFpMatch);
-  container.querySelector('#mv-fp-imp').addEventListener('click', loadFpImpostor);
+  container.querySelector('#mv-fp-gen')?.addEventListener('click', loadFpMatch);
+  container.querySelector('#mv-fp-imp')?.addEventListener('click', loadFpImpostor);
 
   container.querySelector('#mv-run').addEventListener('click', async () => {
     const identityRef = idSel.value;
@@ -1418,26 +1558,40 @@ export function renderVerification(container, { appState, navigate }) {
       const modRows = Object.entries(res.modalityEvaluations || {});
 
       resultEl.innerHTML = `
-        <div class="panel stack-md">
+        <section class="panel stack-md">
           <div class="row-between">
             <div class="stack-sm" style="gap:2px;">
-              <span class="state-text ${outcomeCls}">Verification Decision: ${escapeHtml(res.outcome.toUpperCase())} (${escapeHtml(res.reasonCode)})</span>
-              <h3 class="panel-title">${escapeHtml(res.identityRef)} · ${escapeHtml(res.pipeline)} · <span class="mono">${escapeHtml(res.fusionPolicy)}</span></h3>
+              <span class="state-text ${outcomeCls}">Decision: ${escapeHtml(res.outcome === 'match' ? 'MATCH (VERIFIED)' : res.outcome === 'no_match' ? 'NO MATCH (REJECTED)' : 'NOT EVALUATED')}</span>
+              <h3 class="panel-title">${escapeHtml(res.identityRef)}</h3>
+              <span class="meta-line">${escapeHtml(res.reasonCode)}</span>
             </div>
-            <div class="row-wrap">
-              <div style="text-align:right;">
-                <div class="meta-line" style="justify-content:flex-end;">Model Similarity</div>
-                <div class="mono" style="font-size:21px;font-weight:700;">${fmtPct(res.score)}</div>
-              </div>
-              <div style="text-align:right;padding-left:14px;border-left:1px solid var(--border-hairline);">
-                <div class="meta-line" style="justify-content:flex-end;">Verification Confidence</div>
-                <div class="mono ${confCls}" style="font-size:18px;font-weight:700;">${fmtPct(res.confidence || 0)} (${escapeHtml(res.confidenceBand || 'low')})</div>
-              </div>
-              ${
-                appState.permissions.includes('use_ai_analyst')
-                  ? `<button type="button" class="btn btn-secondary btn-sm" id="mv-explain-ai">Explain in AI</button>`
-                  : ''
-              }
+            ${
+              appState.permissions.includes('use_ai_analyst')
+                ? `<button type="button" class="btn btn-secondary btn-sm" id="mv-explain-ai">Explain with AI Analyst</button>`
+                : ''
+            }
+          </div>
+
+          <div class="kpi-strip">
+            <div class="kpi-cell">
+              <span class="kpi-label">Similarity Score</span>
+              <span class="kpi-value">${fmtPct(res.score)}</span>
+              <span class="kpi-meta">Required: ${fmtPct(res.threshold)}</span>
+            </div>
+            <div class="kpi-cell">
+              <span class="kpi-label">Confidence</span>
+              <span class="kpi-value ${confCls}">${fmtPct(res.confidence || 0)}</span>
+              <span class="kpi-meta" style="text-transform:capitalize;">${escapeHtml(res.confidenceBand || 'low')} certainty</span>
+            </div>
+            <div class="kpi-cell">
+              <span class="kpi-label">Liveness Check</span>
+              <span class="kpi-value ${liveCls}" style="font-size:20px;">${res.liveness?.passed ? 'Passed' : 'Failed'}</span>
+              <span class="kpi-meta">Integrity score ${Math.round((res.liveness?.score ?? 0) * 100)}%</span>
+            </div>
+            <div class="kpi-cell">
+              <span class="kpi-label">Risk Indicator</span>
+              <span class="kpi-value ${riskCls}" style="font-size:20px;">${res.risk?.score ?? 0} / 100</span>
+              <span class="kpi-meta" style="text-transform:capitalize;">${escapeHtml(riskLvl)} risk</span>
             </div>
           </div>
 
@@ -1447,12 +1601,12 @@ export function renderVerification(container, { appState, navigate }) {
 
           ${
             res.conflictDetected
-              ? `<div class="notice-strip danger"><div><strong>Cross-Modality Conflict Blocked Override</strong><div>${escapeHtml((res.conflictDetails || []).join(' '))}</div></div></div>`
+              ? `<div class="notice-strip danger"><div><strong>Cross-Modality Conflict Detected</strong><div>${escapeHtml((res.conflictDetails || []).join(' '))}</div></div></div>`
               : ''
           }
           ${
             res.legacyCompatibility
-              ? `<div class="notice-strip warning"><div><strong>Legacy Template Compatibility Mode</strong><div>This identity was enrolled on <span class="mono">${escapeHtml(res.featureVersion)}</span>. Re-enroll in Enrollment Center to upgrade to v2.0 FaceRes-1024D &amp; Minutiae RANSAC.</div></div></div>`
+              ? `<div class="notice-strip warning"><div><strong>Legacy Template Compatibility Mode</strong><div>This identity uses <span class="mono">${escapeHtml(res.featureVersion)}</span>. Re-enroll in Enrollment to upgrade to the latest extractors.</div></div></div>`
               : ''
           }
           ${
@@ -1460,16 +1614,6 @@ export function renderVerification(container, { appState, navigate }) {
               ? `<div class="notice-strip warning"><div><strong>Decision Explanation</strong><div>${res.rejectionReasons.map((r) => `• ${escapeHtml(r)}`).join('<br/>')}</div></div></div>`
               : ''
           }
-
-          <div class="meta-line">
-            <span>Threshold: <strong class="mono">${fmtPct(res.threshold)}</strong>${res.adaptiveApplied ? ` (base ${fmtPct(res.baseThreshold)})` : ''}</span>
-            <span aria-hidden="true">·</span>
-            <span>Ground Truth: <strong class="mono">${escapeHtml(groundTruth)}</strong></span>
-            <span aria-hidden="true">·</span>
-            <span>Processing Time: <strong class="mono">${res.processingTimeMs ?? '—'} ms</strong></span>
-            <span aria-hidden="true">·</span>
-            <span>Request: <span class="mono">${escapeHtml(res.requestId)}</span></span>
-          </div>
 
           ${
             modRows.length > 0
@@ -1480,9 +1624,8 @@ export function renderVerification(container, { appState, navigate }) {
                         <th>Modality</th>
                         <th class="num-col">Similarity</th>
                         <th class="num-col">Threshold</th>
-                        <th class="num-col">Signal Quality</th>
+                        <th class="num-col">Quality</th>
                         <th>Status</th>
-                        <th>Matcher Telemetry</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1490,12 +1633,6 @@ export function renderVerification(container, { appState, navigate }) {
                         .map(([mod, ev]) => {
                           const stCls = ev.strongMismatch ? 'state-danger' : ev.passed ? 'state-success' : 'state-warning';
                           const stTxt = ev.strongMismatch ? 'Strong Mismatch' : ev.passed ? 'Passed' : 'Below Threshold';
-                          const detStr =
-                            mod === 'fingerprint' && typeof ev.details?.matchedMinutiae === 'number'
-                              ? `${ev.details.matchedMinutiae}/${ev.details.probeMinutiae} minutiae · rot ${ev.details.estimatedRotationDeg}°`
-                              : typeof ev.rawCosine === 'number'
-                              ? `rawCos=${ev.rawCosine} (${ev.details?.dim || ''}-D)`
-                              : 'Evaluated';
                           return `
                           <tr>
                             <td style="text-transform:capitalize;"><strong>${escapeHtml(mod)}</strong></td>
@@ -1503,7 +1640,6 @@ export function renderVerification(container, { appState, navigate }) {
                             <td class="num-col">${fmtPct(ev.threshold)}</td>
                             <td class="num-col">${ev.qualityScore}/100</td>
                             <td><span class="state-text ${stCls}">${stTxt}</span></td>
-                            <td class="mono" style="font-size:12px;">${escapeHtml(detStr)}</td>
                           </tr>`;
                         })
                         .join('')}
@@ -1513,29 +1649,56 @@ export function renderVerification(container, { appState, navigate }) {
               : ''
           }
 
-          <div class="grid-2">
-            <div class="panel stack-sm" style="background:var(--bg-subtle);padding:14px 16px;">
-              <div class="row-between">
-                <strong>Liveness &amp; Anti-Spoofing</strong>
-                <span class="state-text ${liveCls}">${res.liveness?.passed ? 'Passed' : 'Failed'} (${Math.round((res.liveness?.score ?? 0) * 100)}%)</span>
+          <details class="advanced-details">
+            <summary>Advanced Details (Matcher Telemetry, Liveness &amp; Risk Factors)</summary>
+            <div class="advanced-details-body" style="font-size:12.5px;">
+              <div class="meta-line">
+                <span>Pipeline: <strong class="mono">${escapeHtml(res.pipeline)}</strong></span>
+                <span aria-hidden="true">·</span>
+                <span>Policy: <strong class="mono">${escapeHtml(res.fusionPolicy)}</strong></span>
+                <span aria-hidden="true">·</span>
+                <span>Threshold: <strong class="mono">${fmtPct(res.threshold)}</strong>${res.adaptiveApplied ? ` (base ${fmtPct(res.baseThreshold)})` : ''}</span>
+                <span aria-hidden="true">·</span>
+                <span>Trial: <strong class="mono">${escapeHtml(groundTruth)}</strong></span>
+                <span aria-hidden="true">·</span>
+                <span>Latency: <strong class="mono">${res.processingTimeMs ?? '—'} ms</strong></span>
+                <span aria-hidden="true">·</span>
+                <span>Request: <span class="mono">${escapeHtml(res.requestId)}</span></span>
               </div>
-              <div style="font-size:12.5px;color:var(--text-secondary);">
-                ${[...(res.liveness?.checks || []), ...(res.liveness?.spoofSignals || [])].map((x) => `<div>• ${escapeHtml(x)}</div>`).join('') || 'Checked signal integrity.'}
-              </div>
-            </div>
 
-            <div class="panel stack-sm" style="background:var(--bg-subtle);padding:14px 16px;">
-              <div class="row-between">
-                <strong>Behavioral Risk &amp; Adaptive Check</strong>
-                <span class="state-text ${riskCls}">${res.risk?.score ?? 0}/100 (${escapeHtml(riskLvl)})</span>
-              </div>
-              <div style="font-size:12.5px;color:var(--text-secondary);">
-                ${(res.risk?.factors || []).map((f) => `<div>• ${escapeHtml(f)}</div>`).join('')}
-                ${res.details?.adaptive?.reason ? `<div style="margin-top:4px;color:var(--accent);">Adaptive: ${escapeHtml(res.details.adaptive.reason)}</div>` : ''}
+              ${
+                modRows.length > 0
+                  ? `<div class="stack-sm" style="gap:4px;">
+                      <strong>Per-Modality Matcher Telemetry</strong>
+                      ${modRows
+                        .map(([mod, ev]) => {
+                          const detStr =
+                            mod === 'fingerprint' && typeof ev.details?.matchedMinutiae === 'number'
+                              ? `${ev.details.matchedMinutiae}/${ev.details.probeMinutiae} minutiae matched · rotation ${ev.details.estimatedRotationDeg}°`
+                              : typeof ev.rawCosine === 'number'
+                              ? `rawCos=${ev.rawCosine} (${ev.details?.dim || ''}-D vector)`
+                              : 'Evaluated';
+                          return `<div class="row-between"><span style="text-transform:capitalize;">${escapeHtml(mod)}</span><span class="mono">${escapeHtml(detStr)}</span></div>`;
+                        })
+                        .join('')}
+                    </div>`
+                  : ''
+              }
+
+              <div class="grid-2">
+                <div class="stack-sm" style="gap:4px;">
+                  <strong>Liveness Signals</strong>
+                  ${[...(res.liveness?.checks || []), ...(res.liveness?.spoofSignals || [])].map((x) => `<div>• ${escapeHtml(x)}</div>`).join('') || '<div>Checked signal integrity.</div>'}
+                </div>
+                <div class="stack-sm" style="gap:4px;">
+                  <strong>Risk &amp; Adaptive Policy</strong>
+                  ${(res.risk?.factors || []).map((f) => `<div>• ${escapeHtml(f)}</div>`).join('') || '<div>Normal baseline behavior.</div>'}
+                  ${res.details?.adaptive?.reason ? `<div style="color:var(--accent);">Adaptive: ${escapeHtml(res.details.adaptive.reason)}</div>` : ''}
+                </div>
               </div>
             </div>
-          </div>
-        </div>
+          </details>
+        </section>
       `;
 
       resultEl.querySelector('#mv-explain-ai')?.addEventListener('click', () => {
@@ -1569,16 +1732,16 @@ export function renderIdentities(container, { appState, navigate }) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <h1 class="page-title">Identity Directory</h1>
-        <p class="page-subtitle">Manage enrolled identities, launch 1:1 or 1:N comparisons, submit controlled deletion requests, or run verification.</p>
+        <h1 class="page-title">Identities</h1>
+        <p class="page-subtitle">Manage enrolled biometric profiles, launch verifications or searches, and process deletion governance.</p>
       </div>
       ${appState.permissions.includes('create_identity') ? `<div class="page-actions"><button type="button" class="btn btn-primary" id="id-enroll-btn">Enroll Identity</button></div>` : ''}
     </div>
 
     <section class="panel stack-md">
       <div class="row-between">
-        <div class="row-wrap">
-          <input type="search" class="input" id="id-search" placeholder="Search identityRef or displayName..." style="width:260px;" />
+        <div class="row-wrap" style="flex:1;">
+          <input type="search" class="input responsive-search" id="id-search" placeholder="Search identity ID or name..." />
           <div class="segmented" id="id-filter">
             <button type="button" class="segmented-btn active" data-st="all">All</button>
             <button type="button" class="segmented-btn" data-st="active">Active</button>
@@ -1691,21 +1854,36 @@ export function renderIdentities(container, { appState, navigate }) {
     });
 
     tbody.querySelectorAll('[data-toggle-id]').forEach((btn) => {
-      btn.addEventListener('click', async () => {
+      btn.addEventListener('click', () => {
         const ref = btn.dataset.toggleId;
         const nextSt = btn.dataset.nextSt;
-        try {
-          await updateIdentityStatusOrName(ref, { status: nextSt });
-          await appendAuditLog({
-            action: nextSt === 'active' ? 'identity_reactivated' : 'identity_deactivated',
-            resourceType: 'identity',
-            resourceId: ref,
-            result: `Status changed to ${nextSt}`,
-          });
-          showToast(`Identity "${ref}" set to ${nextSt}.`, 'success');
-        } catch (err) {
-          showToast(err.message, 'danger');
-        }
+        const activating = nextSt === 'active';
+        openModal({
+          title: `${activating ? 'Reactivate' : 'Deactivate'} Identity ${ref}?`,
+          bodyHtml: `<p style="font-size:13.5px;color:var(--text-secondary);">Confirm status change for <strong class="mono">${escapeHtml(ref)}</strong> to <strong class="mono">${escapeHtml(nextSt)}</strong>.${activating ? ' This profile will become eligible for verification and search.' : ' Deactivated identities cannot be verified until reactivated.'}</p>`,
+          footerButtons: [
+            { label: 'Cancel', variant: 'btn-secondary' },
+            {
+              label: activating ? 'Confirm Reactivation' : 'Confirm Deactivation',
+              variant: activating ? 'btn-primary' : 'btn-danger',
+              onClick: async ({ close }) => {
+                try {
+                  await updateIdentityStatusOrName(ref, { status: nextSt });
+                  await appendAuditLog({
+                    action: activating ? 'identity_reactivated' : 'identity_deactivated',
+                    resourceType: 'identity',
+                    resourceId: ref,
+                    result: `Status changed to ${nextSt}`,
+                  });
+                  close();
+                  showToast(`Identity "${ref}" set to ${nextSt}.`, 'success');
+                } catch (err) {
+                  showToast(err.message, 'danger');
+                }
+              },
+            },
+          ],
+        });
       });
     });
 

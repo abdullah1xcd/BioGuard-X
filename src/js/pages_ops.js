@@ -48,12 +48,12 @@ export function renderAnalytics(container, { appState }) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <h1 class="page-title">Analytics &amp; Validated Accuracy Reports</h1>
-        <p class="page-subtitle">Distinguishes operational match rate, model similarity, and verification confidence from ground-truth classification accuracy computed strictly from persisted Firestore records.</p>
+        <h1 class="page-title">Analytics &amp; Reports</h1>
+        <p class="page-subtitle">Measured classification accuracy, operational verification rates, and ROC analysis from persisted Firestore records.</p>
       </div>
       <div class="page-actions">
         <button type="button" class="btn btn-secondary" id="an-export-csv">Export CSV</button>
-        <button type="button" class="btn btn-secondary" id="an-export-json">Export Security Report (JSON)</button>
+        <button type="button" class="btn btn-secondary" id="an-export-json">Export Report (JSON)</button>
       </div>
     </div>
 
@@ -80,17 +80,15 @@ export function renderAnalytics(container, { appState }) {
       </div>
     </section>
 
-    <div class="notice-strip">
-      <div>
-        <strong>Statistical Integrity Definitions</strong>
-        <div style="font-size:12.5px;color:var(--text-secondary);">
-          <strong>1) Model Similarity</strong> measures normalized feature closeness (not probability).
-          <strong>2) Verification Confidence</strong> reflects decision margin + quality + liveness + modality agreement.
-          <strong>3) Classification Accuracy (TAR/FAR/FRR/EER/F1)</strong> is computed exclusively from <em>ground-truth labeled trials</em> (genuine vs impostor), never inferred from predicted matches.
-          <strong>4) Operational Success Rate</strong> tracks real match fraction on operational traffic.
-        </div>
+    <details class="advanced-details">
+      <summary>Methodology &amp; Statistical Integrity Definitions</summary>
+      <div class="advanced-details-body" style="font-size:12.5px;color:var(--text-secondary);">
+        <div><strong>1. Model Similarity:</strong> Normalized biometric feature closeness (not an identity probability).</div>
+        <div><strong>2. Verification Confidence:</strong> Composite index from threshold margin, signal quality, liveness checks, and modality agreement.</div>
+        <div><strong>3. Classification Accuracy (TAR/FAR/FRR/EER/F1):</strong> Computed exclusively from ground-truth labeled Genuine vs. Impostor trials using subject-disjoint evaluation methodology.</div>
+        <div><strong>4. Operational Success Rate:</strong> Fraction of live operational attempts resulting in a match.</div>
       </div>
-    </div>
+    </details>
 
     <div class="kpi-strip" id="an-kpis"></div>
 
@@ -188,7 +186,7 @@ export function renderAnalytics(container, { appState }) {
 
       ${
         c.insufficientData
-          ? `<div class="notice-strip warning"><div><strong>Insufficient Test Data for Reliable Classification Bounds</strong><div>${escapeHtml(c.insufficientReason)} Run labeled Genuine and Impostor trials in Verification Center (or load QA Match/Impostor probes) to establish genuine vs impostor separation.</div></div></div>`
+          ? `<div class="notice-strip warning"><div><strong>Insufficient Test Data for Reliable Classification Bounds</strong><div>${escapeHtml(c.insufficientReason)} Run labeled Genuine and Impostor trials in Verification to establish statistically reliable genuine vs. impostor separation.</div></div></div>`
           : ''
       }
 
@@ -460,8 +458,8 @@ export function renderThreatIntel(container, { appState, navigate }) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <h1 class="page-title">Risk &amp; Threat Analysis</h1>
-        <p class="page-subtitle">Investigate spoofing/liveness detections, suspicious verification velocity, and recommended security actions.</p>
+        <h1 class="page-title">Threat Monitoring</h1>
+        <p class="page-subtitle">Investigate spoofing detections, high-risk attempts, security alerts, and recommended actions.</p>
       </div>
       <div class="page-actions">
         <button type="button" class="btn btn-primary" id="ti-new-alert">Create Security Alert</button>
@@ -493,7 +491,7 @@ export function renderThreatIntel(container, { appState, navigate }) {
 
     <section class="panel stack-md">
       <div class="row-between">
-        <input type="search" class="input" id="ti-search" placeholder="Search alert category or description..." style="max-width:320px;" />
+        <input type="search" class="input responsive-search" id="ti-search" placeholder="Search alert category or description..." />
         <div class="segmented" id="ti-sev-tabs">
           <button type="button" class="segmented-btn active" data-sev="all">All</button>
           <button type="button" class="segmented-btn" data-sev="critical">Critical</button>
@@ -746,8 +744,8 @@ export function renderApprovals(container, { appState }) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <h1 class="page-title">Approval Workflow</h1>
-        <p class="page-subtitle">Controlled two-step authorization for sensitive biometric deletion and policy review requests.</p>
+        <h1 class="page-title">Approval Requests</h1>
+        <p class="page-subtitle">Controlled authorization queue for biometric deletion and policy review requests.</p>
       </div>
       <div class="page-actions">
         <button type="button" class="btn btn-primary" id="ap-new-btn">New Approval Request</button>
@@ -1012,16 +1010,30 @@ export function renderAutomationCenter(container, { appState }) {
   `;
 
   container.querySelectorAll('[data-toggle-wf]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
+    btn.addEventListener('click', () => {
       const id = btn.dataset.toggleWf;
       const enabled = btn.dataset.nextEn === 'true';
-      try {
-        await updateWorkflowDoc(id, { enabled });
-        await appendAuditLog({ action: 'workflow_toggled', resourceType: 'workflow', resourceId: id, result: `enabled=${enabled}` });
-        showToast(`Workflow ${enabled ? 'enabled' : 'disabled'}.`, 'success');
-      } catch (err) {
-        showToast(err.message, 'danger');
-      }
+      openModal({
+        title: `${enabled ? 'Enable' : 'Disable'} Workflow?`,
+        bodyHtml: `<p style="font-size:13.5px;color:var(--text-secondary);">Confirm changing workflow <strong class="mono">${escapeHtml(id)}</strong> state to <strong>${enabled ? 'Enabled' : 'Disabled'}</strong>.</p>`,
+        footerButtons: [
+          { label: 'Cancel', variant: 'btn-secondary' },
+          {
+            label: enabled ? 'Enable Workflow' : 'Disable Workflow',
+            variant: enabled ? 'btn-primary' : 'btn-danger',
+            onClick: async ({ close }) => {
+              try {
+                await updateWorkflowDoc(id, { enabled });
+                await appendAuditLog({ action: 'workflow_toggled', resourceType: 'workflow', resourceId: id, result: `enabled=${enabled}` });
+                close();
+                showToast(`Workflow ${enabled ? 'enabled' : 'disabled'}.`, 'success');
+              } catch (err) {
+                showToast(err.message, 'danger');
+              }
+            },
+          },
+        ],
+      });
     });
   });
 
@@ -1101,7 +1113,7 @@ export function renderAuditTrail(container, { appState }) {
 
     <section class="panel stack-md">
       <div class="row-between">
-        <input type="search" class="input" id="at-search" placeholder="Filter by action, actor UID, resource, or request ID..." style="max-width:380px;" />
+        <input type="search" class="input responsive-search" id="at-search" placeholder="Filter by action, actor, resource, or request ID..." />
         <span id="at-count" class="meta-line"></span>
       </div>
 

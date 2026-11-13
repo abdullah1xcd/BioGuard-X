@@ -2,6 +2,7 @@ import '../css/styles.css';
 import {
   onAuthChanged,
   signInWithGoogle,
+  resolveAuthRedirect,
   signOutUser,
   testFirestoreConnection,
   provisionUserProfile,
@@ -40,34 +41,49 @@ import {
   renderSettings,
 } from './pages_admin.js';
 import { initPwaUI } from './pwa.js';
+import { isAuthorizedDevAdmin, isDevTestingModeActive } from './config.js';
+
+const DEV_MODE_STORAGE_KEY = 'bgx_dev_testing_mode';
 
 const NAV_GROUPS = [
   {
-    section: 'Biometric Platform',
+    section: 'Overview',
     items: [
-      { id: 'overview', label: 'Main Dashboard', icon: 'dashboard', render: renderOverview },
-      { id: 'enrollment', label: 'Biometric Enrollment', icon: 'userPlus', render: renderEnrollment, requirePermission: 'create_identity' },
-      { id: 'verification', label: 'Verification Center', icon: 'layers', render: renderVerification, requirePermission: 'perform_verification' },
-      { id: 'compare', label: '1:1 & 1:N Compare', icon: 'compare', render: renderCompareIdentities, requirePermission: 'perform_verification' },
+      { id: 'overview', label: 'Dashboard', icon: 'dashboard', render: renderOverview },
+      { id: 'analytics', label: 'Analytics & Reports', icon: 'barChart', render: renderAnalytics },
+    ],
+  },
+  {
+    section: 'Biometric Operations',
+    items: [
+      { id: 'enrollment', label: 'Enrollment', icon: 'userPlus', render: renderEnrollment, requirePermission: 'create_identity' },
+      { id: 'verification', label: 'Verification', icon: 'layers', render: renderVerification, requirePermission: 'perform_verification' },
+      { id: 'compare', label: 'Identity Search', icon: 'compare', render: renderCompareIdentities, requirePermission: 'perform_verification' },
       { id: 'identities', label: 'Identities', icon: 'users', render: renderIdentities },
     ],
   },
   {
-    section: 'Security Intelligence',
+    section: 'Security & Administration',
     items: [
-      { id: 'threat_intel', label: 'Risk & Threat Analysis', icon: 'radar', render: renderThreatIntel, requirePermission: 'manage_alerts' },
+      { id: 'threat_intel', label: 'Threat Monitoring', icon: 'radar', render: renderThreatIntel, requirePermission: 'manage_alerts' },
       { id: 'ai_analyst', label: 'AI Security Analyst', icon: 'cpu', render: renderAiAnalyst, requirePermission: 'use_ai_analyst' },
-    ],
-  },
-  {
-    section: 'Administration',
-    items: [
-      { id: 'analytics', label: 'Analytics & Reports', icon: 'barChart', render: renderAnalytics },
-      { id: 'approvals', label: 'Approval Workflow', icon: 'checkSquare', render: renderApprovals },
-      { id: 'automation', label: 'Automation Center', icon: 'workflow', render: renderAutomationCenter, requirePermission: 'manage_workflows' },
+      { id: 'approvals', label: 'Approval Requests', icon: 'checkSquare', render: renderApprovals },
       { id: 'audit_trail', label: 'Audit Logs', icon: 'scroll', render: renderAuditTrail },
       { id: 'access_control', label: 'Access Control', icon: 'lock', render: renderAccessControl },
       { id: 'settings', label: 'Settings', icon: 'shieldCheck', render: renderSettings },
+    ],
+  },
+  {
+    section: 'Advanced Administration',
+    items: [
+      {
+        id: 'automation',
+        label: 'Automation Center',
+        icon: 'workflow',
+        render: renderAutomationCenter,
+        requirePermission: 'manage_workflows',
+        showInSidebar: (state) => (state.workflows && state.workflows.length > 0) || isDevTestingModeActive(state),
+      },
     ],
   },
 ];
@@ -98,6 +114,7 @@ const appState = {
   analystInitialPrompt: '',
   analystInitialMode: 'chat',
   selectedVerificationId: '',
+  devTestingMode: false,
 };
 
 let activeRoute = 'overview';
@@ -119,6 +136,31 @@ function resetAppStateData() {
   appState.analystInitialPrompt = '';
   appState.analystInitialMode = 'chat';
   appState.selectedVerificationId = '';
+  appState.devTestingMode = false;
+  try {
+    sessionStorage.removeItem(DEV_MODE_STORAGE_KEY);
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function setDevTestingMode(enabled) {
+  if (!isAuthorizedDevAdmin(appState)) {
+    appState.devTestingMode = false;
+    return false;
+  }
+  appState.devTestingMode = Boolean(enabled);
+  try {
+    if (appState.devTestingMode) {
+      sessionStorage.setItem(DEV_MODE_STORAGE_KEY, '1');
+    } else {
+      sessionStorage.removeItem(DEV_MODE_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  renderActiveView();
+  return appState.devTestingMode;
 }
 
 function clearSubscriptions() {
@@ -160,7 +202,9 @@ function renderSidebar() {
   const pendingApprovals = appState.approvals.filter((r) => r.status === 'pending').length;
 
   nav.innerHTML = NAV_GROUPS.map((g) => {
-    const visibleItems = g.items.filter(canAccessItem);
+    const visibleItems = g.items.filter(
+      (it) => canAccessItem(it) && (typeof it.showInSidebar !== 'function' || it.showInSidebar(appState) || it.id === activeRoute)
+    );
     if (!visibleItems.length) return '';
     return `
       <div>
@@ -201,8 +245,8 @@ function renderSidebar() {
   if (healthEl) {
     const apiOk = appState.health?.status === 'ok';
     healthEl.innerHTML = `
-      <div><strong class="${apiOk ? 'state-success' : 'state-danger'}">${apiOk ? 'API Ready' : 'API Offline'}</strong> · ${escapeHtml(appState.health?.feature_version || 'v2.0-multimodal')}</div>
-      <div>Firestore: ${appState.firestoreOk ? 'Connected' : 'Offline'} · Vault: ${appState.identities.length}</div>
+      <div><strong class="${apiOk ? 'state-success' : 'state-danger'}">${apiOk ? 'API Ready' : 'API Offline'}</strong>${isDevTestingModeActive(appState) ? ' · <span class="state-warning">Dev Mode</span>' : ''}</div>
+      <div>Vault: ${appState.identities.length} · Sync: ${appState.firestoreOk ? 'Live' : 'Offline'}</div>
     `;
   }
 }
@@ -315,6 +359,7 @@ function renderActiveView() {
     appState,
     navigate,
     applyTheme,
+    setDevTestingMode,
   });
   if (typeof maybeCleanup === 'function') activeCleanup = maybeCleanup;
 }
@@ -360,6 +405,11 @@ async function bootstrapAuthenticatedSession(fbUser) {
   const serverMe = await fetchServerSession();
   appState.profile = { ...profile, role: serverMe.role, status: serverMe.status };
   appState.permissions = serverMe.permissions || [];
+  try {
+    appState.devTestingMode = isAuthorizedDevAdmin(appState) && sessionStorage.getItem(DEV_MODE_STORAGE_KEY) === '1';
+  } catch {
+    appState.devTestingMode = false;
+  }
   applyTheme(appState.profile.theme || 'dark');
 
   appState.health = await fetchApiHealth().catch(() => null);
@@ -421,6 +471,7 @@ async function bootstrapAuthenticatedSession(fbUser) {
     unsubs.push(
       subscribeWorkflows(uid, (list) => {
         appState.workflows = list;
+        renderSidebar();
         if (['overview', 'automation'].includes(activeRoute)) renderActiveView();
       })
     );
@@ -440,6 +491,13 @@ function initApp() {
   const appShell = document.getElementById('app-shell');
   const authError = document.getElementById('auth-error');
   const signInBtn = document.getElementById('google-signin-btn');
+
+  resolveAuthRedirect().catch((err) => {
+    if (authError && err?.message) {
+      authError.hidden = false;
+      authError.textContent = err.message;
+    }
+  });
 
   signInBtn?.addEventListener('click', async () => {
     authError.hidden = true;

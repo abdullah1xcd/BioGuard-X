@@ -159,3 +159,14 @@ export function recommendPipelineForModalities(modalities = []) {
   if (set.has('fingerprint')) return 'fingerprint_only';
   return 'hierarchical';
 }
+
+export function isAuthorizedDevAdmin(state) {
+  const role = state?.profile?.role;
+  const perms = state?.permissions || [];
+  return role === 'super_admin' || role === 'administrator' || perms.includes('manage_roles');
+}
+
+export function isDevTestingModeActive(state) {
+  return Boolean(isAuthorizedDevAdmin(state) && state?.devTestingMode);
+}
+

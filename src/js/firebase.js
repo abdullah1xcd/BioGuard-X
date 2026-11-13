@@ -3,6 +3,8 @@ import {
   getAuth,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   signOut,
   onAuthStateChanged,
 } from 'firebase/auth';
@@ -106,9 +108,39 @@ export async function testFirestoreConnection() {
   }
 }
 
+export async function resolveAuthRedirect() {
+  try {
+    const result = await getRedirectResult(auth);
+    return result?.user || null;
+  } catch (err) {
+    console.warn('Google redirect sign-in returned error:', err?.message || err);
+    throw err;
+  }
+}
+
 export async function signInWithGoogle() {
-  const cred = await signInWithPopup(auth, googleProvider);
-  return cred.user;
+  const isStandalone =
+    typeof window !== 'undefined' &&
+    (window.matchMedia?.('(display-mode: standalone)')?.matches === true || window.navigator?.standalone === true);
+  if (isStandalone) {
+    await signInWithRedirect(auth, googleProvider);
+    return null;
+  }
+  try {
+    const cred = await signInWithPopup(auth, googleProvider);
+    return cred.user;
+  } catch (err) {
+    const code = err?.code || '';
+    if (
+      code === 'auth/popup-blocked' ||
+      code === 'auth/operation-not-supported-in-this-environment' ||
+      code === 'auth/cancelled-popup-request'
+    ) {
+      await signInWithRedirect(auth, googleProvider);
+      return null;
+    }
+    throw err;
+  }
 }
 
 export async function signOutUser() {
@@ -140,10 +172,11 @@ export async function provisionUserProfile(fbUser) {
     if (!snap.exists()) {
       const isBootstrap = fbUser.emailVerified && fbUser.email === BOOTSTRAPPED_ADMIN_EMAIL;
       const initialRole = isBootstrap ? 'super_admin' : 'operator';
+      const fallbackEmail = `${fbUser.uid}@users.local`;
       const payload = {
         uid: fbUser.uid,
         displayName: (fbUser.displayName || fbUser.email || 'Operator').slice(0, 120),
-        email: (fbUser.email || '').slice(0, 180),
+        email: (fbUser.email || fallbackEmail).slice(0, 180),
         photoURL: (fbUser.photoURL || '').slice(0, 500),
         role: initialRole,
         status: 'active',
@@ -163,11 +196,17 @@ export async function provisionUserProfile(fbUser) {
       const created = await getDoc(ref);
       return created.data();
     } else {
-      await updateDoc(ref, {
-        displayName: (fbUser.displayName || snap.data().displayName || 'Operator').slice(0, 120),
-        photoURL: (fbUser.photoURL || snap.data().photoURL || '').slice(0, 500),
+      const existingData = snap.data();
+      const updates = {
+        displayName: (fbUser.displayName || existingData.displayName || 'Operator').slice(0, 120),
+        photoURL: (fbUser.photoURL || existingData.photoURL || '').slice(0, 500),
         lastLoginAt: serverTimestamp(),
-      });
+      };
+      // Automatically activate legacy read-only viewer profiles into their own isolated operator workspace
+      if (existingData.status === 'active' && existingData.role === 'viewer') {
+        updates.role = 'operator';
+      }
+      await updateDoc(ref, updates);
       const updated = await getDoc(ref);
       return updated.data();
     }

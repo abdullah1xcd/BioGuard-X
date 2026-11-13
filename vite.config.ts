@@ -105,7 +105,8 @@ export default defineConfig(() => {
       emptyOutDir: false,
     },
     server: {
-      hmr: process.env.DISABLE_HMR !== 'true',
+      hmr: false,
+      ws: false as const,
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
     },
   };

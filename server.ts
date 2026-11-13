@@ -43,12 +43,12 @@ const ROLE_CAPABILITIES: Record<Role, string[]> = {
     'manage_workflows', 'manage_approvals', 'manage_users', 'manage_roles', 'change_settings', 'use_ai_analyst',
   ],
   security_analyst: [
-    'view_identities', 'create_identity', 'edit_identity', 'delete_identity',
+    'view_identities', 'create_identity', 'edit_identity', 'deactivate_identity', 'delete_identity',
     'perform_verification', 'view_analytics', 'view_audit_logs',
     'manage_alerts', 'manage_workflows', 'manage_approvals', 'change_settings', 'use_ai_analyst',
   ],
   operator: [
-    'view_identities', 'create_identity', 'edit_identity', 'delete_identity',
+    'view_identities', 'create_identity', 'edit_identity', 'deactivate_identity', 'delete_identity',
     'perform_verification', 'view_analytics', 'view_audit_logs',
     'manage_alerts', 'manage_workflows', 'manage_approvals', 'change_settings', 'use_ai_analyst',
   ],
@@ -672,10 +672,6 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
       email: firebaseUser.email,
       email_verified: firebaseUser.emailVerified === true,
     };
-    if (!decoded.email_verified) {
-      res.status(403).json({ error: 'email_not_verified', message: 'Verified Google account email is required.' });
-      return;
-    }
     const { role, status } = await fetchUserFirestoreRole(
       decoded.uid,
       decoded.email,
@@ -1753,7 +1749,21 @@ async function startServer() {
 
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: false, ws: false },
+      plugins: [
+        {
+          name: 'bioguard-disable-hmr-client-ws',
+          transform(code: string, id: string) {
+            if (id.includes('vite/dist/client/client.mjs')) {
+              return code.replace(
+                /const transport = normalizeModuleRunnerTransport\(\(\(\) => \{[\s\S]*?\}\)\(\)\);/,
+                'const transport = normalizeModuleRunnerTransport({ connect() {}, disconnect() {}, send() {} });'
+              );
+            }
+            return null;
+          },
+        },
+      ],
       appType: 'spa',
     });
     app.use(vite.middlewares);

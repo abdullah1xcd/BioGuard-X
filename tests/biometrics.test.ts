@@ -21,6 +21,11 @@ import {
   computeClassificationMetrics,
   wilsonCI95,
 } from '../src/shared/metrics.ts';
+import {
+  isAuthorizedDevAdmin,
+  isDevTestingModeActive,
+  recommendPipelineForModalities,
+} from '../src/js/config.js';
 
 const FEATURE_VERSION = 'v2.0-multimodal';
 
@@ -500,3 +505,50 @@ test('Server Vault AES-256-GCM encryption round-trip and HTTP auth / health chec
     await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
   }
 });
+
+test('Developer/Testing Mode is strictly isolated to authorized admins and defaults to off', () => {
+  // Non-admin roles must never enter Developer/Testing Mode even if state flag is forced true
+  for (const role of ['viewer', 'operator', 'security_analyst']) {
+    const injectedState = {
+      profile: { role },
+      permissions: role === 'viewer' ? ['view_identities', 'view_analytics'] : ['perform_verification', 'create_identity'],
+      devTestingMode: true,
+    };
+    assert.equal(isAuthorizedDevAdmin(injectedState), false, `Role ${role} must not be authorized as dev admin`);
+    assert.equal(isDevTestingModeActive(injectedState), false, `Role ${role} must never activate dev testing mode`);
+  }
+
+  // Authorized admins default to false and activate only when toggled true
+  for (const adminRole of ['administrator', 'super_admin']) {
+    const defaultAdminState = {
+      profile: { role: adminRole },
+      permissions: ['manage_roles', 'change_settings'],
+      devTestingMode: false,
+    };
+    assert.equal(isAuthorizedDevAdmin(defaultAdminState), true, `Role ${adminRole} should be authorized dev admin`);
+    assert.equal(isDevTestingModeActive(defaultAdminState), false, `Role ${adminRole} should default dev mode to false`);
+
+    const enabledAdminState = { ...defaultAdminState, devTestingMode: true };
+    assert.equal(isDevTestingModeActive(enabledAdminState), true, `Role ${adminRole} should activate dev mode when enabled`);
+  }
+
+  // Permission-based check if manage_roles is present
+  assert.equal(
+    isDevTestingModeActive({ profile: { role: 'custom_admin' }, permissions: ['manage_roles'], devTestingMode: true }),
+    true
+  );
+
+  // Empty/unauthenticated state
+  assert.equal(isAuthorizedDevAdmin(null), false);
+  assert.equal(isDevTestingModeActive({}), false);
+
+  // Pipeline recommendation mapping for enrollment/verification UX
+  assert.equal(recommendPipelineForModalities(['face']), 'face_only');
+  assert.equal(recommendPipelineForModalities(['voice']), 'voice_only');
+  assert.equal(recommendPipelineForModalities(['fingerprint']), 'fingerprint_only');
+  assert.equal(recommendPipelineForModalities(['face', 'voice']), 'hierarchical');
+  assert.equal(recommendPipelineForModalities(['face', 'fingerprint']), 'face_fingerprint');
+  assert.equal(recommendPipelineForModalities(['voice', 'fingerprint']), 'voice_fingerprint');
+  assert.equal(recommendPipelineForModalities(['face', 'voice', 'fingerprint']), 'three_modal');
+});
+

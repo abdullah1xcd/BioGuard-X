@@ -10,14 +10,16 @@ import {
   queryAiSecurityAnalyst,
 } from './api.js';
 import { buildBiometricAnalyticsReport } from './biometrics.js';
-import { getPwaStatus, triggerPwaInstall } from './pwa.js';
+import { getPwaStatus, triggerPwaInstall, shareOrCopyPortableLink } from './pwa.js';
 import {
   DEFAULT_THRESHOLDS,
   PERMISSION_MATRIX,
   THRESHOLD_PRESETS,
   FUSION_POLICIES,
+  isAuthorizedDevAdmin,
+  isDevTestingModeActive,
 } from './config.js';
-import { escapeHtml, fmtPct, showToast } from './ui.js';
+import { escapeHtml, fmtPct, showToast, openModal } from './ui.js';
 
 function buildAnalystContext(appState, selectedVerId) {
   const selectedVerification = appState.verifications.find((v) => v.verificationId === selectedVerId) || null;
@@ -283,8 +285,26 @@ export function renderAiAnalyst(container, { appState }) {
   });
 
   container.querySelector('#ai-clear-btn').addEventListener('click', () => {
-    appState.aiHistory = [];
-    drawThread();
+    if (!appState.aiHistory.length) {
+      showToast('Investigation thread is already empty.', 'neutral');
+      return;
+    }
+    openModal({
+      title: 'Clear Investigation Thread?',
+      bodyHtml: `<p style="font-size:13.5px;color:var(--text-secondary);">Clear all ${appState.aiHistory.length} message(s) from the current AI Security Analyst session? Persisted Firestore audit logs remain intact.</p>`,
+      footerButtons: [
+        { label: 'Cancel', variant: 'btn-secondary' },
+        {
+          label: 'Clear Thread',
+          variant: 'btn-danger',
+          onClick: ({ close }) => {
+            appState.aiHistory = [];
+            drawThread();
+            close();
+          },
+        },
+      ],
+    });
   });
 
   container.querySelector('#ai-form').addEventListener('submit', (e) => {
@@ -357,11 +377,15 @@ export async function renderAccessControl(container, { appState }) {
     <section class="panel stack-md" id="ac-users-panel">
       <div class="panel-header">
         <div>
-          <h2 class="panel-title">User &amp; Role Management</h2>
-          <p class="panel-subtitle">Assign operator roles or update account access status</p>
+          <h2 class="panel-title">${canManageRoles ? 'User &amp; Role Management' : 'Your Isolated Account Workspace'}</h2>
+          <p class="panel-subtitle">${canManageRoles ? 'Assign operator roles or update account access status' : 'Every Google account operates in its own isolated Firestore workspace and AES-256-GCM biometric vault.'}</p>
         </div>
       </div>
-      <div id="ac-users-body" class="panel-subtitle">${canManageRoles ? 'Loading user accounts from Firestore...' : 'Administrator privileges are required to view and modify other user accounts.'}</div>
+      <div id="ac-users-body" class="panel-subtitle">${
+        canManageRoles
+          ? 'Loading user accounts from Firestore...'
+          : `Signed in as <strong class="mono">${escapeHtml(appState.profile?.email || '')}</strong> · Workspace UID: <strong class="mono">${escapeHtml(appState.fbUser?.uid || '')}</strong> · Data path: <span class="mono">users/${escapeHtml(appState.fbUser?.uid || '')}/...</span>`
+      }</div>
     </section>
   `;
 
@@ -418,25 +442,39 @@ export async function renderAccessControl(container, { appState }) {
     `;
 
     usersBody.querySelectorAll('[data-save-user]').forEach((btn) => {
-      btn.addEventListener('click', async () => {
+      btn.addEventListener('click', () => {
         const uid = btn.dataset.saveUser;
         const role = usersBody.querySelector(`[data-u-role="${uid}"]`).value;
         const status = usersBody.querySelector(`[data-u-status="${uid}"]`).value;
-        btn.disabled = true;
-        try {
-          await updateUserRoleOrStatus(uid, { role, status });
-          await appendAuditLog({
-            action: 'user_role_updated',
-            resourceType: 'user',
-            resourceId: uid,
-            result: `role=${role}, status=${status}`,
-          });
-          showToast(`Updated role and status for ${uid}.`, 'success');
-        } catch (err) {
-          showToast(err.message, 'danger');
-        } finally {
-          btn.disabled = false;
-        }
+        openModal({
+          title: 'Update Account Access?',
+          bodyHtml: `<p style="font-size:13.5px;color:var(--text-secondary);">Apply role <strong class="mono">${escapeHtml(role)}</strong> and status <strong class="mono">${escapeHtml(status)}</strong> to user <strong class="mono">${escapeHtml(uid)}</strong>?</p>`,
+          footerButtons: [
+            { label: 'Cancel', variant: 'btn-secondary' },
+            {
+              label: 'Confirm Update',
+              variant: status === 'suspended' ? 'btn-danger' : 'btn-primary',
+              onClick: async ({ close }) => {
+                btn.disabled = true;
+                try {
+                  await updateUserRoleOrStatus(uid, { role, status });
+                  await appendAuditLog({
+                    action: 'user_role_updated',
+                    resourceType: 'user',
+                    resourceId: uid,
+                    result: `role=${role}, status=${status}`,
+                  });
+                  close();
+                  showToast(`Updated role and status for ${uid}.`, 'success');
+                } catch (err) {
+                  showToast(err.message, 'danger');
+                } finally {
+                  btn.disabled = false;
+                }
+              },
+            },
+          ],
+        });
       });
     });
   } catch (err) {
@@ -445,10 +483,13 @@ export async function renderAccessControl(container, { appState }) {
 }
 
 // SETTINGS & ADAPTATION PROFILES
-export function renderSettings(container, { appState, applyTheme }) {
+export function renderSettings(container, { appState, navigate, applyTheme, setDevTestingMode }) {
   const profile = appState.profile || {};
   const settings = appState.settings || { ...DEFAULT_THRESHOLDS };
   const isAdmin = appState.permissions.includes('change_settings');
+  const canWorkflows = appState.permissions.includes('manage_workflows');
+  const canDevMode = isAuthorizedDevAdmin(appState);
+  const devModeActive = isDevTestingModeActive(appState);
   const pwa = getPwaStatus();
 
   let selectedPresetId =
@@ -465,8 +506,8 @@ export function renderSettings(container, { appState, applyTheme }) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <h1 class="page-title">Settings &amp; Configuration</h1>
-        <p class="page-subtitle">Adapt appearance, multimodal fusion policies, threshold presets, and PWA installation state.</p>
+        <h1 class="page-title">Settings</h1>
+        <p class="page-subtitle">Manage account preferences, biometric fusion presets, platform diagnostics, and advanced administration.</p>
       </div>
       <div class="page-actions">
         <button type="button" class="btn btn-secondary" id="st-refresh-health">Refresh Diagnostics</button>
@@ -476,7 +517,7 @@ export function renderSettings(container, { appState, applyTheme }) {
     <div class="grid-2">
       <form id="st-profile-form" class="panel stack-md">
         <div class="panel-header">
-          <div><h2 class="panel-title">Operator Preferences</h2><p class="panel-subtitle">Signed in via Google / Firebase Authentication</p></div>
+          <div><h2 class="panel-title">Account Preferences</h2><p class="panel-subtitle">Google / Firebase session profile</p></div>
         </div>
         <div class="form-grid">
           <div class="form-field">
@@ -504,31 +545,37 @@ export function renderSettings(container, { appState, applyTheme }) {
 
       <section class="panel stack-md">
         <div class="panel-header">
-          <div><h2 class="panel-title">System Diagnostics &amp; PWA Status</h2><p class="panel-subtitle">Live status of models, vault, and installability</p></div>
+          <div><h2 class="panel-title">System Status &amp; App Install</h2><p class="panel-subtitle">Core API, database, encryption, and offline shell</p></div>
         </div>
         <div class="divider-list" style="font-size:13.5px;">
           <div class="divider-row"><span>Biometric Verification API</span><span class="state-text ${appState.health?.status === 'ok' ? 'state-success' : 'state-danger'}">${appState.health?.status === 'ok' ? 'Healthy' : 'Unreachable'}</span></div>
           <div class="divider-row"><span>Cloud Firestore Database</span><span class="state-text ${appState.firestoreOk ? 'state-success' : 'state-danger'}">${appState.firestoreOk ? 'Connected' : 'Offline'}</span></div>
           <div class="divider-row"><span>Encrypted Biometric Vault</span><span class="state-text ${appState.health?.vault_ready ? 'state-success' : 'state-warning'}">${appState.health?.vault_ready ? 'AES-256-GCM Active' : 'Unavailable'}</span></div>
-          <div class="divider-row"><span>Models (v2.0)</span><span class="mono" style="font-size:12px;">FaceRes-1024D · CMVN-96D · Minutiae-RANSAC</span></div>
-          <div class="divider-row"><span>AI Security Analyst (Gemini)</span><span class="state-text ${appState.health?.gemini_configured ? 'state-success' : 'state-warning'}">${appState.health?.gemini_configured ? 'Ready (Server-Side)' : 'Secret Not Configured'}</span></div>
-          <div class="divider-row"><span>Feature Version</span><span class="mono">${escapeHtml(appState.health?.feature_version || 'v2.0-multimodal')}</span></div>
+          <div class="divider-row"><span>AI Security Analyst</span><span class="state-text ${appState.health?.gemini_configured ? 'state-success' : 'state-warning'}">${appState.health?.gemini_configured ? 'Ready' : 'Not Configured'}</span></div>
           <div class="divider-row">
-            <span>App Install &amp; Offline Shell</span>
+            <span>Portable App Access (${escapeHtml(pwa.platformLabel || 'Web')})</span>
             <span class="row-wrap">
-              <span class="mono" style="font-size:12px;">${pwa.standalone ? 'Standalone Installed' : pwa.swRegistered ? 'Service Worker Active' : 'Web Session'}</span>
+              <span class="mono" style="font-size:12px;">${pwa.standalone ? 'Installed' : pwa.swRegistered ? 'Offline Ready' : 'Browser Session'}</span>
               ${!pwa.standalone ? `<button type="button" class="btn btn-secondary btn-sm" id="st-pwa-install">Install App</button>` : ''}
+              <button type="button" class="btn btn-ghost btn-sm" id="st-share-link">Share / Copy Link</button>
             </span>
           </div>
         </div>
+        <details class="advanced-details">
+          <summary>Advanced Details (Engine Versions)</summary>
+          <div class="advanced-details-body" style="font-size:12.5px;">
+            <div class="row-between"><span>Biometric Engines</span><span class="mono">FaceRes-1024D · CMVN-96D · Minutiae-RANSAC</span></div>
+            <div class="row-between"><span>Feature Version</span><span class="mono">${escapeHtml(appState.health?.feature_version || 'v2.0-multimodal')}</span></div>
+          </div>
+        </details>
       </section>
     </div>
 
     <form id="st-org-form" class="panel stack-md">
       <div class="panel-header">
         <div>
-          <h2 class="panel-title">Multimodal Fusion Policy &amp; Threshold Presets</h2>
-          <p class="panel-subtitle">${isAdmin ? 'Configure cross-modality fusion strategy, security presets, or individual thresholds.' : 'Administrator or Operator privileges are required to update policy thresholds.'}</p>
+          <h2 class="panel-title">Security Policy &amp; Verification Thresholds</h2>
+          <p class="panel-subtitle">${isAdmin ? 'Select a security preset and fusion strategy for verification checks.' : 'Operator or Administrator privileges are required to modify policy thresholds.'}</p>
         </div>
       </div>
 
@@ -556,35 +603,113 @@ export function renderSettings(container, { appState, applyTheme }) {
           </select>
         </div>
         <div class="form-field">
-          <label class="field-label" for="st-org">Organization Name</label>
+          <label class="field-label" for="st-org">Workspace Name</label>
           <input class="input" id="st-org" ${isAdmin ? '' : 'disabled'} value="${escapeHtml(settings.organizationName)}" />
         </div>
-        <div class="form-field">
-          <label class="field-label" for="st-f-thr">Face Threshold (0.30–0.98)</label>
-          <input class="input mono" id="st-f-thr" type="number" step="0.01" min="0.3" max="0.98" ${isAdmin ? '' : 'disabled'} value="${settings.faceThreshold}" />
-        </div>
-        <div class="form-field">
-          <label class="field-label" for="st-v-thr">Voice Threshold (0.30–0.98)</label>
-          <input class="input mono" id="st-v-thr" type="number" step="0.01" min="0.3" max="0.98" ${isAdmin ? '' : 'disabled'} value="${settings.voiceThreshold}" />
-        </div>
-        <div class="form-field">
-          <label class="field-label" for="st-fp-thr">Fingerprint Threshold (0.30–0.98)</label>
-          <input class="input mono" id="st-fp-thr" type="number" step="0.01" min="0.3" max="0.98" ${isAdmin ? '' : 'disabled'} value="${settings.fingerprintThreshold}" />
-        </div>
-        <div class="form-field">
-          <label class="field-label" for="st-3-thr">Three-Modal Threshold (0.30–0.98)</label>
-          <input class="input mono" id="st-3-thr" type="number" step="0.01" min="0.3" max="0.98" ${isAdmin ? '' : 'disabled'} value="${settings.threeModalThreshold}" />
-        </div>
-        <div class="form-field">
-          <label class="field-label" for="st-hold">Max Temporary Hold (Hours, 1–4)</label>
-          <input class="input mono" id="st-hold" type="number" min="1" max="4" ${isAdmin ? '' : 'disabled'} value="${settings.maxHoldHours}" />
-        </div>
       </div>
+
+      <details class="advanced-details">
+        <summary>Advanced Threshold Calibration (Face, Voice, Fingerprint &amp; Hold Window)</summary>
+        <div class="advanced-details-body">
+          <div class="form-grid">
+            <div class="form-field">
+              <label class="field-label" for="st-f-thr">Face Threshold (0.30–0.98)</label>
+              <input class="input mono" id="st-f-thr" type="number" step="0.01" min="0.3" max="0.98" ${isAdmin ? '' : 'disabled'} value="${settings.faceThreshold}" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="st-v-thr">Voice Threshold (0.30–0.98)</label>
+              <input class="input mono" id="st-v-thr" type="number" step="0.01" min="0.3" max="0.98" ${isAdmin ? '' : 'disabled'} value="${settings.voiceThreshold}" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="st-fp-thr">Fingerprint Threshold (0.30–0.98)</label>
+              <input class="input mono" id="st-fp-thr" type="number" step="0.01" min="0.3" max="0.98" ${isAdmin ? '' : 'disabled'} value="${settings.fingerprintThreshold}" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="st-3-thr">Three-Modal Threshold (0.30–0.98)</label>
+              <input class="input mono" id="st-3-thr" type="number" step="0.01" min="0.3" max="0.98" ${isAdmin ? '' : 'disabled'} value="${settings.threeModalThreshold}" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="st-hold">Max Temporary Hold (Hours, 1–4)</label>
+              <input class="input mono" id="st-hold" type="number" min="1" max="4" ${isAdmin ? '' : 'disabled'} value="${settings.maxHoldHours}" />
+            </div>
+          </div>
+        </div>
+      </details>
       ${isAdmin ? '<button type="submit" class="btn btn-primary" style="align-self:flex-start;">Save Organization Policy</button>' : ''}
     </form>
+
+    ${
+      canWorkflows || canDevMode
+        ? `
+      <section class="panel stack-md">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Advanced Administration</h2>
+            <p class="panel-subtitle">Workflow automation and authorized developer QA validation controls</p>
+          </div>
+        </div>
+        <div class="divider-list">
+          ${
+            canWorkflows
+              ? `
+            <div class="divider-row">
+              <div class="stack-sm" style="gap:2px;">
+                <strong>Automation Center</strong>
+                <span class="meta-line">${appState.workflows.length} event-driven Firestore workflow(s) configured</span>
+              </div>
+              <button type="button" class="btn btn-secondary btn-sm" id="st-open-automation">Open Automation Center</button>
+            </div>`
+              : ''
+          }
+          ${
+            canDevMode
+              ? `
+            <div class="divider-row">
+              <div class="stack-sm" style="gap:2px;flex:1;">
+                <strong>Developer / Testing Mode</strong>
+                <span class="meta-line">Administrator-only mode that exposes synthetic QA sample loaders in Enrollment and Verification. Synthetic probes are flagged <span class="mono">isTestProbe=true</span> and excluded from operational metrics.</span>
+              </div>
+              <div class="row-wrap">
+                <span class="state-text ${devModeActive ? 'state-warning' : 'state-neutral'}">${devModeActive ? 'Active' : 'Disabled'}</span>
+                <button type="button" class="btn ${devModeActive ? 'btn-danger' : 'btn-secondary'} btn-sm" id="st-toggle-devmode">${devModeActive ? 'Disable Dev Mode' : 'Enable Dev Mode'}</button>
+              </div>
+            </div>`
+              : ''
+          }
+        </div>
+      </section>`
+        : ''
+    }
   `;
 
   container.querySelector('#st-pwa-install')?.addEventListener('click', triggerPwaInstall);
+  container.querySelector('#st-share-link')?.addEventListener('click', shareOrCopyPortableLink);
+  container.querySelector('#st-open-automation')?.addEventListener('click', () => navigate('automation'));
+
+  container.querySelector('#st-toggle-devmode')?.addEventListener('click', () => {
+    if (!canDevMode || typeof setDevTestingMode !== 'function') return;
+    if (devModeActive) {
+      setDevTestingMode(false);
+      showToast('Developer / Testing Mode disabled. Synthetic QA controls hidden.', 'success');
+      return;
+    }
+    openModal({
+      title: 'Enable Developer / Testing Mode?',
+      bodyHtml: `<p style="font-size:13.5px;color:var(--text-secondary);">Enabling Developer / Testing Mode reveals synthetic QA test sample controls in Enrollment and Verification. All generated test probes are tagged <span class="mono">isTestProbe=true</span> so they are never counted as real biometric verifications, and Dev Mode resets automatically upon sign-out.</p>`,
+      footerButtons: [
+        { label: 'Cancel', variant: 'btn-secondary' },
+        {
+          label: 'Enable Dev Mode',
+          variant: 'btn-primary',
+          onClick: ({ close }) => {
+            setDevTestingMode(true);
+            close();
+            showToast('Developer / Testing Mode enabled for this session.', 'neutral');
+          },
+        },
+      ],
+    });
+  });
 
   container.querySelectorAll('[data-preset]').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -623,7 +748,7 @@ export function renderSettings(container, { appState, applyTheme }) {
     }
   });
 
-  container.querySelector('#st-org-form')?.addEventListener('submit', async (e) => {
+  container.querySelector('#st-org-form')?.addEventListener('submit', (e) => {
     e.preventDefault();
     if (!isAdmin) return;
     const cfg = {
@@ -636,25 +761,39 @@ export function renderSettings(container, { appState, applyTheme }) {
       fingerprintThreshold: Number(container.querySelector('#st-fp-thr').value),
       threeModalThreshold: Number(container.querySelector('#st-3-thr').value),
     };
-    try {
-      await saveSystemSettings(cfg);
-      appState.settings = cfg;
-      await appendAuditLog({
-        action: 'system_settings_updated',
-        resourceType: 'system_settings',
-        resourceId: 'default',
-        result: `Policy=${cfg.fusionPolicy} (${cfg.securityPreset}) · F=${cfg.faceThreshold}, V=${cfg.voiceThreshold}, FP=${cfg.fingerprintThreshold}`,
-      });
-      showToast('Organization policy saved.', 'success');
-    } catch (err) {
-      showToast(err.message, 'danger');
-    }
+    openModal({
+      title: 'Save Organization Security Policy?',
+      bodyHtml: `<p style="font-size:13.5px;color:var(--text-secondary);">Update active fusion policy to <strong class="mono">${escapeHtml(cfg.fusionPolicy)}</strong> (${escapeHtml(cfg.securityPreset)}) with thresholds Face=${cfg.faceThreshold}, Voice=${cfg.voiceThreshold}, Fingerprint=${cfg.fingerprintThreshold}?</p>`,
+      footerButtons: [
+        { label: 'Cancel', variant: 'btn-secondary' },
+        {
+          label: 'Confirm Policy Save',
+          variant: 'btn-primary',
+          onClick: async ({ close }) => {
+            try {
+              await saveSystemSettings(cfg);
+              appState.settings = cfg;
+              await appendAuditLog({
+                action: 'system_settings_updated',
+                resourceType: 'system_settings',
+                resourceId: 'default',
+                result: `Policy=${cfg.fusionPolicy} (${cfg.securityPreset}) · F=${cfg.faceThreshold}, V=${cfg.voiceThreshold}, FP=${cfg.fingerprintThreshold}`,
+              });
+              close();
+              showToast('Organization policy saved.', 'success');
+            } catch (err) {
+              showToast(err.message, 'danger');
+            }
+          },
+        },
+      ],
+    });
   });
 
   container.querySelector('#st-refresh-health').addEventListener('click', async () => {
     try {
       appState.health = await fetchApiHealth();
-      renderSettings(container, { appState, applyTheme });
+      renderSettings(container, { appState, navigate, applyTheme, setDevTestingMode });
       showToast('Diagnostics refreshed.', 'success');
     } catch (err) {
       showToast(err.message, 'danger');

@@ -10,7 +10,7 @@ import {
 import { compareIdentities, identifyBiometricProbe } from './api.js';
 import { appendAuditLog } from './firebase.js';
 import { FUSION_POLICIES } from './config.js';
-import { escapeHtml, fmtPct, showToast, loadImageFile, recordMicrophonePCM } from './ui.js';
+import { escapeHtml, fmtPct, showToast, loadImageFile, recordMicrophonePCM, openCameraStream, createLiveVideoElement } from './ui.js';
 
 function snapVideoFrameCanvas(videoEl, width = 320, height = 240) {
   const c = document.createElement('canvas');
@@ -56,8 +56,8 @@ export function renderCompareIdentities(container, { appState, navigate }) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <h1 class="page-title">1:1 &amp; 1:N Identity Comparison</h1>
-        <p class="page-subtitle">Cross-compare enrolled biometric profiles pairwise (1:1) or search across your entire vault using a biometric probe (1:N).</p>
+        <h1 class="page-title">Identity Search</h1>
+        <p class="page-subtitle">Compare two enrolled identities (1:1) or search across the encrypted vault using a profile or captured probe (1:N).</p>
       </div>
       <div class="page-actions">
         <div class="segmented" id="cmp-mode-tabs">
@@ -74,33 +74,41 @@ export function renderCompareIdentities(container, { appState, navigate }) {
       <section class="panel stack-md" id="cmp-1to1-panel">
         <div class="panel-header">
           <div>
-            <h2 class="panel-title">Pairwise 1:1 Biometric Comparison</h2>
-            <p class="panel-subtitle">Evaluates all shared compatible modalities between Identity A and Identity B using your configured fusion policy.</p>
+            <h2 class="panel-title">1:1 Identity Comparison</h2>
+            <p class="panel-subtitle">Evaluate all shared modalities between two enrolled biometric profiles.</p>
           </div>
         </div>
 
         <div class="form-grid">
           <div class="form-field">
-            <label class="field-label" for="cmp-ref-a">Identity A (Probe Reference)</label>
+            <label class="field-label" for="cmp-ref-a">Identity A</label>
             <select class="select" id="cmp-ref-a">
               ${identities.map((i) => `<option value="${escapeHtml(i.identityRef)}" ${i.identityRef === preselected ? 'selected' : ''}>${escapeHtml(i.displayName)} (${escapeHtml(i.identityRef)}) · [${escapeHtml((i.registeredModalities || []).join(', '))}]</option>`).join('')}
             </select>
           </div>
           <div class="form-field">
-            <label class="field-label" for="cmp-ref-b">Identity B (Target Reference)</label>
+            <label class="field-label" for="cmp-ref-b">Identity B</label>
             <select class="select" id="cmp-ref-b">
               ${identities.map((i, idx) => `<option value="${escapeHtml(i.identityRef)}" ${idx === (identities.length > 1 ? 1 : 0) ? 'selected' : ''}>${escapeHtml(i.displayName)} (${escapeHtml(i.identityRef)}) · [${escapeHtml((i.registeredModalities || []).join(', '))}]</option>`).join('')}
             </select>
           </div>
-          <div class="form-field">
-            <label class="field-label" for="cmp-policy-1">Fusion Policy</label>
-            <select class="select" id="cmp-policy-1">
-              ${FUSION_POLICIES.map((fp) => `<option value="${fp.id}" ${fp.id === defaultPolicy ? 'selected' : ''}>${escapeHtml(fp.label)}</option>`).join('')}
-            </select>
+        </div>
+
+        <details class="advanced-details">
+          <summary>Advanced Options (Fusion Policy)</summary>
+          <div class="advanced-details-body">
+            <div class="form-field">
+              <label class="field-label" for="cmp-policy-1">Fusion Policy</label>
+              <select class="select" id="cmp-policy-1">
+                ${FUSION_POLICIES.map((fp) => `<option value="${fp.id}" ${fp.id === defaultPolicy ? 'selected' : ''}>${escapeHtml(fp.label)}</option>`).join('')}
+              </select>
+            </div>
           </div>
-          <div class="form-field" style="justify-content:flex-end;">
-            <button type="button" class="btn btn-primary" id="cmp-run-1to1">Compare Identities (1:1)</button>
-          </div>
+        </details>
+
+        <div class="row-between">
+          <span class="meta-line">Matched securely server-side without exposing biometric vectors.</span>
+          <button type="button" class="btn btn-primary" id="cmp-run-1to1">Compare Identities (1:1)</button>
         </div>
 
         <div id="cmp-1to1-result"></div>
@@ -109,12 +117,12 @@ export function renderCompareIdentities(container, { appState, navigate }) {
       <section class="panel stack-md" id="cmp-1ton-panel" hidden>
         <div class="panel-header">
           <div>
-            <h2 class="panel-title">1:N Biometric Identification Search</h2>
-            <p class="panel-subtitle">Rank matching vault candidates against either an enrolled profile or a freshly captured biometric probe.</p>
+            <h2 class="panel-title">1:N Vault Search</h2>
+            <p class="panel-subtitle">Rank matching vault candidates from an enrolled profile or freshly captured probe.</p>
           </div>
           <div class="segmented" id="cmp-src-tabs">
             <button type="button" class="segmented-btn active" data-src="enrolled">From Enrolled Identity</button>
-            <button type="button" class="segmented-btn" data-src="probe">From Captured Probe</button>
+            <button type="button" class="segmented-btn" data-src="probe">From Live / Uploaded Probe</button>
           </div>
         </div>
 
@@ -128,7 +136,7 @@ export function renderCompareIdentities(container, { appState, navigate }) {
           <div class="form-field" style="justify-content:flex-end;">
             <label class="checkbox-row">
               <input type="checkbox" id="cmp-exclude-self" checked />
-              <span>Exclude self from 1:N ranked candidate matches</span>
+              <span>Exclude source identity from ranked matches</span>
             </label>
           </div>
         </div>
@@ -137,17 +145,18 @@ export function renderCompareIdentities(container, { appState, navigate }) {
           <div class="probe-card">
             <div class="row-between"><strong>Face Probe</strong><span id="idn-face-st" class="state-text state-neutral">Optional</span></div>
             <div id="idn-face-live" class="preview-frame" style="max-height:150px;" hidden></div>
-            <div id="idn-face-q" class="meta-line">Webcam or photo</div>
+            <div id="idn-face-q" class="meta-line">Live camera or photo upload</div>
             <div class="row-wrap">
-              <button type="button" class="btn btn-secondary btn-sm" id="idn-face-cam">Webcam</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="idn-face-cam">Live Camera</button>
               <button type="button" class="btn btn-primary btn-sm" id="idn-face-snap" hidden>Capture</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="idn-face-stop" hidden>Stop</button>
               <label class="btn btn-secondary btn-sm" style="cursor:pointer;">Upload<input type="file" id="idn-face-file" accept="image/*" hidden /></label>
             </div>
           </div>
 
           <div class="probe-card">
             <div class="row-between"><strong>Voice Probe</strong><span id="idn-voice-st" class="state-text state-neutral">Optional</span></div>
-            <div id="idn-voice-q" class="meta-line">2.4s Mic or audio upload</div>
+            <div id="idn-voice-q" class="meta-line">2.4s Mic recording or audio file</div>
             <div class="row-wrap">
               <button type="button" class="btn btn-secondary btn-sm" id="idn-voice-mic">Mic (2.4s)</button>
               <label class="btn btn-secondary btn-sm" style="cursor:pointer;">Upload<input type="file" id="idn-voice-file" accept="audio/*" hidden /></label>
@@ -163,25 +172,30 @@ export function renderCompareIdentities(container, { appState, navigate }) {
           </div>
         </div>
 
-        <div class="form-grid">
-          <div class="form-field">
-            <label class="field-label" for="cmp-policy-n">Fusion Policy</label>
-            <select class="select" id="cmp-policy-n">
-              ${FUSION_POLICIES.map((fp) => `<option value="${fp.id}" ${fp.id === defaultPolicy ? 'selected' : ''}>${escapeHtml(fp.label)}</option>`).join('')}
-            </select>
+        <details class="advanced-details">
+          <summary>Advanced Options (Fusion Policy &amp; Result Limit)</summary>
+          <div class="advanced-details-body">
+            <div class="form-grid">
+              <div class="form-field">
+                <label class="field-label" for="cmp-policy-n">Fusion Policy</label>
+                <select class="select" id="cmp-policy-n">
+                  ${FUSION_POLICIES.map((fp) => `<option value="${fp.id}" ${fp.id === defaultPolicy ? 'selected' : ''}>${escapeHtml(fp.label)}</option>`).join('')}
+                </select>
+              </div>
+              <div class="form-field">
+                <label class="field-label" for="cmp-topk">Top-K Candidates</label>
+                <select class="select mono" id="cmp-topk">
+                  <option value="5" selected>Top 5</option>
+                  <option value="10">Top 10</option>
+                  <option value="20">Top 20</option>
+                </select>
+              </div>
+            </div>
           </div>
-          <div class="form-field">
-            <label class="field-label" for="cmp-topk">Top-K Candidates</label>
-            <select class="select mono" id="cmp-topk">
-              <option value="5" selected>Top 5</option>
-              <option value="10">Top 10</option>
-              <option value="20">Top 20</option>
-            </select>
-          </div>
-        </div>
+        </details>
 
         <div class="row-between">
-          <span class="meta-line">Evaluated server-side across all encrypted vault entries owned by your account.</span>
+          <span class="meta-line">Evaluated server-side across your account's encrypted vault entries.</span>
           <button type="button" class="btn btn-primary" id="cmp-run-1ton">Search Vault (1:N)</button>
         </div>
 
@@ -304,26 +318,18 @@ export function renderCompareIdentities(container, { appState, navigate }) {
                   <th class="num-col">Similarity</th>
                   <th class="num-col">Threshold</th>
                   <th>Status</th>
-                  <th>Matcher Details</th>
                 </tr>
               </thead>
               <tbody>
                 ${rows
                   .map(([m, ev]) => {
                     const cls = ev.strongMismatch ? 'state-danger' : ev.passed ? 'state-success' : 'state-warning';
-                    const det =
-                      m === 'fingerprint' && typeof ev.details?.matchedMinutiae === 'number'
-                        ? `${ev.details.matchedMinutiae}/${ev.details.probeMinutiae} minutiae · rot ${ev.details.estimatedRotationDeg}°`
-                        : typeof ev.rawCosine === 'number'
-                        ? `rawCos=${ev.rawCosine} (${ev.details?.dim || ''}-D)`
-                        : 'Matched';
                     return `
                     <tr>
                       <td style="text-transform:capitalize;"><strong>${escapeHtml(m)}</strong></td>
                       <td class="num-col">${fmtPct(ev.score)}</td>
                       <td class="num-col">${fmtPct(ev.threshold)}</td>
                       <td><span class="state-text ${cls}">${ev.strongMismatch ? 'Strong Mismatch' : ev.passed ? 'Pass' : 'Below Thr'}</span></td>
-                      <td class="mono" style="font-size:12px;">${escapeHtml(det)}</td>
                     </tr>`;
                   })
                   .join('')}
@@ -331,13 +337,29 @@ export function renderCompareIdentities(container, { appState, navigate }) {
             </table>
           </div>
 
-          <div class="meta-line">
-            <span>Policy Threshold: <strong class="mono">${fmtPct(res.baseThreshold)}</strong></span>
-            <span aria-hidden="true">·</span>
-            <span>Processing Time: <strong class="mono">${res.processingTimeMs} ms</strong></span>
-            <span aria-hidden="true">·</span>
-            <span>Request: <span class="mono">${escapeHtml(res.requestId)}</span></span>
-          </div>
+          <details class="advanced-details">
+            <summary>Advanced Details (Matcher Telemetry &amp; Request Info)</summary>
+            <div class="advanced-details-body" style="font-size:12.5px;">
+              <div class="meta-line">
+                <span>Policy Threshold: <strong class="mono">${fmtPct(res.baseThreshold)}</strong></span>
+                <span aria-hidden="true">·</span>
+                <span>Processing Time: <strong class="mono">${res.processingTimeMs} ms</strong></span>
+                <span aria-hidden="true">·</span>
+                <span>Request: <span class="mono">${escapeHtml(res.requestId)}</span></span>
+              </div>
+              ${rows
+                .map(([m, ev]) => {
+                  const det =
+                    m === 'fingerprint' && typeof ev.details?.matchedMinutiae === 'number'
+                      ? `${ev.details.matchedMinutiae}/${ev.details.probeMinutiae} minutiae · rotation ${ev.details.estimatedRotationDeg}°`
+                      : typeof ev.rawCosine === 'number'
+                      ? `rawCos=${ev.rawCosine} (${ev.details?.dim || ''}-D)`
+                      : 'Matched';
+                  return `<div class="row-between"><span style="text-transform:capitalize;">${escapeHtml(m)}</span><span class="mono">${escapeHtml(det)}</span></div>`;
+                })
+                .join('')}
+            </div>
+          </details>
         </div>
       `;
     } catch (err) {
@@ -354,22 +376,29 @@ export function renderCompareIdentities(container, { appState, navigate }) {
   const fQ = container.querySelector('#idn-face-q');
   const fLive = container.querySelector('#idn-face-live');
   const fSnap = container.querySelector('#idn-face-snap');
+  const fStop = container.querySelector('#idn-face-stop');
   const vSt = container.querySelector('#idn-voice-st');
   const vQ = container.querySelector('#idn-voice-q');
   const fpSt = container.querySelector('#idn-fp-st');
   const fpQ = container.querySelector('#idn-fp-q');
 
+  const haltIdnCam = () => {
+    stopCamera();
+    fSnap.hidden = true;
+    fStop.hidden = true;
+    fLive.hidden = true;
+  };
+
   container.querySelector('#idn-face-cam').addEventListener('click', async () => {
     try {
-      stopCamera();
+      haltIdnCam();
       fSt.className = 'state-text state-warning';
-      fSt.textContent = 'Loading ML...';
+      fSt.textContent = 'Starting Camera...';
       await ensureFaceEngineReady();
-      activeStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } } });
+      activeStream = await openCameraStream();
       const wrap = document.createElement('div');
       wrap.className = 'face-guide-wrap';
-      const v = document.createElement('video');
-      v.autoplay = true; v.playsInline = true; v.muted = true; v.srcObject = activeStream;
+      const v = await createLiveVideoElement(activeStream);
       const oval = document.createElement('div');
       oval.className = 'face-guide-oval';
       const msgBadge = document.createElement('div');
@@ -377,7 +406,7 @@ export function renderCompareIdentities(container, { appState, navigate }) {
       msgBadge.textContent = 'Align face in oval...';
       wrap.appendChild(v); wrap.appendChild(oval); wrap.appendChild(msgBadge);
       fLive.innerHTML = ''; fLive.appendChild(wrap);
-      fLive.hidden = false; fSnap.hidden = false;
+      fLive.hidden = false; fSnap.hidden = false; fStop.hidden = false;
       fSt.textContent = 'Preview';
 
       guidanceTimer = setInterval(async () => {
@@ -398,26 +427,33 @@ export function renderCompareIdentities(container, { appState, navigate }) {
           await new Promise((r) => setTimeout(r, 250));
           const f2 = snapVideoFrameCanvas(v);
           const motion = computeFrameMotion(f1, f2);
-          stopCamera();
+          haltIdnCam();
           const res = await extractFaceFeatures(f2, { isLiveCapture: true, frameMotionScore: motion, captureSource: 'webcam' });
           faceVec = res.vector;
           faceQuality = res.quality;
           fSt.className = 'state-text state-success';
-          fSt.textContent = 'Ready (1024-D)';
-          fQ.textContent = `Q:${faceQuality.faceQualityScore}/100 · Motion:${motion}`;
+          fSt.textContent = 'Ready ✓';
+          fQ.textContent = `Quality: ${faceQuality.faceQualityScore}/100`;
         } catch (err) {
           fSt.className = 'state-text state-danger';
           fSt.textContent = 'Rejected';
           fQ.textContent = err.message;
           showToast(err.message, 'danger');
         } finally {
-          fSnap.disabled = false; fSnap.hidden = true; fLive.hidden = true;
-          stopCamera();
+          fSnap.disabled = false;
+          haltIdnCam();
         }
       };
     } catch (err) {
-      showToast(`Webcam error: ${err.message}`, 'warning');
+      haltIdnCam();
+      showToast(`Camera error: ${err.message}`, 'warning');
     }
+  });
+
+  fStop.addEventListener('click', () => {
+    haltIdnCam();
+    fSt.className = 'state-text state-neutral';
+    fSt.textContent = faceVec ? 'Ready ✓' : 'Optional';
   });
 
   container.querySelector('#idn-face-file').addEventListener('change', async (e) => {
