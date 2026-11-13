@@ -1237,6 +1237,14 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   });
 });
 
+function registerProductionFrontend() {
+  const publicDir = path.join(rootDir, 'public');
+  app.use(express.static(publicDir));
+  app.get('*', (_req: Request, res: Response) => {
+    res.sendFile(path.join(publicDir, 'index.html'));
+  });
+}
+
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -1246,11 +1254,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const publicDir = path.join(rootDir, 'public');
-    app.use(express.static(publicDir));
-    app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.join(publicDir, 'index.html'));
-    });
+    registerProductionFrontend();
   }
 
   app.listen(PORT, '0.0.0.0', () => {
@@ -1258,7 +1262,11 @@ async function startServer() {
   });
 }
 
-if (process.env.VERCEL !== '1') {
+// Vercel imports the Express app as a request handler and does not call startServer().
+// Register the production frontend routes during module initialization in that environment.
+if (process.env.VERCEL === '1') {
+  registerProductionFrontend();
+} else {
   void startServer();
 }
 
