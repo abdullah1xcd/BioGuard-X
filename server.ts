@@ -164,7 +164,7 @@ async function deleteVaultEntry(identityRef: string, idToken: string): Promise<v
   const url = firestoreDocUrl(`biometric_vault/${encodeURIComponent(identityRef)}`);
   const response = await fetch(url, {
     method: 'DELETE',
-    headers: { Authorization: `Bearer ${idToken} },
+    headers: { Authorization: `Bearer ${idToken}` },
   });
   if (!response.ok && response.status !== 404) {
     const detail = await response.text().catch(() => '');
