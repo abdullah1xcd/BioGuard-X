@@ -120,61 +120,55 @@ function decryptVaultMap(raw: string): Record<string, VaultEntry> {
   return JSON.parse(dec.toString('utf8')) as Record<string, VaultEntry>;
 }
 
-async function loadVault(idToken: string): Promise<Record<string, VaultEntry>> {
-  const url = `${firestoreDocUrl('biometric_vault')}?pageSize=1000`;
+async function loadVaultEntry(identityRef: string, idToken: string): Promise<VaultEntry | null> {
+  const url = firestoreDocUrl(`biometric_vault/${encodeURIComponent(identityRef)}`);
   const response = await fetch(url, { headers: { Authorization: `Bearer ${idToken}` } });
+  if (response.status === 404) return null;
   if (!response.ok) {
     const detail = await response.text().catch(() => '');
-    throw new Error(`Firestore vault read failed (${response.status}): ${detail.slice(0, 300)}`);
+    throw new Error(`Firestore vault document read failed (${response.status}): ${detail.slice(0, 300)}`);
   }
   const payload = await response.json() as {
-    documents?: Array<{ fields?: { encryptedPayload?: { stringValue?: string } } }>;
+    fields?: { encryptedPayload?: { stringValue?: string } };
   };
-  const vault: Record<string, VaultEntry> = {};
-  for (const document of payload.documents || []) {
-    const encryptedPayload = document.fields?.encryptedPayload?.stringValue;
-    if (!encryptedPayload) continue;
-    Object.assign(vault, decryptVaultMap(encryptedPayload));
-  }
-  return vault;
+  const encryptedPayload = payload.fields?.encryptedPayload?.stringValue;
+  if (!encryptedPayload) throw new Error('Firestore vault document is missing encryptedPayload.');
+  const decrypted = decryptVaultMap(encryptedPayload);
+  return decrypted[identityRef] || null;
 }
 
-async function saveVault(
-  map: Record<string, VaultEntry>,
-  idToken: string,
-  previous: Record<string, VaultEntry> = {}
-): Promise<void> {
-  const headers = {
-    Authorization: `Bearer ${idToken}`,
-    'Content-Type': 'application/json',
-  };
-  for (const [identityRef, entry] of Object.entries(map)) {
-    if (previous[identityRef] && JSON.stringify(previous[identityRef]) === JSON.stringify(entry)) continue;
-    const url = firestoreDocUrl(`biometric_vault/${encodeURIComponent(identityRef)}`);
-    const response = await fetch(url, {
-      method: 'PATCH',
-      headers,
-      body: JSON.stringify({
-        fields: {
-          identityRef: { stringValue: identityRef },
-          encryptedPayload: { stringValue: encryptVaultMap({ [identityRef]: entry }) },
-          updatedAt: { timestampValue: new Date().toISOString() },
-        },
-      }),
-    });
-    if (!response.ok) {
-      const detail = await response.text().catch(() => '');
-      throw new Error(`Firestore vault write failed (${response.status}): ${detail.slice(0, 300)}`);
-    }
+async function saveVaultEntry(entry: VaultEntry, idToken: string): Promise<void> {
+  const identityRef = entry.identityRef;
+  const url = firestoreDocUrl(`biometric_vault/${encodeURIComponent(identityRef)}`);
+  const response = await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      fields: {
+        identityRef: { stringValue: identityRef },
+        encryptedPayload: { stringValue: encryptVaultMap({ [identityRef]: entry }) },
+        updatedAt: { timestampValue: new Date().toISOString() },
+      },
+    }),
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(`Firestore vault write failed (${response.status}): ${detail.slice(0, 300)}`);
   }
-  for (const identityRef of Object.keys(previous)) {
-    if (map[identityRef]) continue;
-    const url = firestoreDocUrl(`biometric_vault/${encodeURIComponent(identityRef)}`);
-    const response = await fetch(url, { method: 'DELETE', headers });
-    if (!response.ok && response.status !== 404) {
-      const detail = await response.text().catch(() => '');
-      throw new Error(`Firestore vault delete failed (${response.status}): ${detail.slice(0, 300)}`);
-    }
+}
+
+async function deleteVaultEntry(identityRef: string, idToken: string): Promise<void> {
+  const url = firestoreDocUrl(`biometric_vault/${encodeURIComponent(identityRef)}`);
+  const response = await fetch(url, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${idToken} },
+  });
+  if (!response.ok && response.status !== 404) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(`Firestore vault delete failed (${response.status}): ${detail.slice(0, 300)}`);
   }
 }
 
@@ -672,9 +666,7 @@ app.post(
       return;
     }
 
-    const previousVault = await loadVault(req.auth!.idToken);
-    const vault = { ...previousVault };
-    const existing = vault[identityRef];
+    const existing = await loadVaultEntry(identityRef, req.auth!.idToken);
     const now = new Date().toISOString();
     const entry: VaultEntry = existing || {
       identityRef,
@@ -690,8 +682,7 @@ app.post(
     if (voiceVec) entry.modalities.voice = [...(entry.modalities.voice || []).slice(-4), voiceVec];
     if (fpVec) entry.modalities.fingerprint = [...(entry.modalities.fingerprint || []).slice(-4), fpVec];
 
-    vault[identityRef] = entry;
-    await saveVault(vault, req.auth!.idToken, previousVault);
+    await saveVaultEntry(entry, req.auth!.idToken);
 
     const registeredModalities = Object.keys(entry.modalities).filter(
       (m) => (entry.modalities[m as keyof typeof entry.modalities]?.length || 0) > 0
@@ -735,8 +726,7 @@ app.post(
       return;
     }
 
-    const vault = await loadVault(req.auth!.idToken);
-    const entry = vault[identityRef];
+    const entry = await loadVaultEntry(identityRef, req.auth!.idToken);
     if (!entry) {
       res.status(404).json({
         error: 'missing_identity',
@@ -1017,8 +1007,7 @@ app.post(
 // 5. Vault Identity Status & Admin Deletion
 app.get('/api/v1/identities/:identityRef/vault', requireAuth, requireCapability('view_identities'), asyncHandler(async (req: AuthedRequest, res: Response) => {
   const identityRef = String(req.params.identityRef || '');
-  const vault = await loadVault(req.auth!.idToken);
-  const entry = vault[identityRef];
+  const entry = await loadVaultEntry(identityRef, req.auth!.idToken);
   if (!entry) {
     res.json({ identityRef, inVault: false, modalities: [] });
     return;
@@ -1038,14 +1027,12 @@ app.get('/api/v1/identities/:identityRef/vault', requireAuth, requireCapability(
 
 app.delete('/api/v1/identities/:identityRef', requireAuth, requireCapability('delete_identity'), asyncHandler(async (req: AuthedRequest, res: Response) => {
   const identityRef = String(req.params.identityRef || '');
-  const previousVault = await loadVault(req.auth!.idToken);
-  const vault = { ...previousVault };
-  if (!vault[identityRef]) {
+  const existing = await loadVaultEntry(identityRef, req.auth!.idToken);
+  if (!existing) {
     res.status(404).json({ error: 'not_found', message: 'Identity not present in biometric vault.' });
     return;
   }
-  delete vault[identityRef];
-  await saveVault(vault, req.auth!.idToken, previousVault);
+  await deleteVaultEntry(identityRef, req.auth!.idToken);
   res.json({ status: 'deleted_from_vault', identityRef });
 }));
 
