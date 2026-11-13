@@ -11,9 +11,10 @@ export default defineConfig(() => {
       },
     },
     build: {
-      outDir: 'dist',
+      outDir: 'public',
       assetsDir: 'build',
-      emptyOutDir: true,
+      // Preserve checked-in public assets while publishing the Vite bundle.
+      emptyOutDir: false,
       publicDir: false,
     },
     server: {
