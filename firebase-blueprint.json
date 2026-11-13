@@ -31,7 +31,7 @@
     },
     "BiometricIdentity": {
       "title": "BiometricIdentity",
-      "description": "Enrolled identity metadata (templates remain encrypted in backend vault, never in Firestore)",
+      "description": "Per-account enrolled identity metadata (templates remain encrypted in backend vault)",
       "type": "object",
       "properties": {
         "identityId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -47,9 +47,20 @@
       },
       "required": ["identityId", "identityRef", "displayName", "status", "registeredModalities", "consentRecorded", "createdBy", "createdAt", "updatedAt"]
     },
+    "BiometricVaultEntry": {
+      "title": "BiometricVaultEntry",
+      "description": "Per-account AES-256-GCM encrypted biometric template payload",
+      "type": "object",
+      "properties": {
+        "identityRef": { "type": "string", "minLength": 2, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "encryptedPayload": { "type": "string", "minLength": 1, "maxLength": 900000 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["identityRef", "encryptedPayload", "updatedAt"]
+    },
     "VerificationRecord": {
       "title": "VerificationRecord",
-      "description": "Multimodal biometric verification outcome record (policyDecision remains pending)",
+      "description": "Per-account multimodal biometric verification outcome record",
       "type": "object",
       "properties": {
         "verificationId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -65,6 +76,19 @@
         "livenessPassed": { "type": "boolean" },
         "livenessScore": { "type": "number" },
         "adaptiveApplied": { "type": "boolean" },
+        "groundTruth": { "type": "string", "enum": ["genuine", "impostor", "unlabeled"] },
+        "isTestProbe": { "type": "boolean" },
+        "processingTimeMs": { "type": "number" },
+        "confidence": { "type": "number" },
+        "confidenceBand": { "type": "string", "enum": ["high", "moderate", "low"] },
+        "conflictDetected": { "type": "boolean" },
+        "featureVersion": { "type": "string", "maxLength": 32 },
+        "faceScore": { "type": "number" },
+        "voiceScore": { "type": "number" },
+        "fingerprintScore": { "type": "number" },
+        "faceQuality": { "type": "number" },
+        "voiceQuality": { "type": "number" },
+        "fingerprintQuality": { "type": "number" },
         "operatorUid": { "type": "string", "minLength": 1, "maxLength": 128 },
         "createdAt": { "type": "string", "format": "date-time" }
       },
@@ -72,7 +96,7 @@
     },
     "AuditLog": {
       "title": "AuditLog",
-      "description": "Append-only operational audit record without raw biometric samples or secrets",
+      "description": "Per-account append-only operational audit record without raw biometric samples or secrets",
       "type": "object",
       "properties": {
         "eventId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -103,7 +127,7 @@
     },
     "SecurityAlert": {
       "title": "SecurityAlert",
-      "description": "Threat intelligence investigation alert",
+      "description": "Per-account threat intelligence investigation alert",
       "type": "object",
       "properties": {
         "alertId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -121,7 +145,7 @@
     },
     "AutomationWorkflow": {
       "title": "AutomationWorkflow",
-      "description": "Authorized event-driven workflow metadata",
+      "description": "Per-account event-driven workflow metadata",
       "type": "object",
       "properties": {
         "workflowId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -138,7 +162,7 @@
     },
     "SystemSettings": {
       "title": "SystemSettings",
-      "description": "System configuration metadata (no secrets)",
+      "description": "Per-account threshold and organization configuration metadata (no secrets)",
       "type": "object",
       "properties": {
         "settingId": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -148,6 +172,8 @@
         "fingerprintThreshold": { "type": "number" },
         "threeModalThreshold": { "type": "number" },
         "maxHoldHours": { "type": "number" },
+        "fusionPolicy": { "type": "string", "enum": ["weighted_score", "strict_and", "hierarchical_adaptive"] },
+        "securityPreset": { "type": "string", "enum": ["balanced", "strict", "convenience", "custom"] },
         "updatedAt": { "type": "string", "format": "date-time" },
         "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 }
       },
@@ -155,7 +181,7 @@
     },
     "ApprovalRequest": {
       "title": "ApprovalRequest",
-      "description": "Authorized approval workflow record for sensitive biometric actions such as deletion requests",
+      "description": "Per-account approval workflow record for sensitive biometric actions",
       "type": "object",
       "properties": {
         "requestId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -182,37 +208,41 @@
       "schema": { "$ref": "#/entities/AdminGrant" },
       "description": "Privileged administrator registry"
     },
-    "/identities/{identityId}": {
+    "/users/{userId}/identities/{identityId}": {
       "schema": { "$ref": "#/entities/BiometricIdentity" },
-      "description": "Enrolled biometric identity metadata (no raw templates or keys)"
+      "description": "Per-account enrolled biometric identity metadata"
     },
-    "/verification_records/{verificationId}": {
+    "/users/{userId}/biometric_vault/{identityRef}": {
+      "schema": { "$ref": "#/entities/BiometricVaultEntry" },
+      "description": "Per-account AES-256-GCM encrypted biometric templates"
+    },
+    "/users/{userId}/verification_records/{verificationId}": {
       "schema": { "$ref": "#/entities/VerificationRecord" },
-      "description": "Verification event metadata records"
+      "description": "Per-account verification event metadata records"
     },
-    "/audit_logs/{eventId}": {
+    "/users/{userId}/audit_logs/{eventId}": {
       "schema": { "$ref": "#/entities/AuditLog" },
-      "description": "Append-only operational audit logs"
+      "description": "Per-account append-only operational audit logs"
     },
-    "/notifications/{notificationId}": {
+    "/users/{userId}/notifications/{notificationId}": {
       "schema": { "$ref": "#/entities/Notification" },
-      "description": "User-scoped notifications"
+      "description": "Per-account notifications"
     },
-    "/security_alerts/{alertId}": {
+    "/users/{userId}/security_alerts/{alertId}": {
       "schema": { "$ref": "#/entities/SecurityAlert" },
-      "description": "Security analyst threat alerts"
+      "description": "Per-account threat alerts"
     },
-    "/automation_workflows/{workflowId}": {
+    "/users/{userId}/automation_workflows/{workflowId}": {
       "schema": { "$ref": "#/entities/AutomationWorkflow" },
-      "description": "Automation center workflow configurations"
+      "description": "Per-account automation center workflow configurations"
     },
-    "/system_settings/{settingId}": {
+    "/users/{userId}/system_settings/{settingId}": {
       "schema": { "$ref": "#/entities/SystemSettings" },
-      "description": "Organization and threshold configuration"
+      "description": "Per-account organization and threshold configuration"
     },
-    "/approval_requests/{requestId}": {
+    "/users/{userId}/approval_requests/{requestId}": {
       "schema": { "$ref": "#/entities/ApprovalRequest" },
-      "description": "Sensitive action approval workflow requests"
+      "description": "Per-account sensitive action approval workflow requests"
     }
   }
 }

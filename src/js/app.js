@@ -26,6 +26,7 @@ import {
   renderEnrollment,
   renderIdentities,
 } from './pages_core.js';
+import { renderCompareIdentities } from './pages_compare.js';
 import {
   renderAnalytics,
   renderThreatIntel,
@@ -38,6 +39,7 @@ import {
   renderAccessControl,
   renderSettings,
 } from './pages_admin.js';
+import { initPwaUI } from './pwa.js';
 
 const NAV_GROUPS = [
   {
@@ -46,6 +48,7 @@ const NAV_GROUPS = [
       { id: 'overview', label: 'Main Dashboard', icon: 'dashboard', render: renderOverview },
       { id: 'enrollment', label: 'Biometric Enrollment', icon: 'userPlus', render: renderEnrollment, requirePermission: 'create_identity' },
       { id: 'verification', label: 'Verification Center', icon: 'layers', render: renderVerification, requirePermission: 'perform_verification' },
+      { id: 'compare', label: '1:1 & 1:N Compare', icon: 'compare', render: renderCompareIdentities, requirePermission: 'perform_verification' },
       { id: 'identities', label: 'Identities', icon: 'users', render: renderIdentities },
     ],
   },
@@ -61,7 +64,7 @@ const NAV_GROUPS = [
     items: [
       { id: 'analytics', label: 'Analytics & Reports', icon: 'barChart', render: renderAnalytics },
       { id: 'approvals', label: 'Approval Workflow', icon: 'checkSquare', render: renderApprovals },
-      { id: 'automation', label: 'Automation Center', icon: 'workflow', render: renderAutomationCenter, requireRoles: ['super_admin', 'administrator', 'security_analyst'] },
+      { id: 'automation', label: 'Automation Center', icon: 'workflow', render: renderAutomationCenter, requirePermission: 'manage_workflows' },
       { id: 'audit_trail', label: 'Audit Logs', icon: 'scroll', render: renderAuditTrail },
       { id: 'access_control', label: 'Access Control', icon: 'lock', render: renderAccessControl },
       { id: 'settings', label: 'Settings', icon: 'shieldCheck', render: renderSettings },
@@ -100,6 +103,23 @@ const appState = {
 let activeRoute = 'overview';
 let activeCleanup = null;
 let unsubs = [];
+
+function resetAppStateData() {
+  appState.permissions = [];
+  appState.identities = [];
+  appState.verifications = [];
+  appState.auditLogs = [];
+  appState.notifications = [];
+  appState.alerts = [];
+  appState.workflows = [];
+  appState.approvals = [];
+  appState.settings = null;
+  appState.preselectedIdentityRef = '';
+  appState.aiHistory = [];
+  appState.analystInitialPrompt = '';
+  appState.analystInitialMode = 'chat';
+  appState.selectedVerificationId = '';
+}
 
 function clearSubscriptions() {
   for (const u of unsubs) {
@@ -181,8 +201,8 @@ function renderSidebar() {
   if (healthEl) {
     const apiOk = appState.health?.status === 'ok';
     healthEl.innerHTML = `
-      <div><strong class="${apiOk ? 'state-success' : 'state-danger'}">${apiOk ? 'API Ready' : 'API Offline'}</strong> · ${escapeHtml(appState.health?.feature_version || 'v1.1')}</div>
-      <div>Firestore: ${appState.firestoreOk ? 'Connected' : 'Offline'} · Vault: ${appState.health?.encrypted_identities ?? 0}</div>
+      <div><strong class="${apiOk ? 'state-success' : 'state-danger'}">${apiOk ? 'API Ready' : 'API Offline'}</strong> · ${escapeHtml(appState.health?.feature_version || 'v2.0-multimodal')}</div>
+      <div>Firestore: ${appState.firestoreOk ? 'Connected' : 'Offline'} · Vault: ${appState.identities.length}</div>
     `;
   }
 }
@@ -284,6 +304,12 @@ function renderActiveView() {
   renderSidebar();
   renderTopbarAccountAndAlerts();
 
+  document.querySelectorAll('#mobile-bottom-nav [data-route]').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.route === activeRoute);
+    const item = ROUTE_MAP.get(btn.dataset.route);
+    btn.hidden = item ? !canAccessItem(item) : false;
+  });
+
   const main = document.getElementById('main-content');
   const maybeCleanup = route.render(main, {
     appState,
@@ -324,6 +350,7 @@ function closeMobileDrawer() {
 
 async function bootstrapAuthenticatedSession(fbUser) {
   clearSubscriptions();
+  resetAppStateData();
   appState.fbUser = fbUser;
 
   const conn = await testFirestoreConnection();
@@ -352,7 +379,7 @@ async function bootstrapAuthenticatedSession(fbUser) {
     subscribeIdentities(role, uid, (list) => {
       appState.identities = list;
       renderSidebar();
-      if (['overview', 'identities', 'verification', 'analytics'].includes(activeRoute)) renderActiveView();
+      if (['overview', 'identities', 'verification', 'compare', 'analytics'].includes(activeRoute)) renderActiveView();
     })
   );
   unsubs.push(
@@ -381,16 +408,18 @@ async function bootstrapAuthenticatedSession(fbUser) {
     })
   );
 
-  if (['super_admin', 'administrator', 'security_analyst'].includes(role)) {
+  if (appState.permissions.includes('manage_alerts')) {
     unsubs.push(
-      subscribeSecurityAlerts((list) => {
+      subscribeSecurityAlerts(uid, (list) => {
         appState.alerts = list;
         renderSidebar();
         if (['overview', 'threat_intel'].includes(activeRoute)) renderActiveView();
       })
     );
+  }
+  if (appState.permissions.includes('manage_workflows')) {
     unsubs.push(
-      subscribeWorkflows((list) => {
+      subscribeWorkflows(uid, (list) => {
         appState.workflows = list;
         if (['overview', 'automation'].includes(activeRoute)) renderActiveView();
       })
@@ -428,9 +457,9 @@ function initApp() {
   onAuthChanged(async (fbUser) => {
     if (!fbUser) {
       clearSubscriptions();
+      resetAppStateData();
       appState.fbUser = null;
       appState.profile = null;
-      appState.aiHistory = [];
       appShell.hidden = true;
       authGate.hidden = false;
       return;
@@ -488,6 +517,27 @@ function initApp() {
   document.getElementById('sidebar-backdrop')?.addEventListener('click', closeMobileDrawer);
   document.getElementById('modal-close-btn')?.addEventListener('click', closeModal);
   document.getElementById('modal-backdrop')?.addEventListener('click', closeModal);
+
+  const mbnIcons = { overview: 'dashboard', verification: 'layers', compare: 'compare', analytics: 'barChart' };
+  document.querySelectorAll('#mobile-bottom-nav [data-route]').forEach((btn) => {
+    const iconKey = mbnIcons[btn.dataset.route];
+    if (iconKey && ICONS[iconKey] && !btn.querySelector('svg')) {
+      btn.insertAdjacentHTML('afterbegin', ICONS[iconKey]);
+    }
+    btn.addEventListener('click', () => navigate(btn.dataset.route));
+  });
+  const moreBtn = document.getElementById('mbn-more-btn');
+  if (moreBtn) {
+    if (!moreBtn.querySelector('svg')) {
+      moreBtn.insertAdjacentHTML(
+        'afterbegin',
+        `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/></svg>`
+      );
+    }
+    moreBtn.addEventListener('click', openMobileDrawer);
+  }
+
+  initPwaUI();
 
   window.addEventListener('hashchange', () => {
     const next = window.location.hash.replace('#', '');

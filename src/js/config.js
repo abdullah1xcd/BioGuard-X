@@ -11,13 +11,33 @@ export const DEFAULT_THRESHOLDS = {
   fingerprintThreshold: 0.72,
   threeModalThreshold: 0.74,
   maxHoldHours: 4,
+  fusionPolicy: 'hierarchical_adaptive',
+  securityPreset: 'balanced',
 };
+
+export const FUSION_POLICIES = [
+  {
+    id: 'hierarchical_adaptive',
+    label: 'Hierarchical Adaptive (Recommended)',
+    summary: 'Quality-weighted fusion with conflict detection and Stage 2 escalation on borderline scores.',
+  },
+  {
+    id: 'weighted_score',
+    label: 'Quality-Weighted Score Fusion',
+    summary: 'Combines calibrated scores weighted by modality signal quality; blocks strong cross-modality conflicts.',
+  },
+  {
+    id: 'strict_and',
+    label: 'Strict Conjunction (All Modalities Pass)',
+    summary: 'Every evaluated modality AND the fused score must meet or exceed configured thresholds.',
+  },
+];
 
 export const THRESHOLD_PRESETS = [
   {
     id: 'balanced',
     label: 'Balanced (Default)',
-    summary: 'Recommended general-purpose thresholds',
+    summary: 'Recommended general-purpose calibrated thresholds',
     faceThreshold: 0.72,
     voiceThreshold: 0.70,
     fingerprintThreshold: 0.72,
@@ -26,7 +46,7 @@ export const THRESHOLD_PRESETS = [
   {
     id: 'strict',
     label: 'High Security',
-    summary: 'Stricter matching for sensitive workflows',
+    summary: 'Stricter matching thresholds for sensitive access',
     faceThreshold: 0.80,
     voiceThreshold: 0.78,
     fingerprintThreshold: 0.80,
@@ -35,7 +55,7 @@ export const THRESHOLD_PRESETS = [
   {
     id: 'convenience',
     label: 'Low Friction',
-    summary: 'Relaxed thresholds for rapid verification',
+    summary: 'Relaxed thresholds for rapid verification flows',
     faceThreshold: 0.65,
     voiceThreshold: 0.63,
     fingerprintThreshold: 0.65,
@@ -48,74 +68,74 @@ export const PIPELINE_CATALOG = [
     key: 'hierarchical',
     label: 'Hierarchical',
     requires: ['face'],
-    optional: ['voice'],
-    description: 'Fast face screening with automatic voice fusion escalation on uncertain scores.',
+    optional: ['voice', 'fingerprint'],
+    description: 'Pretrained FaceRes-1024D screening with automatic Voice/Fingerprint fusion escalation on uncertain scores.',
   },
   {
     key: 'three_modal',
     label: 'Face + Voice + FP',
     requires: ['face', 'voice', 'fingerprint'],
     optional: [],
-    description: 'Weighted three-modality score fusion across all biometric factors.',
+    description: 'Quality-weighted three-modality fusion across FaceRes-1024D, Voice-96D, and Minutiae RANSAC.',
   },
   {
     key: 'face_voice',
     label: 'Face + Voice',
     requires: ['face', 'voice'],
     optional: [],
-    description: 'Early feature fusion combining facial geometry and acoustic vectors.',
+    description: 'Quality-weighted FaceRes-1024D + 16kHz CMVN MFCC+F0 speaker verification.',
   },
   {
     key: 'face_fingerprint',
     label: 'Face + FP',
     requires: ['face', 'fingerprint'],
     optional: [],
-    description: 'Combined facial and fingerprint ridge score verification.',
+    description: 'Combined FaceRes-1024D and Gabor+Minutiae fingerprint verification.',
   },
   {
     key: 'voice_fingerprint',
     label: 'Voice + FP',
     requires: ['voice', 'fingerprint'],
     optional: [],
-    description: 'Combined voice acoustic and fingerprint ridge verification.',
+    description: 'Combined 16kHz Voice-96D acoustic and Gabor+Minutiae fingerprint verification.',
   },
   {
     key: 'face_only',
     label: 'Face Only',
     requires: ['face'],
     optional: [],
-    description: 'Single-modality facial HOG + LBP descriptor match.',
+    description: 'Pretrained BlazeFace + FaceMesh + HSE-FaceRes (1024-D) + Neural Anti-Spoof.',
   },
   {
     key: 'voice_only',
     label: 'Voice Only',
     requires: ['voice'],
     optional: [],
-    description: 'Single-modality MFCC, ZCR, and RMS acoustic match.',
+    description: '16kHz resampled spectral-subtracted CMVN 20-MFCC + Delta + Delta-Delta + F0 (96-D).',
   },
   {
     key: 'fingerprint_only',
     label: 'Fingerprint Only',
     requires: ['fingerprint'],
     optional: [],
-    description: 'Single-modality Gabor ridge orientation match.',
+    description: 'Gabor ridge enhancement, Zhang-Suen thinning, Crossing-Number minutiae & RANSAC alignment.',
   },
 ];
 
 export const PERMISSION_MATRIX = [
-  { key: 'view_identities', label: 'View Identities', roles: ['super_admin', 'administrator', 'security_analyst', 'operator', 'viewer'] },
-  { key: 'create_identity', label: 'Create / Enroll Identities', roles: ['super_admin', 'administrator', 'operator'] },
-  { key: 'edit_identity', label: 'Edit / Deactivate Identities', roles: ['super_admin', 'administrator', 'operator'] },
-  { key: 'delete_identity', label: 'Delete Identities (Audited)', roles: ['super_admin', 'administrator'] },
-  { key: 'perform_verification', label: 'Perform Biometric Verification', roles: ['super_admin', 'administrator', 'security_analyst', 'operator'] },
-  { key: 'view_analytics', label: 'View Security Analytics', roles: ['super_admin', 'administrator', 'security_analyst', 'operator', 'viewer'] },
-  { key: 'view_audit_logs', label: 'View Full Audit Trail', roles: ['super_admin', 'administrator', 'security_analyst'] },
-  { key: 'manage_alerts', label: 'Manage Risk & Threat Alerts', roles: ['super_admin', 'administrator', 'security_analyst'] },
+  { key: 'view_identities', label: 'View Own Identities', roles: ['super_admin', 'administrator', 'security_analyst', 'operator', 'viewer'] },
+  { key: 'create_identity', label: 'Create / Enroll Identities', roles: ['super_admin', 'administrator', 'security_analyst', 'operator'] },
+  { key: 'edit_identity', label: 'Edit / Deactivate Identities', roles: ['super_admin', 'administrator', 'security_analyst', 'operator'] },
+  { key: 'delete_identity', label: 'Delete Own Identities (Audited)', roles: ['super_admin', 'administrator', 'security_analyst', 'operator'] },
+  { key: 'perform_verification', label: 'Perform Verification, 1:1 Compare & 1:N Search', roles: ['super_admin', 'administrator', 'security_analyst', 'operator'] },
+  { key: 'view_analytics', label: 'View Own Security Analytics', roles: ['super_admin', 'administrator', 'security_analyst', 'operator', 'viewer'] },
+  { key: 'view_audit_logs', label: 'View Own Audit Trail', roles: ['super_admin', 'administrator', 'security_analyst', 'operator'] },
+  { key: 'manage_alerts', label: 'Manage Own Risk & Threat Alerts', roles: ['super_admin', 'administrator', 'security_analyst', 'operator'] },
   { key: 'use_ai_analyst', label: 'Use AI Security Analyst', roles: ['super_admin', 'administrator', 'security_analyst', 'operator'] },
-  { key: 'manage_approvals', label: 'Approve Sensitive Biometric Actions', roles: ['super_admin', 'administrator'] },
-  { key: 'manage_workflows', label: 'Manage Automation Workflows', roles: ['super_admin', 'administrator'] },
-  { key: 'manage_roles', label: 'Manage Users & Roles', roles: ['super_admin', 'administrator'] },
-  { key: 'change_settings', label: 'Change System Settings', roles: ['super_admin', 'administrator'] },
+  { key: 'manage_approvals', label: 'Approve Own Biometric Requests', roles: ['super_admin', 'administrator', 'security_analyst', 'operator'] },
+  { key: 'manage_workflows', label: 'Manage Own Automation Workflows', roles: ['super_admin', 'administrator', 'security_analyst', 'operator'] },
+  { key: 'manage_roles', label: 'Manage Platform Users & Roles', roles: ['super_admin', 'administrator'] },
+  { key: 'change_settings', label: 'Change Own Threshold & Fusion Settings', roles: ['super_admin', 'administrator', 'security_analyst', 'operator'] },
 ];
 
 export function slugifyIdentityRef(displayName) {

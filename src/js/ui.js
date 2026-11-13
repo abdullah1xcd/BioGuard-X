@@ -94,7 +94,6 @@ export function downloadFile(filename, content, mimeType = 'text/csv;charset=utf
   URL.revokeObjectURL(url);
 }
 
-// Load an uploaded image File into an HTMLImageElement
 export function loadImageFile(file) {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
@@ -111,8 +110,7 @@ export function loadImageFile(file) {
   });
 }
 
-// Generate a procedural deterministic grayscale fingerprint test image on a canvas
-// so users without a physical fingerprint sensor file can still test image extraction & matching
+// Generate procedural deterministic grayscale fingerprint test image with ridge bifurcations/endings
 export function renderSampleFingerprintCanvas(seedText, width = 180, height = 180) {
   const canvas = document.createElement('canvas');
   canvas.width = width;
@@ -126,17 +124,40 @@ export function renderSampleFingerprintCanvas(seedText, width = 180, height = 18
     h ^= seedText.charCodeAt(i);
     h = Math.imul(h, 16777619);
   }
-  const cx = width / 2 + ((h % 19) - 9);
-  const cy = height / 2 + (((h >> 5) % 19) - 9);
+  const nextRand = () => {
+    h ^= h << 13;
+    h ^= h >>> 17;
+    h ^= h << 5;
+    return (h >>> 0) / 4294967295;
+  };
+
+  const cx = width / 2 + (nextRand() - 0.5) * 16;
+  const cy = height / 2 + (nextRand() - 0.5) * 16;
+  const phaseMod = 1.6 + nextRand() * 2.2;
+  const skewX = 0.95 + nextRand() * 0.25;
+  const skewY = 0.78 + nextRand() * 0.22;
+
+  // Deterministic phase dislocations (yield real ridge endings & bifurcations)
+  const singularities = [];
+  for (let i = 0; i < 6; i++) {
+    const ang = nextRand() * Math.PI * 2;
+    const rad = 18 + nextRand() * 44;
+    singularities.push({
+      x: cx + Math.cos(ang) * rad,
+      y: cy + Math.sin(ang) * rad,
+      sign: i % 2 === 0 ? 1 : -1,
+    });
+  }
+
   const imgData = ctx.getImageData(0, 0, width, height);
   const data = imgData.data;
 
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      const dx = (x - cx) * 1.05;
-      const dy = (y - cy) * 0.85;
+      const dx = (x - cx) * skewX;
+      const dy = (y - cy) * skewY;
       const r = Math.hypot(dx, dy);
-      const ell = Math.hypot(dx / 72, dy / 86);
+      const ell = Math.hypot(dx / 74, dy / 86);
       const idx = (y * width + x) * 4;
       if (ell > 1) {
         data[idx] = 241;
@@ -146,8 +167,15 @@ export function renderSampleFingerprintCanvas(seedText, width = 180, height = 18
         continue;
       }
       const theta = Math.atan2(dy, dx);
-      const ridge = Math.sin(r * 0.55 + Math.sin(theta * 2 + (h % 7)) * 2.2);
-      const val = ridge > 0 ? 38 : 228;
+      let phaseShift = 0;
+      for (const s of singularities) {
+        const sDist = Math.hypot(x - s.x, y - s.y);
+        if (sDist < 42) {
+          phaseShift += s.sign * 0.55 * Math.atan2(y - s.y, x - s.x) * Math.exp(-sDist / 28);
+        }
+      }
+      const ridge = Math.sin(r * 0.56 + Math.sin(theta * 2 + phaseMod) * 2.1 + phaseShift);
+      const val = ridge > 0 ? 34 : 230;
       data[idx] = val;
       data[idx + 1] = val;
       data[idx + 2] = val;
@@ -158,7 +186,7 @@ export function renderSampleFingerprintCanvas(seedText, width = 180, height = 18
   return canvas;
 }
 
-// Generate a procedural deterministic face-like grayscale pattern canvas for testing without webcam
+// Illustrative QA avatar preview canvas (synthetic non-camera test marker)
 export function renderSampleFaceCanvas(seedText, width = 240, height = 180) {
   const canvas = document.createElement('canvas');
   canvas.width = width;
@@ -169,14 +197,14 @@ export function renderSampleFaceCanvas(seedText, width = 240, height = 180) {
     h ^= seedText.charCodeAt(i);
     h = Math.imul(h, 16777619);
   }
-  ctx.fillStyle = '#1e293b';
+  ctx.fillStyle = '#0f172a';
   ctx.fillRect(0, 0, width, height);
 
   const eyeSpread = 24 + (h % 10);
-  const jawW = 48 + ((h >> 4) % 12);
+  const jawW = 46 + ((h >> 4) % 12);
   ctx.fillStyle = '#cbd5e1';
   ctx.beginPath();
-  ctx.ellipse(width / 2, height / 2, jawW, 64, 0, 0, Math.PI * 2);
+  ctx.ellipse(width / 2, height / 2, jawW, 60, 0, 0, Math.PI * 2);
   ctx.fill();
 
   ctx.fillStyle = '#334155';
@@ -186,19 +214,23 @@ export function renderSampleFaceCanvas(seedText, width = 240, height = 180) {
   ctx.fill();
 
   ctx.strokeStyle = '#475569';
-  ctx.lineWidth = 4;
+  ctx.lineWidth = 3.5;
   ctx.beginPath();
   ctx.moveTo(width / 2, height / 2 - 10);
   ctx.lineTo(width / 2, height / 2 + 16);
   ctx.stroke();
 
   ctx.beginPath();
-  ctx.arc(width / 2, height / 2 + 28, 16, 0.15 * Math.PI, 0.85 * Math.PI);
+  ctx.arc(width / 2, height / 2 + 26, 15, 0.15 * Math.PI, 0.85 * Math.PI);
   ctx.stroke();
+
+  ctx.fillStyle = '#06b6d4';
+  ctx.font = '600 10px "JetBrains Mono", monospace';
+  ctx.fillText('SYNTHETIC QA PROBE', 10, height - 10);
   return canvas;
 }
 
-// Generate deterministic synthesized audio PCM buffer (2 seconds @ 16kHz) for mic-free testing
+// Generate deterministic synthesized speech-like PCM buffer (2s @ 16kHz) with natural F0 vibrato & formant harmonics
 export function synthesizeSampleVoicePCM(seedText, segments = 3, sampleRate = 16000) {
   const total = sampleRate * 2;
   const samples = new Float32Array(total);
@@ -207,7 +239,9 @@ export function synthesizeSampleVoicePCM(seedText, segments = 3, sampleRate = 16
     h ^= seedText.charCodeAt(i);
     h = Math.imul(h, 16777619);
   }
-  const f0 = 115 + (h % 95);
+  const f0 = 108 + (h % 115);
+  const formant2Gain = 0.16 + ((h >> 4) % 15) * 0.015;
+  const formant3Gain = 0.08 + ((h >> 8) % 12) * 0.01;
   const segLen = Math.floor(total / (segments * 2 + 1));
 
   for (let s = 0; s < segments; s++) {
@@ -215,31 +249,73 @@ export function synthesizeSampleVoicePCM(seedText, segments = 3, sampleRate = 16
     const end = Math.min(total, start + segLen);
     for (let i = start; i < end; i++) {
       const t = i / sampleRate;
+      const fInst = f0 * (1 + 0.025 * Math.sin(2 * Math.PI * 4.8 * t));
       const env = Math.sin(((i - start) / (end - start)) * Math.PI);
+      const breath = 0.012 * Math.sin(i * 12.9898);
       samples[i] =
         env *
-        (0.35 * Math.sin(2 * Math.PI * f0 * t) +
-          0.18 * Math.sin(2 * Math.PI * f0 * 2.02 * t) +
-          0.09 * Math.sin(2 * Math.PI * f0 * 3.1 * t));
+        (0.36 * Math.sin(2 * Math.PI * fInst * t) +
+          formant2Gain * Math.sin(2 * Math.PI * fInst * 2.04 * t) +
+          formant3Gain * Math.sin(2 * Math.PI * fInst * 3.12 * t) +
+          0.05 * Math.sin(2 * Math.PI * fInst * 4.4 * t) +
+          breath);
     }
   }
   return { samples, sampleRate };
 }
 
-// Record audio from browser microphone for N milliseconds
-export async function recordMicrophonePCM(durationMs = 2400) {
+export function encodeWavBlobUrl(samples, sampleRate = 16000) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeStr = (off, s) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i));
+  };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+  let off = 44;
+  for (let i = 0; i < samples.length; i++, off += 2) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(off, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+  }
+  return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
+}
+
+// Record audio from browser microphone with live elapsed/RMS progress & WAV playback URL
+export async function recordMicrophonePCM(durationMs = 2400, onProgress) {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     throw new Error('Microphone API is unavailable in this browser context.');
   }
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+  });
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   const ctx = new AudioCtx();
   const source = ctx.createMediaStreamSource(stream);
   const processor = ctx.createScriptProcessor(4096, 1, 1);
   const chunks = [];
+  const startedAt = performance.now();
 
   processor.onaudioprocess = (e) => {
-    chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    const ch = new Float32Array(e.inputBuffer.getChannelData(0));
+    chunks.push(ch);
+    if (onProgress) {
+      let sum = 0;
+      for (let i = 0; i < ch.length; i++) sum += ch[i] * ch[i];
+      const rms = Math.sqrt(sum / ch.length);
+      const elapsedSec = Math.min(durationMs / 1000, (performance.now() - startedAt) / 1000);
+      onProgress({ elapsedSec, totalSec: durationMs / 1000, rms });
+    }
   };
 
   source.connect(processor);
@@ -260,5 +336,6 @@ export async function recordMicrophonePCM(durationMs = 2400) {
     out.set(c, offset);
     offset += c.length;
   }
-  return { samples: out, sampleRate };
+  const wavUrl = encodeWavBlobUrl(out, sampleRate);
+  return { samples: out, sampleRate, wavUrl };
 }

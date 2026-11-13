@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>BioGuard X — Multimodal Biometric Security &amp; Automation</title>
+    <meta
+      name="description"
+      content="BioGuard X Hierarchical Multimodal Biometric Verification, Liveness Detection, Risk Engine, Approval Workflows, and AI Security Analyst Platform."
+    />
+    <meta property="og:title" content="BioGuard X — Multimodal Biometric Security &amp; Automation" />
+    <meta
+      property="og:description"
+      content="Hierarchical Face, Voice, and Fingerprint verification with liveness detection, adaptive risk scoring, Firestore governance, and AI Security Analyst."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#070d1a" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="BioGuard X" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script type="module" crossorigin src="/build/index-Bv5wng35.js"></script>
+    <link rel="stylesheet" crossorigin href="/build/index-CUkKhrEw.css">
+  <link rel="manifest" href="/manifest.webmanifest"></head>
+  <body>
+    <!-- Offline Status Banner (PWA) -->
+    <div id="offline-banner" class="offline-banner" hidden role="status">
+      <span>Offline mode — API biometric matching and Firestore sync require a live connection.</span>
+    </div>
+
+    <!-- Google Sign-In Gate -->
+    <div id="auth-gate" class="auth-gate">
+      <div class="auth-card">
+        <div class="auth-brand">
+          <span class="brand-mark" aria-hidden="true">BG</span>
+          <div>
+            <h1 class="auth-title">BioGuard X</h1>
+            <p class="auth-subtitle">Hierarchical Multimodal Biometric Security Platform</p>
+          </div>
+        </div>
+
+        <p class="auth-desc">
+          Sign in with your verified Google account via Firebase Authentication to access biometric enrollment, multimodal verification, 1:1 &amp; 1:N identity search, risk &amp; liveness analysis, and the AI Security Analyst.
+        </p>
+
+        <div id="auth-error" class="notice-strip danger" hidden></div>
+
+        <button id="google-signin-btn" class="btn btn-primary auth-signin-btn" type="button">
+          <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M21.35 11.1h-9.17v2.73h6.51c-.33 3.81-3.5 5.44-6.5 5.44C8.36 19.27 5 16.25 5 12c0-4.1 3.2-7.27 7.2-7.27c3.09 0 4.9 1.97 4.9 1.97L19 4.72S16.56 2 12.1 2C6.42 2 2.03 6.8 2.03 12c0 5.05 4.13 10 10.22 10c5.35 0 9.25-3.67 9.25-9.09c0-1.15-.15-1.81-.15-1.81Z"/></svg>
+          <span>Sign in with Google</span>
+        </button>
+
+        <div class="auth-footnote">
+          <span>Encrypted biometric templates remain on the trusted backend vault</span>
+          <span aria-hidden="true">·</span>
+          <span>RBAC enforced server-side</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Authenticated Workspace -->
+    <div id="app-shell" class="app-shell" hidden>
+      <aside id="sidebar" class="sidebar" aria-label="Primary navigation">
+        <div class="sidebar-brand">
+          <a href="#overview" class="brand-link" id="brand-home-link">
+            <span class="brand-mark" aria-hidden="true">BG</span>
+            <span class="brand-name">BioGuard X</span>
+          </a>
+          <button
+            id="mobile-close-nav"
+            class="icon-btn mobile-only"
+            type="button"
+            aria-label="Close navigation menu"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+
+        <nav id="sidebar-nav" class="sidebar-nav"></nav>
+
+        <div class="sidebar-footer">
+          <div id="health-indicator" class="health-summary">Checking backend health...</div>
+        </div>
+      </aside>
+
+      <div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
+
+      <div class="workspace-main">
+        <header class="topbar">
+          <div class="topbar-left">
+            <button
+              id="mobile-menu-btn"
+              class="icon-btn mobile-only"
+              type="button"
+              aria-label="Open navigation menu"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/></svg>
+            </button>
+            <nav class="breadcrumbs" aria-label="Breadcrumb">
+              <span class="breadcrumb-root">BioGuard X</span>
+              <span class="breadcrumb-sep" aria-hidden="true">/</span>
+              <span id="breadcrumb-page" class="breadcrumb-current">Overview</span>
+            </nav>
+          </div>
+
+          <div class="topbar-actions">
+            <div id="pwa-install-slot" hidden>
+              <button
+                id="pwa-install-btn"
+                class="btn btn-secondary btn-sm"
+                type="button"
+                aria-label="Install BioGuard X app"
+                title="Install BioGuard X as an app"
+              >
+                Install App
+              </button>
+            </div>
+
+            <button
+              id="theme-toggle-btn"
+              class="icon-btn"
+              type="button"
+              aria-label="Switch theme"
+              title="Switch light or dark theme"
+            ></button>
+
+            <div class="popover-anchor">
+              <button id="notif-toggle-btn" class="btn btn-secondary btn-sm" type="button" aria-label="Notifications">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+                <span class="hide-xs">Alerts</span>
+                <span id="notif-unread-count" class="mono">0</span>
+              </button>
+              <div id="notif-popover" class="popover-panel" hidden></div>
+            </div>
+
+            <div class="popover-anchor">
+              <button id="account-menu-btn" class="account-chip-btn" type="button" aria-label="Account menu">
+                <img id="topbar-avatar" class="avatar-img" alt="" referrerpolicy="no-referrer" hidden />
+                <span id="topbar-avatar-fallback" class="avatar-fallback" aria-hidden="true">OP</span>
+                <span id="topbar-user-name" class="account-name">Operator</span>
+              </button>
+              <div id="account-popover" class="popover-panel" hidden></div>
+            </div>
+          </div>
+        </header>
+
+        <main id="main-content" class="main-content" tabindex="-1"></main>
+      </div>
+
+      <!-- Mobile Bottom Navigation Bar -->
+      <nav id="mobile-bottom-nav" class="mobile-bottom-nav" aria-label="Mobile quick navigation">
+        <button type="button" class="mbn-btn" data-route="overview"><span>Home</span></button>
+        <button type="button" class="mbn-btn" data-route="verification"><span>Verify</span></button>
+        <button type="button" class="mbn-btn" data-route="compare"><span>Compare</span></button>
+        <button type="button" class="mbn-btn" data-route="analytics"><span>Stats</span></button>
+        <button type="button" class="mbn-btn" id="mbn-more-btn"><span>Menu</span></button>
+      </nav>
+    </div>
+
+    <div id="modal-root" class="modal-root" hidden role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-backdrop" id="modal-backdrop"></div>
+      <div class="modal-card">
+        <div class="modal-header">
+          <h2 id="modal-title" class="modal-title">Details</h2>
+          <button id="modal-close-btn" class="icon-btn" type="button" aria-label="Close dialog">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+        <div id="modal-body" class="modal-body"></div>
+        <div id="modal-footer" class="modal-footer"></div>
+      </div>
+    </div>
+
+    <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+  </body>
+</html>

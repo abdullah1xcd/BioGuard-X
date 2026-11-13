@@ -42,18 +42,15 @@ service cloud.firestore {
       );
     }
 
-    function userRole() {
-      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
-        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
-        : 'viewer';
+    function isActiveAccount(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId)) &&
+        get(/databases/$(database)/documents/users/$(userId)).data.status == 'active';
     }
 
-    function isAnalystOrAdmin() {
-      return isAdmin() || (isVerifiedUser() && userRole() in ['super_admin', 'administrator', 'security_analyst']);
-    }
-
-    function isOperatorOrAbove() {
-      return isAdmin() || (isVerifiedUser() && userRole() in ['super_admin', 'administrator', 'security_analyst', 'operator']);
+    function canWriteOwnWorkspace(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId)) &&
+        get(/databases/$(database)/documents/users/$(userId)).data.status == 'active' &&
+        get(/databases/$(database)/documents/users/$(userId)).data.role != 'viewer';
     }
 
     // Entity Validation Blueprints
@@ -96,9 +93,23 @@ service cloud.firestore {
         data.updatedAt is timestamp;
     }
 
+    function isValidVaultEntry(data) {
+      return data.keys().hasAll(['identityRef', 'encryptedPayload', 'updatedAt']) &&
+        data.keys().hasOnly(['identityRef', 'encryptedPayload', 'updatedAt']) &&
+        data.identityRef is string && data.identityRef.size() >= 2 && data.identityRef.size() <= 64 && data.identityRef.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.encryptedPayload is string && data.encryptedPayload.size() >= 1 && data.encryptedPayload.size() <= 900000 &&
+        data.updatedAt is timestamp;
+    }
+
     function isValidVerificationRecord(data) {
       return data.keys().hasAll(['verificationId', 'identityRef', 'modalities', 'outcome', 'policyDecision', 'reasonCode', 'operatorUid', 'createdAt']) &&
-        data.keys().hasOnly(['verificationId', 'identityRef', 'modalities', 'pipeline', 'outcome', 'policyDecision', 'reasonCode', 'score', 'riskScore', 'riskLevel', 'livenessPassed', 'livenessScore', 'adaptiveApplied', 'operatorUid', 'createdAt']) &&
+        data.keys().hasOnly([
+          'verificationId', 'identityRef', 'modalities', 'pipeline', 'outcome', 'policyDecision', 'reasonCode',
+          'score', 'riskScore', 'riskLevel', 'livenessPassed', 'livenessScore', 'adaptiveApplied',
+          'groundTruth', 'isTestProbe', 'processingTimeMs', 'confidence', 'confidenceBand', 'conflictDetected',
+          'featureVersion', 'faceScore', 'voiceScore', 'fingerprintScore', 'faceQuality', 'voiceQuality', 'fingerprintQuality',
+          'operatorUid', 'createdAt'
+        ]) &&
         isValidId(data.verificationId) &&
         data.identityRef is string && data.identityRef.size() >= 2 && data.identityRef.size() <= 64 && data.identityRef.matches('^[a-zA-Z0-9_\\-]+$') &&
         data.modalities is list && data.modalities.size() >= 1 && data.modalities.size() <= 3 &&
@@ -113,6 +124,19 @@ service cloud.firestore {
         (!('livenessPassed' in data) || data.livenessPassed is bool) &&
         (!('livenessScore' in data) || (data.livenessScore is number && data.livenessScore >= 0 && data.livenessScore <= 1)) &&
         (!('adaptiveApplied' in data) || data.adaptiveApplied is bool) &&
+        (!('groundTruth' in data) || data.groundTruth in ['genuine', 'impostor', 'unlabeled']) &&
+        (!('isTestProbe' in data) || data.isTestProbe is bool) &&
+        (!('processingTimeMs' in data) || (data.processingTimeMs is number && data.processingTimeMs >= 0 && data.processingTimeMs <= 120000)) &&
+        (!('confidence' in data) || (data.confidence is number && data.confidence >= 0 && data.confidence <= 1)) &&
+        (!('confidenceBand' in data) || data.confidenceBand in ['high', 'moderate', 'low']) &&
+        (!('conflictDetected' in data) || data.conflictDetected is bool) &&
+        (!('featureVersion' in data) || (data.featureVersion is string && data.featureVersion.size() <= 32)) &&
+        (!('faceScore' in data) || (data.faceScore is number && data.faceScore >= 0 && data.faceScore <= 1)) &&
+        (!('voiceScore' in data) || (data.voiceScore is number && data.voiceScore >= 0 && data.voiceScore <= 1)) &&
+        (!('fingerprintScore' in data) || (data.fingerprintScore is number && data.fingerprintScore >= 0 && data.fingerprintScore <= 1)) &&
+        (!('faceQuality' in data) || (data.faceQuality is number && data.faceQuality >= 0 && data.faceQuality <= 100)) &&
+        (!('voiceQuality' in data) || (data.voiceQuality is number && data.voiceQuality >= 0 && data.voiceQuality <= 100)) &&
+        (!('fingerprintQuality' in data) || (data.fingerprintQuality is number && data.fingerprintQuality >= 0 && data.fingerprintQuality <= 100)) &&
         data.operatorUid == request.auth.uid &&
         data.createdAt == request.time;
     }
@@ -174,7 +198,7 @@ service cloud.firestore {
 
     function isValidSettings(data) {
       return data.keys().hasAll(['settingId', 'organizationName', 'faceThreshold', 'voiceThreshold', 'fingerprintThreshold', 'threeModalThreshold', 'maxHoldHours', 'updatedAt', 'updatedBy']) &&
-        data.keys().hasOnly(['settingId', 'organizationName', 'faceThreshold', 'voiceThreshold', 'fingerprintThreshold', 'threeModalThreshold', 'maxHoldHours', 'updatedAt', 'updatedBy']) &&
+        data.keys().hasOnly(['settingId', 'organizationName', 'faceThreshold', 'voiceThreshold', 'fingerprintThreshold', 'threeModalThreshold', 'maxHoldHours', 'fusionPolicy', 'securityPreset', 'updatedAt', 'updatedBy']) &&
         isValidId(data.settingId) &&
         data.organizationName is string && data.organizationName.size() >= 1 && data.organizationName.size() <= 120 &&
         data.faceThreshold is number && data.faceThreshold >= 0.3 && data.faceThreshold <= 0.98 &&
@@ -182,6 +206,8 @@ service cloud.firestore {
         data.fingerprintThreshold is number && data.fingerprintThreshold >= 0.3 && data.fingerprintThreshold <= 0.98 &&
         data.threeModalThreshold is number && data.threeModalThreshold >= 0.3 && data.threeModalThreshold <= 0.98 &&
         data.maxHoldHours is number && data.maxHoldHours >= 1 && data.maxHoldHours <= 4 &&
+        (!('fusionPolicy' in data) || data.fusionPolicy in ['weighted_score', 'strict_and', 'hierarchical_adaptive']) &&
+        (!('securityPreset' in data) || data.securityPreset in ['balanced', 'strict', 'convenience', 'custom']) &&
         data.updatedAt == request.time &&
         data.updatedBy == request.auth.uid;
     }
@@ -202,7 +228,7 @@ service cloud.firestore {
         data.updatedAt is timestamp;
     }
 
-    // Collection Rules
+    // Platform User Profiles & Admin Registry
     match /users/{userId} {
       allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
       allow list: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
@@ -212,7 +238,7 @@ service cloud.firestore {
         incoming().createdAt == request.time &&
         incoming().lastLoginAt == request.time &&
         incoming().status == 'active' &&
-        (incoming().role == 'viewer' || (isBootstrappedAdmin() && incoming().role == 'super_admin'));
+        (incoming().role == 'operator' || (isBootstrappedAdmin() && incoming().role == 'super_admin'));
       allow update: if isValidId(userId) && isVerifiedUser() && isValidUserProfile(incoming()) &&
         incoming().uid == existing().uid &&
         incoming().createdAt == existing().createdAt &&
@@ -221,6 +247,173 @@ service cloud.firestore {
           (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['role', 'status', 'displayName', 'theme', 'lastLoginAt']))
         );
       allow delete: if false;
+
+      // Per-Google-Account Isolated Data Subcollections
+      match /identities/{identityId} {
+        allow get: if isValidId(userId) && isValidId(identityId) && isVerifiedUser() && isOwner(userId) && isActiveAccount(userId);
+        allow list: if isVerifiedUser() && isOwner(userId);
+        allow create: if isValidId(userId) && isValidId(identityId) && isVerifiedUser() && isOwner(userId) &&
+          isValidBiometricIdentity(incoming()) &&
+          incoming().identityId == identityId &&
+          incoming().createdBy == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          canWriteOwnWorkspace(userId);
+        allow update: if isValidId(userId) && isValidId(identityId) && isVerifiedUser() && isOwner(userId) &&
+          isValidBiometricIdentity(incoming()) &&
+          incoming().identityId == existing().identityId &&
+          incoming().identityRef == existing().identityRef &&
+          incoming().createdBy == existing().createdBy &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'status', 'registeredModalities', 'featureVersion', 'updatedAt']) &&
+          canWriteOwnWorkspace(userId);
+        allow delete: if isValidId(userId) && isValidId(identityId) && isVerifiedUser() && isOwner(userId) && canWriteOwnWorkspace(userId);
+      }
+
+      // Per-account AES-256-GCM encrypted biometric templates
+      match /biometric_vault/{identityRef} {
+        allow get: if isValidId(userId) && isValidId(identityRef) && isVerifiedUser() && isOwner(userId) && isActiveAccount(userId);
+        allow list: if isVerifiedUser() && isOwner(userId);
+        allow create: if isValidId(userId) && isValidId(identityRef) && isVerifiedUser() && isOwner(userId) &&
+          isValidVaultEntry(incoming()) &&
+          incoming().identityRef == identityRef &&
+          canWriteOwnWorkspace(userId);
+        allow update: if isValidId(userId) && isValidId(identityRef) && isVerifiedUser() && isOwner(userId) &&
+          isValidVaultEntry(incoming()) &&
+          incoming().identityRef == existing().identityRef &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['identityRef', 'encryptedPayload', 'updatedAt']) &&
+          canWriteOwnWorkspace(userId);
+        allow delete: if isValidId(userId) && isValidId(identityRef) && isVerifiedUser() && isOwner(userId) && canWriteOwnWorkspace(userId);
+      }
+
+      match /verification_records/{verificationId} {
+        allow get: if isValidId(userId) && isValidId(verificationId) && isVerifiedUser() && isOwner(userId) && isActiveAccount(userId);
+        allow list: if isVerifiedUser() && isOwner(userId);
+        allow create: if isValidId(userId) && isValidId(verificationId) && isVerifiedUser() && isOwner(userId) &&
+          isValidVerificationRecord(incoming()) &&
+          incoming().verificationId == verificationId &&
+          canWriteOwnWorkspace(userId) &&
+          exists(/databases/$(database)/documents/users/$(userId)/identities/$(incoming().identityRef));
+        allow update, delete: if false;
+      }
+
+      match /audit_logs/{eventId} {
+        allow get: if isValidId(userId) && isValidId(eventId) && isVerifiedUser() && isOwner(userId) && isActiveAccount(userId);
+        allow list: if isVerifiedUser() && isOwner(userId);
+        allow create: if isValidId(userId) && isValidId(eventId) && isVerifiedUser() && isOwner(userId) &&
+          isValidAuditLog(incoming()) &&
+          incoming().eventId == eventId &&
+          isActiveAccount(userId);
+        allow update, delete: if false;
+      }
+
+      match /notifications/{notificationId} {
+        allow get: if isValidId(userId) && isValidId(notificationId) && isVerifiedUser() && isOwner(userId) && isActiveAccount(userId);
+        allow list: if isVerifiedUser() && isOwner(userId);
+        allow create: if isValidId(userId) && isValidId(notificationId) && isVerifiedUser() && isOwner(userId) &&
+          isValidNotification(incoming()) &&
+          incoming().notificationId == notificationId &&
+          incoming().userUid == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          isActiveAccount(userId);
+        allow update: if isValidId(userId) && isValidId(notificationId) && isVerifiedUser() && isOwner(userId) &&
+          isValidNotification(incoming()) &&
+          incoming().notificationId == existing().notificationId &&
+          incoming().userUid == existing().userUid &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['read']) &&
+          isActiveAccount(userId);
+        allow delete: if isValidId(userId) && isValidId(notificationId) && isVerifiedUser() && isOwner(userId) && isActiveAccount(userId);
+      }
+
+      match /security_alerts/{alertId} {
+        allow get: if isValidId(userId) && isValidId(alertId) && isVerifiedUser() && isOwner(userId) && isActiveAccount(userId);
+        allow list: if isVerifiedUser() && isOwner(userId);
+        allow create: if isValidId(userId) && isValidId(alertId) && isVerifiedUser() && isOwner(userId) &&
+          isValidSecurityAlert(incoming()) &&
+          incoming().alertId == alertId &&
+          incoming().createdBy == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          canWriteOwnWorkspace(userId);
+        allow update: if isValidId(userId) && isValidId(alertId) && isVerifiedUser() && isOwner(userId) &&
+          isValidSecurityAlert(incoming()) &&
+          incoming().alertId == existing().alertId &&
+          incoming().createdBy == existing().createdBy &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          existing().status != 'resolved' &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'assignedTo', 'notes', 'updatedAt']) &&
+          canWriteOwnWorkspace(userId);
+        allow delete: if isValidId(userId) && isValidId(alertId) && isVerifiedUser() && isOwner(userId) && canWriteOwnWorkspace(userId);
+      }
+
+      match /automation_workflows/{workflowId} {
+        allow get: if isValidId(userId) && isValidId(workflowId) && isVerifiedUser() && isOwner(userId) && isActiveAccount(userId);
+        allow list: if isVerifiedUser() && isOwner(userId);
+        allow create: if isValidId(userId) && isValidId(workflowId) && isVerifiedUser() && isOwner(userId) &&
+          isValidWorkflow(incoming()) &&
+          incoming().workflowId == workflowId &&
+          incoming().createdBy == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          canWriteOwnWorkspace(userId);
+        allow update: if isValidId(userId) && isValidId(workflowId) && isVerifiedUser() && isOwner(userId) &&
+          isValidWorkflow(incoming()) &&
+          incoming().workflowId == existing().workflowId &&
+          incoming().createdBy == existing().createdBy &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'enabled', 'trigger', 'actions', 'updatedAt']) &&
+          canWriteOwnWorkspace(userId);
+        allow delete: if isValidId(userId) && isValidId(workflowId) && isVerifiedUser() && isOwner(userId) && canWriteOwnWorkspace(userId);
+      }
+
+      match /system_settings/{settingId} {
+        allow get: if isValidId(userId) && isValidId(settingId) && isVerifiedUser() && isOwner(userId) && isActiveAccount(userId);
+        allow list: if isVerifiedUser() && isOwner(userId);
+        allow create: if isValidId(userId) && isValidId(settingId) && isVerifiedUser() && isOwner(userId) &&
+          isValidSettings(incoming()) &&
+          incoming().settingId == settingId &&
+          canWriteOwnWorkspace(userId);
+        allow update: if isValidId(userId) && isValidId(settingId) && isVerifiedUser() && isOwner(userId) &&
+          isValidSettings(incoming()) &&
+          incoming().settingId == existing().settingId &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['organizationName', 'faceThreshold', 'voiceThreshold', 'fingerprintThreshold', 'threeModalThreshold', 'maxHoldHours', 'fusionPolicy', 'securityPreset', 'updatedAt', 'updatedBy']) &&
+          canWriteOwnWorkspace(userId);
+        allow delete: if false;
+      }
+
+      match /approval_requests/{requestId} {
+        allow get: if isValidId(userId) && isValidId(requestId) && isVerifiedUser() && isOwner(userId) && isActiveAccount(userId);
+        allow list: if isVerifiedUser() && isOwner(userId);
+        allow create: if isValidId(userId) && isValidId(requestId) && isVerifiedUser() && isOwner(userId) &&
+          isValidApprovalRequest(incoming()) &&
+          incoming().requestId == requestId &&
+          incoming().requestedBy == request.auth.uid &&
+          incoming().status == 'pending' &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          !('reviewedBy' in incoming()) &&
+          canWriteOwnWorkspace(userId) &&
+          exists(/databases/$(database)/documents/users/$(userId)/identities/$(incoming().targetIdentityRef));
+        allow update: if isValidId(userId) && isValidId(requestId) && isVerifiedUser() && isOwner(userId) &&
+          isValidApprovalRequest(incoming()) &&
+          existing().status == 'pending' &&
+          incoming().status in ['approved', 'rejected'] &&
+          incoming().requestId == existing().requestId &&
+          incoming().requestType == existing().requestType &&
+          incoming().targetIdentityRef == existing().targetIdentityRef &&
+          incoming().requestedBy == existing().requestedBy &&
+          incoming().requestedByEmail == existing().requestedByEmail &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().reviewedBy == request.auth.uid &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'reviewedBy', 'reviewNotes', 'updatedAt']) &&
+          canWriteOwnWorkspace(userId);
+        allow delete: if false;
+      }
     }
 
     match /admins/{userId} {
@@ -228,140 +421,6 @@ service cloud.firestore {
       allow list: if isAdmin();
       allow create: if isValidId(userId) && isValidAdminGrant(incoming()) && (isAdmin() || (isBootstrappedAdmin() && isOwner(userId)));
       allow update, delete: if isValidId(userId) && isAdmin() && userId != request.auth.uid;
-    }
-
-    match /identities/{identityId} {
-      allow get: if isValidId(identityId) && (isOperatorOrAbove() || (isVerifiedUser() && resource.data.createdBy == request.auth.uid));
-      allow list: if isOperatorOrAbove() || (isVerifiedUser() && resource.data.createdBy == request.auth.uid);
-      allow create: if isValidId(identityId) && isOperatorOrAbove() && isValidBiometricIdentity(incoming()) &&
-        incoming().identityId == identityId &&
-        incoming().createdBy == request.auth.uid &&
-        incoming().createdAt == request.time &&
-        incoming().updatedAt == request.time;
-      allow update: if isValidId(identityId) && isOperatorOrAbove() && isValidBiometricIdentity(incoming()) &&
-        incoming().identityId == existing().identityId &&
-        incoming().identityRef == existing().identityRef &&
-        incoming().createdBy == existing().createdBy &&
-        incoming().createdAt == existing().createdAt &&
-        incoming().updatedAt == request.time &&
-        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'status', 'registeredModalities', 'featureVersion', 'updatedAt']);
-      allow delete: if isValidId(identityId) && isAdmin();
-    }
-
-    // Encrypted biometric templates. Plain biometric vectors are never written to Firestore.
-    match /biometric_vault/{identityRef} {
-      allow get: if isValidId(identityRef) && isOperatorOrAbove();
-      allow list: if isOperatorOrAbove();
-      allow create, update: if isValidId(identityRef) && isOperatorOrAbove() &&
-        request.resource.data.keys().hasAll(['identityRef', 'encryptedPayload', 'updatedAt']) &&
-        request.resource.data.keys().hasOnly(['identityRef', 'encryptedPayload', 'updatedAt']) &&
-        request.resource.data.identityRef == identityRef &&
-        request.resource.data.encryptedPayload is string &&
-        request.resource.data.encryptedPayload.size() <= 900000 &&
-        request.resource.data.updatedAt is timestamp;
-      allow delete: if isValidId(identityRef) && isAdmin();
-    }
-
-    match /verification_records/{verificationId} {
-      allow get: if isValidId(verificationId) && (isAnalystOrAdmin() || (isVerifiedUser() && resource.data.operatorUid == request.auth.uid));
-      allow list: if isAnalystOrAdmin() || (isVerifiedUser() && resource.data.operatorUid == request.auth.uid);
-      allow create: if isValidId(verificationId) && isOperatorOrAbove() && isValidVerificationRecord(incoming()) &&
-        incoming().verificationId == verificationId &&
-        exists(/databases/$(database)/documents/identities/$(incoming().identityRef));
-      allow update, delete: if false;
-    }
-
-    match /audit_logs/{eventId} {
-      allow get: if isValidId(eventId) && (isAnalystOrAdmin() || (isVerifiedUser() && resource.data.actorUid == request.auth.uid));
-      allow list: if isAnalystOrAdmin() || (isVerifiedUser() && resource.data.actorUid == request.auth.uid);
-      allow create: if isValidId(eventId) && isVerifiedUser() && isValidAuditLog(incoming()) &&
-        incoming().eventId == eventId;
-      allow update, delete: if false;
-    }
-
-    match /notifications/{notificationId} {
-      allow get: if isValidId(notificationId) && (isAdmin() || (isVerifiedUser() && resource.data.userUid == request.auth.uid));
-      allow list: if isAdmin() || (isVerifiedUser() && resource.data.userUid == request.auth.uid);
-      allow create: if isValidId(notificationId) && isVerifiedUser() && isValidNotification(incoming()) &&
-        incoming().notificationId == notificationId &&
-        incoming().createdAt == request.time &&
-        (incoming().userUid == request.auth.uid || isAdmin());
-      allow update: if isValidId(notificationId) && isVerifiedUser() && isValidNotification(incoming()) &&
-        (existing().userUid == request.auth.uid || isAdmin()) &&
-        incoming().diff(existing()).affectedKeys().hasOnly(['read']) &&
-        incoming().createdAt == existing().createdAt;
-      allow delete: if isValidId(notificationId) && (isAdmin() || (isVerifiedUser() && resource.data.userUid == request.auth.uid));
-    }
-
-    match /security_alerts/{alertId} {
-      allow get: if isValidId(alertId) && isAnalystOrAdmin();
-      allow list: if isAnalystOrAdmin();
-      allow create: if isValidId(alertId) && isAnalystOrAdmin() && isValidSecurityAlert(incoming()) &&
-        incoming().alertId == alertId &&
-        incoming().createdBy == request.auth.uid &&
-        incoming().createdAt == request.time &&
-        incoming().updatedAt == request.time;
-      allow update: if isValidId(alertId) && isAnalystOrAdmin() && isValidSecurityAlert(incoming()) &&
-        incoming().alertId == existing().alertId &&
-        incoming().createdBy == existing().createdBy &&
-        incoming().createdAt == existing().createdAt &&
-        incoming().updatedAt == request.time &&
-        (
-          isAdmin() ||
-          (existing().status != 'resolved' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'assignedTo', 'notes', 'updatedAt']))
-        );
-      allow delete: if isValidId(alertId) && isAdmin();
-    }
-
-    match /automation_workflows/{workflowId} {
-      allow get: if isValidId(workflowId) && isAnalystOrAdmin();
-      allow list: if isAnalystOrAdmin();
-      allow create: if isValidId(workflowId) && isAdmin() && isValidWorkflow(incoming()) &&
-        incoming().workflowId == workflowId &&
-        incoming().createdBy == request.auth.uid &&
-        incoming().createdAt == request.time &&
-        incoming().updatedAt == request.time;
-      allow update: if isValidId(workflowId) && isAdmin() && isValidWorkflow(incoming()) &&
-        incoming().workflowId == existing().workflowId &&
-        incoming().createdBy == existing().createdBy &&
-        incoming().createdAt == existing().createdAt &&
-        incoming().updatedAt == request.time &&
-        incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'enabled', 'trigger', 'actions', 'updatedAt']);
-      allow delete: if isValidId(workflowId) && isAdmin();
-    }
-
-    match /system_settings/{settingId} {
-      allow get: if isValidId(settingId) && isVerifiedUser();
-      allow list: if isAdmin();
-      allow create, update: if isValidId(settingId) && isAdmin() && isValidSettings(incoming()) &&
-        incoming().settingId == settingId;
-      allow delete: if false;
-    }
-
-    match /approval_requests/{requestId} {
-      allow get: if isValidId(requestId) && (isAdmin() || (isVerifiedUser() && resource.data.requestedBy == request.auth.uid));
-      allow list: if isAdmin() || (isVerifiedUser() && resource.data.requestedBy == request.auth.uid);
-      allow create: if isValidId(requestId) && isVerifiedUser() && isValidApprovalRequest(incoming()) &&
-        incoming().requestId == requestId &&
-        incoming().requestedBy == request.auth.uid &&
-        incoming().status == 'pending' &&
-        incoming().createdAt == request.time &&
-        incoming().updatedAt == request.time &&
-        !('reviewedBy' in incoming()) &&
-        exists(/databases/$(database)/documents/identities/$(incoming().targetIdentityRef));
-      allow update: if isValidId(requestId) && isAdmin() && isValidApprovalRequest(incoming()) &&
-        existing().status == 'pending' &&
-        incoming().status in ['approved', 'rejected'] &&
-        incoming().requestId == existing().requestId &&
-        incoming().requestType == existing().requestType &&
-        incoming().targetIdentityRef == existing().targetIdentityRef &&
-        incoming().requestedBy == existing().requestedBy &&
-        incoming().requestedByEmail == existing().requestedByEmail &&
-        incoming().createdAt == existing().createdAt &&
-        incoming().updatedAt == request.time &&
-        incoming().reviewedBy == request.auth.uid &&
-        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'reviewedBy', 'reviewNotes', 'updatedAt']);
-      allow delete: if false;
     }
   }
 }

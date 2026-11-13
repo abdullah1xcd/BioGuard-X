@@ -41,14 +41,62 @@ export function enrollBiometricIdentity({ identityRef, consentRecorded, samples,
 export function verifyMultimodalBiometrics({
   identityRef,
   pipeline,
+  fusionPolicy = 'hierarchical_adaptive',
   thresholds,
   samples,
   quality,
   adaptiveEnabled = true,
+  groundTruth = 'unlabeled',
+  isTestProbe = false,
 }) {
   return apiFetch('/api/v1/verification/multimodal', {
     method: 'POST',
-    body: JSON.stringify({ identityRef, pipeline, thresholds, samples, quality, adaptiveEnabled }),
+    body: JSON.stringify({
+      identityRef,
+      pipeline,
+      fusionPolicy,
+      thresholds,
+      samples,
+      quality,
+      adaptiveEnabled,
+      groundTruth,
+      isTestProbe,
+    }),
+  });
+}
+
+export function compareIdentities({
+  identityRefA,
+  identityRefB,
+  thresholds,
+  fusionPolicy = 'hierarchical_adaptive',
+}) {
+  return apiFetch('/api/v1/identities/compare', {
+    method: 'POST',
+    body: JSON.stringify({ identityRefA, identityRefB, thresholds, fusionPolicy }),
+  });
+}
+
+export function identifyBiometricProbe({
+  sourceIdentityRef,
+  excludeSelf = true,
+  samples,
+  quality,
+  thresholds,
+  fusionPolicy = 'hierarchical_adaptive',
+  topK = 5,
+}) {
+  return apiFetch('/api/v1/identities/identify', {
+    method: 'POST',
+    body: JSON.stringify({
+      sourceIdentityRef,
+      excludeSelf,
+      samples,
+      quality,
+      thresholds,
+      fusionPolicy,
+      topK,
+    }),
   });
 }
 

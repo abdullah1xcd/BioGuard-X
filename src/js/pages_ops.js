@@ -8,10 +8,16 @@ import {
   deleteIdentityMetadata,
   appendAuditLog,
   pushNotification,
+  getFirestoreTelemetry,
 } from './firebase.js';
 import { deleteIdentityFromVault } from './api.js';
-import { computeBiometricMetrics } from './biometrics.js';
-import { drawRocChart, drawFarFrrChart } from './charts.js';
+import { buildBiometricAnalyticsReport } from './biometrics.js';
+import {
+  drawRocChart,
+  drawFarFrrChart,
+  drawVerificationTrendChart,
+  drawModalityComparisonChart,
+} from './charts.js';
 import { escapeHtml, fmtPct, showToast, openModal, downloadFile } from './ui.js';
 
 function fmtFsTime(ts) {
@@ -35,172 +41,250 @@ function getRecommendedAction(alert) {
 // 5. ANALYTICS & SECURITY REPORTS
 export function renderAnalytics(container, { appState }) {
   let daysFilter = 'all';
+  let scopeFilter = 'all'; // 'all' | 'labeled' | 'operational'
+  let customStart = '';
+  let customEnd = '';
 
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <h1 class="page-title">Analytics &amp; Security Reports</h1>
-        <p class="page-subtitle">Operational telemetry, ROC/FAR-FRR curves, and exportable reports computed strictly from persisted Firestore records.</p>
+        <h1 class="page-title">Analytics &amp; Validated Accuracy Reports</h1>
+        <p class="page-subtitle">Distinguishes operational match rate, model similarity, and verification confidence from ground-truth classification accuracy computed strictly from persisted Firestore records.</p>
       </div>
       <div class="page-actions">
-        <div class="segmented" id="an-days">
-          <button type="button" class="segmented-btn active" data-days="all">All Time</button>
-          <button type="button" class="segmented-btn" data-days="7">Last 7d</button>
-          <button type="button" class="segmented-btn" data-days="1">Last 24h</button>
-        </div>
         <button type="button" class="btn btn-secondary" id="an-export-csv">Export CSV</button>
         <button type="button" class="btn btn-secondary" id="an-export-json">Export Security Report (JSON)</button>
       </div>
     </div>
 
+    <section class="panel stack-sm">
+      <div class="row-between">
+        <div class="segmented" id="an-days">
+          <button type="button" class="segmented-btn active" data-days="all">All Time</button>
+          <button type="button" class="segmented-btn" data-days="90">90d</button>
+          <button type="button" class="segmented-btn" data-days="30">30d</button>
+          <button type="button" class="segmented-btn" data-days="7">7d</button>
+          <button type="button" class="segmented-btn" data-days="1">Today</button>
+          <button type="button" class="segmented-btn" data-days="custom">Custom</button>
+        </div>
+        <div class="segmented" id="an-scope">
+          <button type="button" class="segmented-btn active" data-scope="all">All Records</button>
+          <button type="button" class="segmented-btn" data-scope="labeled">Labeled Trials Only</button>
+          <button type="button" class="segmented-btn" data-scope="operational">Operational Only</button>
+        </div>
+      </div>
+      <div id="an-custom-dates" class="row-wrap" hidden style="padding-top:6px;">
+        <label class="meta-line">From <input type="date" class="input" id="an-start" style="width:auto;min-height:34px;" /></label>
+        <label class="meta-line">To <input type="date" class="input" id="an-end" style="width:auto;min-height:34px;" /></label>
+        <button type="button" class="btn btn-secondary btn-sm" id="an-apply-custom">Apply Range</button>
+      </div>
+    </section>
+
+    <div class="notice-strip">
+      <div>
+        <strong>Statistical Integrity Definitions</strong>
+        <div style="font-size:12.5px;color:var(--text-secondary);">
+          <strong>1) Model Similarity</strong> measures normalized feature closeness (not probability).
+          <strong>2) Verification Confidence</strong> reflects decision margin + quality + liveness + modality agreement.
+          <strong>3) Classification Accuracy (TAR/FAR/FRR/EER/F1)</strong> is computed exclusively from <em>ground-truth labeled trials</em> (genuine vs impostor), never inferred from predicted matches.
+          <strong>4) Operational Success Rate</strong> tracks real match fraction on operational traffic.
+        </div>
+      </div>
+    </div>
+
     <div class="kpi-strip" id="an-kpis"></div>
 
+    <section class="panel stack-md" id="an-classification-panel"></section>
+
     <div class="grid-2">
-      <section class="panel stack-md" id="an-modalities"></section>
-      <section class="panel stack-md" id="an-outcomes"></section>
+      <section class="panel stack-md" id="an-trends-panel"></section>
+      <section class="panel stack-md" id="an-modcomp-panel"></section>
     </div>
 
     <section class="panel stack-md" id="an-roc-panel"></section>
+
+    <div class="grid-2">
+      <section class="panel stack-md" id="an-modalities"></section>
+      <section class="panel stack-md" id="an-latency-panel"></section>
+    </div>
   `;
 
   const getFilteredVerifications = () => {
     const now = Date.now();
-    const cutoff = daysFilter === 'all' ? 0 : now - Number(daysFilter) * 86400_000;
     return appState.verifications.filter((v) => {
-      if (!cutoff) return true;
       const ms = typeof v.createdAt?.toMillis === 'function' ? v.createdAt.toMillis() : 0;
-      return ms >= cutoff;
+      if (daysFilter === 'custom') {
+        const sMs = customStart ? Date.parse(`${customStart}T00:00:00`) : 0;
+        const eMs = customEnd ? Date.parse(`${customEnd}T23:59:59`) : Number.MAX_SAFE_INTEGER;
+        if (sMs && ms < sMs) return false;
+        if (eMs && ms > eMs) return false;
+      } else if (daysFilter !== 'all') {
+        const cutoff = now - Number(daysFilter) * 86400_000;
+        if (ms < cutoff) return false;
+      }
+      if (scopeFilter === 'labeled') {
+        return v.groundTruth === 'genuine' || v.groundTruth === 'impostor';
+      }
+      if (scopeFilter === 'operational') {
+        return !v.isTestProbe;
+      }
+      return true;
     });
   };
 
+  let latestReport = null;
+
   const renderStats = () => {
     const verifications = getFilteredVerifications();
-    const matches = verifications.filter((v) => v.outcome === 'match').length;
-    const noMatches = verifications.filter((v) => v.outcome === 'no_match').length;
+    const s = appState.settings || {};
+    const activeCount = appState.identities.filter((i) => i.status === 'active').length;
+    const report = buildBiometricAnalyticsReport(verifications, appState.identities.length, activeCount, {
+      face: s.faceThreshold ?? 0.72,
+      voice: s.voiceThreshold ?? 0.70,
+      fingerprint: s.fingerprintThreshold ?? 0.72,
+      threeModal: s.threeModalThreshold ?? 0.74,
+    });
+    latestReport = report;
 
-    const livenessKnown = verifications.filter((v) => typeof v.livenessPassed === 'boolean');
-    const livenessPassed = livenessKnown.filter((v) => v.livenessPassed).length;
-    const livenessPct = livenessKnown.length ? `${((livenessPassed / livenessKnown.length) * 100).toFixed(1)}%` : '—';
-
-    const riskKnown = verifications.filter((v) => typeof v.riskScore === 'number');
-    const avgRisk = riskKnown.length
-      ? (riskKnown.reduce((s, v) => s + v.riskScore, 0) / riskKnown.length).toFixed(1)
-      : '—';
+    const livenessPct = report.livenessKnownCount ? fmtPct(report.livenessSuccessRate) : '—';
+    const opPct = report.totalAttempts > 0 ? fmtPct(report.operationalVerificationSuccessRate) : '—';
 
     container.querySelector('#an-kpis').innerHTML = `
       <div class="kpi-cell">
-        <span class="kpi-label">Total Identities</span>
-        <span class="kpi-value">${appState.identities.length}</span>
-        <span class="kpi-meta">${appState.identities.filter((i) => i.status === 'active').length} active enrolled</span>
+        <span class="kpi-label">Registered Identities</span>
+        <span class="kpi-value">${report.totalIdentities}</span>
+        <span class="kpi-meta">${report.activeIdentities} active · ${report.totalAttempts} verification(s) in range</span>
       </div>
       <div class="kpi-cell">
-        <span class="kpi-label">Verification Requests</span>
-        <span class="kpi-value">${verifications.length}</span>
-        <span class="kpi-meta">${matches} match · ${noMatches} no-match</span>
+        <span class="kpi-label">Verification Outcomes</span>
+        <span class="kpi-value">${report.successfulVerifications} / ${report.rejectedVerifications}</span>
+        <span class="kpi-meta">Match / Rejected (${report.notEvaluatedVerifications} not evaluated)</span>
+      </div>
+      <div class="kpi-cell">
+        <span class="kpi-label">Operational Success Rate</span>
+        <span class="kpi-value">${opPct}</span>
+        <span class="kpi-meta">${report.operationalAttempts} operational · ${report.testProbeAttempts} QA probe(s)</span>
       </div>
       <div class="kpi-cell">
         <span class="kpi-label">Liveness Pass Rate</span>
         <span class="kpi-value">${livenessPct}</span>
-        <span class="kpi-meta">${livenessKnown.length} check(s) with liveness data</span>
-      </div>
-      <div class="kpi-cell">
-        <span class="kpi-label">Average Risk Score</span>
-        <span class="kpi-value">${avgRisk === '—' ? '—' : `${avgRisk} / 100`}</span>
-        <span class="kpi-meta">${riskKnown.length} scored evaluation(s)</span>
+        <span class="kpi-meta">${report.livenessKnownCount} check(s) · ${report.conflictCount} conflict block(s)</span>
       </div>
     `;
 
-    const modCounts = { face: 0, voice: 0, fingerprint: 0 };
-    for (const v of verifications) {
-      for (const m of v.modalities || []) {
-        if (m in modCounts) modCounts[m]++;
-      }
-    }
-    const maxMod = Math.max(1, ...Object.values(modCounts));
+    const c = report.classification;
+    const drStart = report.dateRange.startMs ? new Date(report.dateRange.startMs).toLocaleDateString() : '—';
+    const drEnd = report.dateRange.endMs ? new Date(report.dateRange.endMs).toLocaleDateString() : '—';
+    const ciText = (ci) => (c.sampleCount > 0 ? `CI [${(ci.low * 100).toFixed(1)}%–${(ci.high * 100).toFixed(1)}%]` : '—');
 
-    container.querySelector('#an-modalities').innerHTML = `
+    container.querySelector('#an-classification-panel').innerHTML = `
       <div class="panel-header">
-        <div><h2 class="panel-title">Modality Usage</h2><p class="panel-subtitle">Modalities evaluated across persisted requests</p></div>
+        <div>
+          <h2 class="panel-title">Measured Classification Accuracy (Ground-Truth Labeled Trials)</h2>
+          <p class="panel-subtitle">Sample size: ${c.sampleCount} labeled (${c.genuineCount} genuine, ${c.impostorCount} impostor) · ${report.unlabeledAttempts} unlabeled excluded · Range: ${escapeHtml(drStart)} → ${escapeHtml(drEnd)}</p>
+        </div>
+        <span class="state-text ${c.insufficientData ? 'state-warning' : 'state-success'}">${c.insufficientData ? 'Insufficient Ground-Truth Data' : 'Statistically Grounded'}</span>
       </div>
+
       ${
-        verifications.length === 0
-          ? `<div class="empty-state"><div class="empty-title">Insufficient verification data</div><div class="empty-desc">Run biometric verification requests to populate real modality distribution metrics.</div></div>`
-          : `<div class="stack-md">
-              ${Object.entries(modCounts)
-                .map(
-                  ([mod, cnt]) => `
-                <div class="stack-sm" style="gap:6px;">
-                  <div class="row-between" style="font-size:13.5px;">
-                    <strong style="text-transform:capitalize;">${mod}</strong>
-                    <span class="mono">${cnt} evaluation(s)</span>
-                  </div>
-                  <div class="progress-track"><div class="progress-fill" style="width:${Math.round((cnt / maxMod) * 100)}%"></div></div>
-                </div>`
-                )
-                .join('')}
-            </div>`
+        c.insufficientData
+          ? `<div class="notice-strip warning"><div><strong>Insufficient Test Data for Reliable Classification Bounds</strong><div>${escapeHtml(c.insufficientReason)} Run labeled Genuine and Impostor trials in Verification Center (or load QA Match/Impostor probes) to establish genuine vs impostor separation.</div></div></div>`
+          : ''
+      }
+
+      ${
+        c.sampleCount > 0
+          ? `
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Metric</th>
+                <th class="num-col">Value</th>
+                <th>95% Wilson CI</th>
+                <th>Formula / Meaning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Overall Accuracy</strong></td>
+                <td class="num-col">${fmtPct(c.accuracy)}</td>
+                <td class="mono" style="font-size:12px;">${ciText(c.ci95.accuracy)}</td>
+                <td class="meta-line">(TP + TN) / Total (${c.tp} TP, ${c.tn} TN, ${c.fp} FP, ${c.fn} FN)</td>
+              </tr>
+              <tr>
+                <td><strong>TAR / GAR / Recall</strong></td>
+                <td class="num-col">${fmtPct(c.tar)}</td>
+                <td class="mono" style="font-size:12px;">${ciText(c.ci95.tar)}</td>
+                <td class="meta-line">TP / (TP + FN) — Genuine Acceptance Rate (1 − FRR)</td>
+              </tr>
+              <tr>
+                <td><strong>FAR / IAR</strong></td>
+                <td class="num-col">${fmtPct(c.far)}</td>
+                <td class="mono" style="font-size:12px;">${ciText(c.ci95.far)}</td>
+                <td class="meta-line">FP / (FP + TN) — Impostor Acceptance Rate</td>
+              </tr>
+              <tr>
+                <td><strong>FRR</strong></td>
+                <td class="num-col">${fmtPct(c.frr)}</td>
+                <td class="mono" style="font-size:12px;">${ciText(c.ci95.frr)}</td>
+                <td class="meta-line">FN / (TP + FN) — False Rejection Rate</td>
+              </tr>
+              <tr>
+                <td><strong>Precision &amp; F1 Score</strong></td>
+                <td class="num-col">${fmtPct(c.precision)} / ${fmtPct(c.f1)}</td>
+                <td class="mono" style="font-size:12px;">—</td>
+                <td class="meta-line">Precision = TP/(TP+FP) · F1 = harmonic mean(P, R)</td>
+              </tr>
+              <tr>
+                <td><strong>EER &amp; ROC AUC</strong></td>
+                <td class="num-col">${c.roc.length ? `${fmtPct(c.eer)} @ ${c.eerThreshold.toFixed(2)}` : '—'} · AUC ${c.roc.length ? c.auc.toFixed(3) : '—'}</td>
+                <td class="mono" style="font-size:12px;">Threshold sweep</td>
+                <td class="meta-line">Equal Error Rate where FAR ≈ FRR; requires both genuine &amp; impostor labels</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>`
+          : `<div class="empty-state"><div class="empty-title">No labeled genuine/impostor trials in selected window</div><div class="empty-desc">Operational traffic remains excluded from accuracy claims unless explicitly labeled as genuine or impostor.</div></div>`
       }
     `;
 
-    container.querySelector('#an-outcomes').innerHTML = `
+    container.querySelector('#an-trends-panel').innerHTML = `
       <div class="panel-header">
-        <div><h2 class="panel-title">Outcome &amp; Pipeline Breakdown</h2><p class="panel-subtitle">Actual Firestore verification_records summary</p></div>
+        <div><h2 class="panel-title">Daily Verification Activity Trend</h2><p class="panel-subtitle">Matches vs rejections across recent dates</p></div>
       </div>
-      ${
-        verifications.length === 0
-          ? `<div class="empty-state"><div class="empty-title">No records in selected window</div><div class="empty-desc">Adjust the time range filter or submit a verification request.</div></div>`
-          : `<div class="table-wrap">
-              <table class="data-table">
-                <thead><tr><th>Identity</th><th>Pipeline</th><th>Outcome</th><th>Risk</th><th class="num-col">Score</th></tr></thead>
-                <tbody>
-                  ${verifications
-                    .slice(0, 10)
-                    .map(
-                      (v) => `
-                    <tr>
-                      <td class="mono">${escapeHtml(v.identityRef)}</td>
-                      <td class="mono">${escapeHtml(v.pipeline)}</td>
-                      <td><span class="state-text ${v.outcome === 'match' ? 'state-success' : v.outcome === 'no_match' ? 'state-danger' : 'state-warning'}">${escapeHtml(v.outcome)}</span></td>
-                      <td class="mono">${typeof v.riskScore === 'number' ? `${v.riskScore} (${escapeHtml(v.riskLevel || 'low')})` : '—'}</td>
-                      <td class="num-col">${fmtPct(v.score || 0)}</td>
-                    </tr>`
-                    )
-                    .join('')}
-                </tbody>
-              </table>
-            </div>`
-      }
+      <canvas class="chart-canvas" id="an-trend-canvas" width="520" height="220"></canvas>
     `;
+    drawVerificationTrendChart(container.querySelector('#an-trend-canvas'), verifications);
+
+    container.querySelector('#an-modcomp-panel').innerHTML = `
+      <div class="panel-header">
+        <div><h2 class="panel-title">Modality Similarity vs Labeled Accuracy</h2><p class="panel-subtitle">Mean similarity compared against ground-truth accuracy per modality</p></div>
+      </div>
+      <canvas class="chart-canvas" id="an-modcomp-canvas" width="520" height="220"></canvas>
+    `;
+    drawModalityComparisonChart(container.querySelector('#an-modcomp-canvas'), report.perModality);
 
     const rocPanel = container.querySelector('#an-roc-panel');
-    const evaluated = verifications.filter((v) => v.outcome === 'match' || v.outcome === 'no_match');
-    const hasMatch = evaluated.some((v) => v.outcome === 'match');
-    const hasNoMatch = evaluated.some((v) => v.outcome === 'no_match');
-
-    if (!hasMatch || !hasNoMatch) {
+    const currentThr = Number(s.faceThreshold ?? 0.72);
+    if (c.roc.length === 0) {
       rocPanel.innerHTML = `
         <div class="panel-header">
-          <div><h2 class="panel-title">ROC &amp; FAR / FRR Operating Curves</h2><p class="panel-subtitle">Computed exclusively from persisted match and impostor/no-match records</p></div>
+          <div><h2 class="panel-title">ROC &amp; FAR / FRR Operating Curves</h2><p class="panel-subtitle">Computed exclusively from ground-truth labeled genuine and impostor trials</p></div>
         </div>
         <div class="empty-state">
-          <div class="empty-title">Need both match and no-match outcomes for ROC analysis</div>
-          <div class="empty-desc">Run at least one matching verification and one impostor verification in Verification Center to plot real FAR, FRR, EER, and AUC curves.</div>
+          <div class="empty-title">Need both Genuine and Impostor labeled trials for ROC &amp; EER curves</div>
+          <div class="empty-desc">Run at least one Genuine-labeled trial and one Impostor-labeled trial in Verification Center to plot true FAR, FRR, EER, and AUC curves.</div>
         </div>
       `;
     } else {
-      const trials = evaluated.map((v) => ({
-        score: Number(v.score || 0),
-        genuine: v.outcome === 'match',
-      }));
-      const currentThr = Number(appState.settings?.faceThreshold ?? 0.72);
-      const metrics = computeBiometricMetrics(trials, currentThr);
       rocPanel.innerHTML = `
         <div class="panel-header">
           <div>
             <h2 class="panel-title">ROC &amp; FAR / FRR Operating Curves</h2>
-            <p class="panel-subtitle">Observed AUC ${(metrics.auc * 100).toFixed(1)}% · EER ${(metrics.eer * 100).toFixed(1)}% @ ${metrics.eerThreshold.toFixed(2)} across ${evaluated.length} persisted trial(s)</p>
+            <p class="panel-subtitle">Observed AUC ${c.auc.toFixed(3)} · EER ${fmtPct(c.eer)} @ ${c.eerThreshold.toFixed(2)} across ${c.sampleCount} labeled trial(s)</p>
           </div>
-          <span class="meta-line">Current operating threshold: <strong class="mono">${currentThr.toFixed(2)}</strong></span>
+          <span class="meta-line">Current face threshold: <strong class="mono">${currentThr.toFixed(2)}</strong></span>
         </div>
         <div class="grid-2">
           <div class="stack-sm">
@@ -213,25 +297,103 @@ export function renderAnalytics(container, { appState }) {
           </div>
         </div>
       `;
-      drawRocChart(rocPanel.querySelector('#an-roc-canvas'), metrics.roc, currentThr, metrics.auc);
-      drawFarFrrChart(rocPanel.querySelector('#an-far-canvas'), metrics.roc, currentThr, metrics.eerThreshold);
+      drawRocChart(rocPanel.querySelector('#an-roc-canvas'), c.roc, currentThr, c.auc);
+      drawFarFrrChart(rocPanel.querySelector('#an-far-canvas'), c.roc, currentThr, c.eerThreshold);
     }
+
+    container.querySelector('#an-modalities').innerHTML = `
+      <div class="panel-header">
+        <div><h2 class="panel-title">Per-Modality Breakdown</h2><p class="panel-subtitle">Observed similarity &amp; ground-truth accuracy per modality</p></div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead><tr><th>Modality</th><th class="num-col">Evaluations</th><th class="num-col">Mean Sim</th><th class="num-col">Labeled Acc</th><th>Data Status</th></tr></thead>
+          <tbody>
+            ${['face', 'voice', 'fingerprint', 'multimodal']
+              .map((m) => {
+                const pm = report.perModality[m];
+                const accTxt = pm.metrics ? fmtPct(pm.metrics.accuracy) : '—';
+                const statusTxt = !pm.metrics
+                  ? 'No labeled data'
+                  : pm.metrics.insufficientData
+                  ? `${pm.labeledCount} labeled (<3/class)`
+                  : `${pm.labeledCount} labeled`;
+                return `
+                <tr>
+                  <td style="text-transform:capitalize;"><strong>${m === 'multimodal' ? 'Overall Multimodal' : m}</strong></td>
+                  <td class="num-col">${pm.totalEvaluations}</td>
+                  <td class="num-col">${pm.meanSimilarity !== null ? fmtPct(pm.meanSimilarity) : '—'}</td>
+                  <td class="num-col">${accTxt}</td>
+                  <td class="meta-line">${escapeHtml(statusTxt)}</td>
+                </tr>`;
+              })
+              .join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+
+    const fsTel = getFirestoreTelemetry();
+    container.querySelector('#an-latency-panel').innerHTML = `
+      <div class="panel-header">
+        <div><h2 class="panel-title">Performance, Latency &amp; Rejection Reasons</h2><p class="panel-subtitle">Measured server matching speed and Firestore client telemetry</p></div>
+      </div>
+      <div class="divider-list" style="font-size:13.5px;">
+        <div class="divider-row">
+          <span>Verification Server Latency (${report.latency.measuredCount} timed)</span>
+          <span class="mono">${report.latency.avgMs !== null ? `avg ${report.latency.avgMs}ms · p50 ${report.latency.p50Ms}ms · p95 ${report.latency.p95Ms}ms · max ${report.latency.maxMs}ms` : 'No timed v2.0 records yet'}</span>
+        </div>
+        <div class="divider-row">
+          <span>Firestore Client Ops (session)</span>
+          <span class="mono">${fsTel.opsCount} ops (${fsTel.reads} reads, ${fsTel.writes} writes${fsTel.avgLatencyMs ? `, avg ${fsTel.avgLatencyMs}ms` : ''})</span>
+        </div>
+        <div class="divider-row">
+          <span>Average Behavioral Risk Score</span>
+          <span class="mono">${report.avgRiskScore !== null ? `${report.avgRiskScore} / 100` : '—'}</span>
+        </div>
+      </div>
+      ${
+        report.failedBreakdown.length > 0
+          ? `<div class="stack-sm" style="padding-top:10px;border-top:1px solid var(--border-hairline);">
+              <strong style="font-size:13px;">Non-Match / Rejection Breakdown</strong>
+              ${report.failedBreakdown.slice(0, 6).map((f) => `<div class="row-between" style="font-size:12.5px;"><span class="mono">${escapeHtml(f.reasonCode)}</span><strong>${f.count}</strong></div>`).join('')}
+            </div>`
+          : `<div class="meta-line">No rejected or un-evaluated attempts in current filter window.</div>`
+      }
+    `;
   };
 
   renderStats();
 
+  const customBox = container.querySelector('#an-custom-dates');
   container.querySelectorAll('#an-days .segmented-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       container.querySelectorAll('#an-days .segmented-btn').forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
       daysFilter = btn.dataset.days;
+      customBox.hidden = daysFilter !== 'custom';
+      if (daysFilter !== 'custom') renderStats();
+    });
+  });
+
+  container.querySelector('#an-apply-custom').addEventListener('click', () => {
+    customStart = container.querySelector('#an-start').value;
+    customEnd = container.querySelector('#an-end').value;
+    renderStats();
+  });
+
+  container.querySelectorAll('#an-scope .segmented-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      container.querySelectorAll('#an-scope .segmented-btn').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      scopeFilter = btn.dataset.scope;
       renderStats();
     });
   });
 
   container.querySelector('#an-export-csv').addEventListener('click', () => {
-    const header = 'verificationId,identityRef,pipeline,modalities,outcome,policyDecision,reasonCode,score,riskScore,riskLevel,livenessPassed,adaptiveApplied\n';
-    const lines = appState.verifications
+    const header = 'verificationId,identityRef,pipeline,modalities,outcome,policyDecision,reasonCode,score,confidence,confidenceBand,conflictDetected,groundTruth,isTestProbe,processingTimeMs,faceScore,voiceScore,fingerprintScore,riskScore,riskLevel,livenessPassed,adaptiveApplied\n';
+    const lines = getFilteredVerifications()
       .map((v) =>
         [
           v.verificationId,
@@ -242,6 +404,15 @@ export function renderAnalytics(container, { appState }) {
           v.policyDecision,
           v.reasonCode,
           v.score,
+          v.confidence ?? '',
+          v.confidenceBand ?? '',
+          v.conflictDetected ?? '',
+          v.groundTruth ?? 'unlabeled',
+          v.isTestProbe ?? false,
+          v.processingTimeMs ?? '',
+          v.faceScore ?? '',
+          v.voiceScore ?? '',
+          v.fingerprintScore ?? '',
           v.riskScore ?? '',
           v.riskLevel ?? '',
           v.livenessPassed ?? '',
@@ -259,17 +430,9 @@ export function renderAnalytics(container, { appState }) {
     const report = {
       generatedAt: new Date().toISOString(),
       organization: appState.settings?.organizationName || 'BioGuard X',
-      summary: {
-        enrolledIdentities: appState.identities.length,
-        totalVerifications: appState.verifications.length,
-        matches: appState.verifications.filter((v) => v.outcome === 'match').length,
-        noMatches: appState.verifications.filter((v) => v.outcome === 'no_match').length,
-        livenessFailures: appState.verifications.filter((v) => v.livenessPassed === false).length,
-        highRiskEvents: appState.verifications.filter((v) => (v.riskScore ?? 0) >= 50).length,
-        openAlerts: appState.alerts.filter((a) => a.status !== 'resolved').length,
-        pendingApprovals: appState.approvals.filter((r) => r.status === 'pending').length,
-      },
-      verifications: appState.verifications,
+      filters: { daysFilter, scopeFilter, customStart, customEnd },
+      analyticsReport: latestReport,
+      verifications: getFilteredVerifications(),
       securityAlerts: appState.alerts,
       approvals: appState.approvals,
     };
@@ -674,7 +837,8 @@ export function renderApprovals(container, { appState }) {
             <label class="field-label" for="ap-type">Request Type</label>
             <select class="select mono" id="ap-type">
               <option value="biometric_deletion">biometric_deletion</option>
-              <option value="policy_override_review">policy_override_review</option>
+              <option value="identity_status_change">identity_status_change</option>
+              <option value="policy_review">policy_review</option>
             </select>
           </div>
           <div class="form-field">
@@ -783,9 +947,8 @@ export function renderApprovals(container, { appState }) {
 // 8. AUTOMATION CENTER
 export function renderAutomationCenter(container, { appState }) {
   const canManage = appState.permissions.includes('manage_workflows');
-  const isAnalystOrAbove = ['super_admin', 'administrator', 'security_analyst'].includes(appState.profile?.role);
-  if (!isAnalystOrAbove) {
-    container.innerHTML = `<div class="notice-strip danger"><div><strong>Permission Denied</strong><div>Automation Center requires Security Analyst, Administrator, or Super Admin privileges.</div></div></div>`;
+  if (!canManage) {
+    container.innerHTML = `<div class="notice-strip danger"><div><strong>Permission Denied</strong><div>Your role (${escapeHtml(appState.profile?.role || 'viewer')}) does not have permission to manage automation workflows.</div></div></div>`;
     return;
   }
 

@@ -9,19 +9,46 @@ import {
   fetchApiHealth,
   queryAiSecurityAnalyst,
 } from './api.js';
+import { buildBiometricAnalyticsReport } from './biometrics.js';
+import { getPwaStatus, triggerPwaInstall } from './pwa.js';
 import {
   DEFAULT_THRESHOLDS,
   PERMISSION_MATRIX,
   THRESHOLD_PRESETS,
+  FUSION_POLICIES,
 } from './config.js';
 import { escapeHtml, fmtPct, showToast } from './ui.js';
 
 function buildAnalystContext(appState, selectedVerId) {
   const selectedVerification = appState.verifications.find((v) => v.verificationId === selectedVerId) || null;
+  const s = appState.settings || DEFAULT_THRESHOLDS;
+  const activeCount = appState.identities.filter((i) => i.status === 'active').length;
+  const report = buildBiometricAnalyticsReport(appState.verifications, appState.identities.length, activeCount, {
+    face: s.faceThreshold ?? 0.72,
+    voice: s.voiceThreshold ?? 0.70,
+    fingerprint: s.fingerprintThreshold ?? 0.72,
+    threeModal: s.threeModalThreshold ?? 0.74,
+  });
+
   return {
-    organization: appState.settings?.organizationName || 'BioGuard X Research',
-    thresholds: appState.settings || DEFAULT_THRESHOLDS,
+    organization: s.organizationName || 'BioGuard X Research',
+    thresholds: s,
     enrolledIdentitiesCount: appState.identities.length,
+    analyticsSummary: {
+      totalAttempts: report.totalAttempts,
+      operationalVerificationSuccessRate: report.operationalVerificationSuccessRate,
+      labeledAttempts: report.labeledAttempts,
+      unlabeledAttempts: report.unlabeledAttempts,
+      insufficientData: report.classification.insufficientData,
+      classificationAccuracy: report.classification.sampleCount > 0 ? report.classification.accuracy : null,
+      tar: report.classification.sampleCount > 0 ? report.classification.tar : null,
+      far: report.classification.sampleCount > 0 ? report.classification.far : null,
+      frr: report.classification.sampleCount > 0 ? report.classification.frr : null,
+      eer: report.classification.roc.length > 0 ? report.classification.eer : null,
+      livenessSuccessRate: report.livenessKnownCount > 0 ? report.livenessSuccessRate : null,
+      conflictsCount: report.conflictCount,
+      avgProcessingTimeMs: report.latency.avgMs,
+    },
     selectedVerification: selectedVerification
       ? {
           verificationId: selectedVerification.verificationId,
@@ -30,6 +57,12 @@ function buildAnalystContext(appState, selectedVerId) {
           modalities: selectedVerification.modalities,
           outcome: selectedVerification.outcome,
           score: selectedVerification.score,
+          confidence: selectedVerification.confidence,
+          confidenceBand: selectedVerification.confidenceBand,
+          conflictDetected: selectedVerification.conflictDetected,
+          processingTimeMs: selectedVerification.processingTimeMs,
+          featureVersion: selectedVerification.featureVersion,
+          groundTruth: selectedVerification.groundTruth,
           riskScore: selectedVerification.riskScore,
           riskLevel: selectedVerification.riskLevel,
           livenessPassed: selectedVerification.livenessPassed,
@@ -44,6 +77,10 @@ function buildAnalystContext(appState, selectedVerId) {
       pipeline: v.pipeline,
       outcome: v.outcome,
       score: v.score,
+      confidence: v.confidence,
+      conflictDetected: v.conflictDetected,
+      processingTimeMs: v.processingTimeMs,
+      groundTruth: v.groundTruth,
       riskScore: v.riskScore,
       riskLevel: v.riskLevel,
       livenessPassed: v.livenessPassed,
@@ -412,8 +449,9 @@ export function renderSettings(container, { appState, applyTheme }) {
   const profile = appState.profile || {};
   const settings = appState.settings || { ...DEFAULT_THRESHOLDS };
   const isAdmin = appState.permissions.includes('change_settings');
+  const pwa = getPwaStatus();
 
-  const activePresetId =
+  let selectedPresetId =
     THRESHOLD_PRESETS.find(
       (p) =>
         Math.abs(p.faceThreshold - Number(settings.faceThreshold)) < 0.001 &&
@@ -422,14 +460,16 @@ export function renderSettings(container, { appState, applyTheme }) {
         Math.abs(p.threeModalThreshold - Number(settings.threeModalThreshold)) < 0.001
     )?.id || 'custom';
 
+  const activePolicy = settings.fusionPolicy || 'hierarchical_adaptive';
+
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h1 class="page-title">Settings &amp; Configuration</h1>
-        <p class="page-subtitle">Adapt appearance, verification sensitivity presets, and organization thresholds to match your deployment.</p>
+        <p class="page-subtitle">Adapt appearance, multimodal fusion policies, threshold presets, and PWA installation state.</p>
       </div>
       <div class="page-actions">
-        <button type="button" class="btn btn-secondary" id="st-refresh-health">Refresh Health Status</button>
+        <button type="button" class="btn btn-secondary" id="st-refresh-health">Refresh Diagnostics</button>
       </div>
     </div>
 
@@ -464,15 +504,22 @@ export function renderSettings(container, { appState, applyTheme }) {
 
       <section class="panel stack-md">
         <div class="panel-header">
-          <div><h2 class="panel-title">System Diagnostics</h2><p class="panel-subtitle">Live status of connected services</p></div>
+          <div><h2 class="panel-title">System Diagnostics &amp; PWA Status</h2><p class="panel-subtitle">Live status of models, vault, and installability</p></div>
         </div>
         <div class="divider-list" style="font-size:13.5px;">
           <div class="divider-row"><span>Biometric Verification API</span><span class="state-text ${appState.health?.status === 'ok' ? 'state-success' : 'state-danger'}">${appState.health?.status === 'ok' ? 'Healthy' : 'Unreachable'}</span></div>
-          <div class="divider-row"><span>Firebase Authentication</span><span class="state-text state-success">Verified Session</span></div>
           <div class="divider-row"><span>Cloud Firestore Database</span><span class="state-text ${appState.firestoreOk ? 'state-success' : 'state-danger'}">${appState.firestoreOk ? 'Connected' : 'Offline'}</span></div>
           <div class="divider-row"><span>Encrypted Biometric Vault</span><span class="state-text ${appState.health?.vault_ready ? 'state-success' : 'state-warning'}">${appState.health?.vault_ready ? 'AES-256-GCM Active' : 'Unavailable'}</span></div>
+          <div class="divider-row"><span>Models (v2.0)</span><span class="mono" style="font-size:12px;">FaceRes-1024D · CMVN-96D · Minutiae-RANSAC</span></div>
           <div class="divider-row"><span>AI Security Analyst (Gemini)</span><span class="state-text ${appState.health?.gemini_configured ? 'state-success' : 'state-warning'}">${appState.health?.gemini_configured ? 'Ready (Server-Side)' : 'Secret Not Configured'}</span></div>
-          <div class="divider-row"><span>Feature Extraction Version</span><span class="mono">${escapeHtml(appState.health?.feature_version || 'v1.1-classical-liveness')}</span></div>
+          <div class="divider-row"><span>Feature Version</span><span class="mono">${escapeHtml(appState.health?.feature_version || 'v2.0-multimodal')}</span></div>
+          <div class="divider-row">
+            <span>App Install &amp; Offline Shell</span>
+            <span class="row-wrap">
+              <span class="mono" style="font-size:12px;">${pwa.standalone ? 'Standalone Installed' : pwa.swRegistered ? 'Service Worker Active' : 'Web Session'}</span>
+              ${!pwa.standalone ? `<button type="button" class="btn btn-secondary btn-sm" id="st-pwa-install">Install App</button>` : ''}
+            </span>
+          </div>
         </div>
       </section>
     </div>
@@ -480,8 +527,8 @@ export function renderSettings(container, { appState, applyTheme }) {
     <form id="st-org-form" class="panel stack-md">
       <div class="panel-header">
         <div>
-          <h2 class="panel-title">Threshold Presets &amp; Organization Policy</h2>
-          <p class="panel-subtitle">${isAdmin ? 'Choose a quick sensitivity preset or adjust individual modality thresholds below.' : 'Administrator privileges are required to modify organization thresholds.'}</p>
+          <h2 class="panel-title">Multimodal Fusion Policy &amp; Threshold Presets</h2>
+          <p class="panel-subtitle">${isAdmin ? 'Configure cross-modality fusion strategy, security presets, or individual thresholds.' : 'Administrator or Operator privileges are required to update policy thresholds.'}</p>
         </div>
       </div>
 
@@ -490,7 +537,7 @@ export function renderSettings(container, { appState, applyTheme }) {
           (p) => `
           <button
             type="button"
-            class="preset-btn ${activePresetId === p.id ? 'active' : ''}"
+            class="preset-btn ${selectedPresetId === p.id ? 'active' : ''}"
             data-preset="${p.id}"
             ${isAdmin ? '' : 'disabled'}
           >
@@ -503,12 +550,14 @@ export function renderSettings(container, { appState, applyTheme }) {
 
       <div class="form-grid">
         <div class="form-field">
-          <label class="field-label" for="st-org">Organization Name</label>
-          <input class="input" id="st-org" ${isAdmin ? '' : 'disabled'} value="${escapeHtml(settings.organizationName)}" />
+          <label class="field-label" for="st-fusion-policy">Default Fusion Policy</label>
+          <select class="select" id="st-fusion-policy" ${isAdmin ? '' : 'disabled'}>
+            ${FUSION_POLICIES.map((fp) => `<option value="${fp.id}" ${activePolicy === fp.id ? 'selected' : ''}>${escapeHtml(fp.label)}</option>`).join('')}
+          </select>
         </div>
         <div class="form-field">
-          <label class="field-label" for="st-hold">Max Temporary Hold (Hours, 1–4)</label>
-          <input class="input mono" id="st-hold" type="number" min="1" max="4" ${isAdmin ? '' : 'disabled'} value="${settings.maxHoldHours}" />
+          <label class="field-label" for="st-org">Organization Name</label>
+          <input class="input" id="st-org" ${isAdmin ? '' : 'disabled'} value="${escapeHtml(settings.organizationName)}" />
         </div>
         <div class="form-field">
           <label class="field-label" for="st-f-thr">Face Threshold (0.30–0.98)</label>
@@ -526,15 +575,22 @@ export function renderSettings(container, { appState, applyTheme }) {
           <label class="field-label" for="st-3-thr">Three-Modal Threshold (0.30–0.98)</label>
           <input class="input mono" id="st-3-thr" type="number" step="0.01" min="0.3" max="0.98" ${isAdmin ? '' : 'disabled'} value="${settings.threeModalThreshold}" />
         </div>
+        <div class="form-field">
+          <label class="field-label" for="st-hold">Max Temporary Hold (Hours, 1–4)</label>
+          <input class="input mono" id="st-hold" type="number" min="1" max="4" ${isAdmin ? '' : 'disabled'} value="${settings.maxHoldHours}" />
+        </div>
       </div>
       ${isAdmin ? '<button type="submit" class="btn btn-primary" style="align-self:flex-start;">Save Organization Policy</button>' : ''}
     </form>
   `;
 
+  container.querySelector('#st-pwa-install')?.addEventListener('click', triggerPwaInstall);
+
   container.querySelectorAll('[data-preset]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const preset = THRESHOLD_PRESETS.find((p) => p.id === btn.dataset.preset);
       if (!preset) return;
+      selectedPresetId = preset.id;
       container.querySelectorAll('[data-preset]').forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
       container.querySelector('#st-f-thr').value = preset.faceThreshold;
@@ -542,6 +598,13 @@ export function renderSettings(container, { appState, applyTheme }) {
       container.querySelector('#st-fp-thr').value = preset.fingerprintThreshold;
       container.querySelector('#st-3-thr').value = preset.threeModalThreshold;
       showToast(`Applied "${preset.label}" thresholds. Save to persist.`, 'neutral');
+    });
+  });
+
+  ['#st-f-thr', '#st-v-thr', '#st-fp-thr', '#st-3-thr'].forEach((sel) => {
+    container.querySelector(sel)?.addEventListener('input', () => {
+      selectedPresetId = 'custom';
+      container.querySelectorAll('[data-preset]').forEach((b) => b.classList.remove('active'));
     });
   });
 
@@ -565,6 +628,8 @@ export function renderSettings(container, { appState, applyTheme }) {
     if (!isAdmin) return;
     const cfg = {
       organizationName: container.querySelector('#st-org').value.trim(),
+      fusionPolicy: container.querySelector('#st-fusion-policy').value,
+      securityPreset: selectedPresetId,
       maxHoldHours: Number(container.querySelector('#st-hold').value),
       faceThreshold: Number(container.querySelector('#st-f-thr').value),
       voiceThreshold: Number(container.querySelector('#st-v-thr').value),
@@ -578,7 +643,7 @@ export function renderSettings(container, { appState, applyTheme }) {
         action: 'system_settings_updated',
         resourceType: 'system_settings',
         resourceId: 'default',
-        result: `Thresholds updated (F=${cfg.faceThreshold}, V=${cfg.voiceThreshold}, FP=${cfg.fingerprintThreshold})`,
+        result: `Policy=${cfg.fusionPolicy} (${cfg.securityPreset}) · F=${cfg.faceThreshold}, V=${cfg.voiceThreshold}, FP=${cfg.fingerprintThreshold}`,
       });
       showToast('Organization policy saved.', 'success');
     } catch (err) {

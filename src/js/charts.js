@@ -1,4 +1,4 @@
-// Pure HTML5 Canvas visualizers for ROC curves, FAR/FRR thresholds, Confusion Matrices, and Audio Waveforms
+// Pure HTML5 Canvas visualizers for ROC curves, FAR/FRR thresholds, trends, modality comparisons, and waveforms
 
 function getThemeColors() {
   const dark = !document.documentElement.classList.contains('light');
@@ -9,6 +9,7 @@ function getThemeColors() {
     text: dark ? '#cbd5e1' : '#334155',
     muted: dark ? '#94a3b8' : '#64748b',
     accent: dark ? '#06b6d4' : '#0891b2',
+    accentSecondary: dark ? '#8b5cf6' : '#7c3aed',
     accentFill: dark ? 'rgba(6, 182, 212, 0.16)' : 'rgba(8, 145, 178, 0.10)',
     success: dark ? '#14b8a6' : '#0d9488',
     danger: dark ? '#ef4444' : '#dc2626',
@@ -30,7 +31,6 @@ export function drawRocChart(canvas, rocPoints, currentThreshold, auc) {
   ctx.fillStyle = c.bg;
   ctx.fillRect(0, 0, w, h);
 
-  // Grid
   ctx.strokeStyle = c.grid;
   ctx.lineWidth = 1;
   for (let i = 0; i <= 4; i++) {
@@ -40,7 +40,6 @@ export function drawRocChart(canvas, rocPoints, currentThreshold, auc) {
     ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + pw, y); ctx.stroke();
   }
 
-  // Diagonal random baseline
   ctx.save();
   ctx.setLineDash([4, 4]);
   ctx.strokeStyle = c.axis;
@@ -74,7 +73,6 @@ export function drawRocChart(canvas, rocPoints, currentThreshold, auc) {
     ctx.stroke();
   }
 
-  // Highlight operating threshold point
   const op = rocPoints.reduce((best, p) =>
     Math.abs(p.thr - currentThreshold) < Math.abs(best.thr - currentThreshold) ? p : best
   , rocPoints[0]);
@@ -87,7 +85,6 @@ export function drawRocChart(canvas, rocPoints, currentThreshold, auc) {
     ctx.fill();
   }
 
-  // Labels
   ctx.fillStyle = c.muted;
   ctx.font = '11px "JetBrains Mono", monospace';
   ctx.textAlign = 'center';
@@ -124,7 +121,6 @@ export function drawFarFrrChart(canvas, rocPoints, currentThreshold, eerThreshol
     ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + pw, y); ctx.stroke();
   }
 
-  // FAR curve
   ctx.beginPath();
   rocPoints.forEach((pt, i) => {
     const x = pad.l + pt.thr * pw;
@@ -135,7 +131,6 @@ export function drawFarFrrChart(canvas, rocPoints, currentThreshold, eerThreshol
   ctx.lineWidth = 2.2;
   ctx.stroke();
 
-  // FRR curve
   ctx.beginPath();
   rocPoints.forEach((pt, i) => {
     const x = pad.l + pt.thr * pw;
@@ -146,7 +141,6 @@ export function drawFarFrrChart(canvas, rocPoints, currentThreshold, eerThreshol
   ctx.lineWidth = 2.2;
   ctx.stroke();
 
-  // Current threshold line
   const tx = pad.l + currentThreshold * pw;
   ctx.save();
   ctx.setLineDash([4, 3]);
@@ -155,8 +149,6 @@ export function drawFarFrrChart(canvas, rocPoints, currentThreshold, eerThreshol
   ctx.beginPath(); ctx.moveTo(tx, pad.t); ctx.lineTo(tx, pad.t + ph); ctx.stroke();
   ctx.restore();
 
-  // EER marker
-  const ex = pad.l + eerThreshold * pw;
   ctx.fillStyle = c.muted;
   ctx.font = '11px "JetBrains Mono", monospace';
   ctx.textAlign = 'center';
@@ -169,6 +161,141 @@ export function drawFarFrrChart(canvas, rocPoints, currentThreshold, eerThreshol
   ctx.fillText('FRR', pad.l + 44, pad.t + 16);
   ctx.fillStyle = c.warning;
   ctx.fillText(`Thr ${currentThreshold.toFixed(2)}`, Math.min(w - 70, Math.max(pad.l + 80, tx + 6)), pad.t + 16);
+}
+
+export function drawVerificationTrendChart(canvas, records) {
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width;
+  const h = canvas.height;
+  const c = getThemeColors();
+  const pad = { l: 40, r: 16, t: 28, b: 36 };
+  const pw = w - pad.l - pad.r;
+  const ph = h - pad.t - pad.b;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = c.bg;
+  ctx.fillRect(0, 0, w, h);
+
+  const buckets = new Map();
+  for (const r of records) {
+    const ms = typeof r.createdAt?.toMillis === 'function'
+      ? r.createdAt.toMillis()
+      : typeof r.createdAt === 'string'
+      ? Date.parse(r.createdAt)
+      : Date.now();
+    if (!ms || Number.isNaN(ms)) continue;
+    const d = new Date(ms);
+    const key = `${d.getMonth() + 1}/${d.getDate()}`;
+    if (!buckets.has(key)) buckets.set(key, { key, ts: ms, match: 0, fail: 0 });
+    const b = buckets.get(key);
+    if (r.outcome === 'match') b.match++;
+    else b.fail++;
+  }
+
+  const days = [...buckets.values()].sort((a, b) => a.ts - b.ts).slice(-10);
+  if (days.length === 0) {
+    ctx.fillStyle = c.muted;
+    ctx.font = '12px "DM Sans", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No verification history in selected range', w / 2, h / 2);
+    return;
+  }
+
+  const maxY = Math.max(2, ...days.map((d) => d.match + d.fail));
+  ctx.strokeStyle = c.grid;
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 3; i++) {
+    const y = pad.t + (ph * i) / 3;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + pw, y); ctx.stroke();
+  }
+
+  const colW = pw / days.length;
+  const barW = Math.min(26, Math.max(8, colW * 0.45));
+  days.forEach((d, idx) => {
+    const cx = pad.l + idx * colW + colW / 2;
+    const matchH = (d.match / maxY) * ph;
+    const failH = (d.fail / maxY) * ph;
+
+    ctx.fillStyle = c.success;
+    ctx.fillRect(cx - barW / 2, pad.t + ph - matchH - failH, barW, matchH);
+    ctx.fillStyle = c.danger;
+    ctx.fillRect(cx - barW / 2, pad.t + ph - failH, barW, failH);
+
+    ctx.fillStyle = c.muted;
+    ctx.font = '10px "JetBrains Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(d.key, cx, h - 12);
+  });
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = c.success;
+  ctx.font = '11px "JetBrains Mono", monospace';
+  ctx.fillText('Match', pad.l + 4, 16);
+  ctx.fillStyle = c.danger;
+  ctx.fillText('Reject/Other', pad.l + 52, 16);
+}
+
+export function drawModalityComparisonChart(canvas, perModality) {
+  if (!canvas || !perModality) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width;
+  const h = canvas.height;
+  const c = getThemeColors();
+  const pad = { l: 42, r: 16, t: 28, b: 36 };
+  const pw = w - pad.l - pad.r;
+  const ph = h - pad.t - pad.b;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = c.bg;
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.strokeStyle = c.grid;
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + (ph * i) / 4;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + pw, y); ctx.stroke();
+  }
+
+  const mods = [
+    { key: 'face', label: 'Face' },
+    { key: 'voice', label: 'Voice' },
+    { key: 'fingerprint', label: 'FP' },
+    { key: 'multimodal', label: 'Fused' },
+  ];
+
+  const colW = pw / mods.length;
+  const barW = Math.min(24, colW * 0.28);
+
+  mods.forEach((m, idx) => {
+    const item = perModality[m.key];
+    const cx = pad.l + idx * colW + colW / 2;
+    const sim = typeof item?.meanSimilarity === 'number' ? item.meanSimilarity : 0;
+    const acc = item?.metrics && !item.metrics.insufficientData ? item.metrics.accuracy : 0;
+
+    if (sim > 0) {
+      const sh = sim * ph;
+      ctx.fillStyle = c.accent;
+      ctx.fillRect(cx - barW - 2, pad.t + ph - sh, barW, sh);
+    }
+    if (acc > 0) {
+      const ah = acc * ph;
+      ctx.fillStyle = c.accentSecondary;
+      ctx.fillRect(cx + 2, pad.t + ph - ah, barW, ah);
+    }
+
+    ctx.fillStyle = c.muted;
+    ctx.font = '11px "JetBrains Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(m.label, cx, h - 12);
+  });
+
+  ctx.textAlign = 'left';
+  ctx.font = '11px "JetBrains Mono", monospace';
+  ctx.fillStyle = c.accent;
+  ctx.fillText('Mean Sim', pad.l + 4, 16);
+  ctx.fillStyle = c.accentSecondary;
+  ctx.fillText('Labeled Acc', pad.l + 76, 16);
 }
 
 export function drawWaveform(canvas, samples) {

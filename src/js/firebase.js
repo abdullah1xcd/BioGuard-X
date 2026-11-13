@@ -41,6 +41,34 @@ export const OperationType = {
   WRITE: 'write',
 };
 
+const fsTelemetry = {
+  reads: 0,
+  writes: 0,
+  errors: 0,
+  totalLatencyMs: 0,
+  opsCount: 0,
+  lastOpMs: null,
+};
+
+function trackFsOp(kind, t0, ok = true) {
+  const dt = Number((performance.now() - t0).toFixed(1));
+  fsTelemetry.opsCount++;
+  fsTelemetry.totalLatencyMs += dt;
+  fsTelemetry.lastOpMs = dt;
+  if (kind === 'read') fsTelemetry.reads++;
+  else fsTelemetry.writes++;
+  if (!ok) fsTelemetry.errors++;
+}
+
+export function getFirestoreTelemetry() {
+  return {
+    ...fsTelemetry,
+    avgLatencyMs: fsTelemetry.opsCount
+      ? Number((fsTelemetry.totalLatencyMs / fsTelemetry.opsCount).toFixed(1))
+      : null,
+  };
+}
+
 export function handleFirestoreError(error, operationType, path) {
   const errInfo = {
     error: error instanceof Error ? error.message : String(error),
@@ -111,7 +139,7 @@ export async function provisionUserProfile(fbUser) {
     const snap = await getDoc(ref);
     if (!snap.exists()) {
       const isBootstrap = fbUser.emailVerified && fbUser.email === BOOTSTRAPPED_ADMIN_EMAIL;
-      const initialRole = isBootstrap ? 'super_admin' : 'viewer';
+      const initialRole = isBootstrap ? 'super_admin' : 'operator';
       const payload = {
         uid: fbUser.uid,
         displayName: (fbUser.displayName || fbUser.email || 'Operator').slice(0, 120),
@@ -171,13 +199,13 @@ export async function listUsersForAdmin() {
   }
 }
 
-// Identities Metadata (NO vectors stored here)
+// Identities Metadata (NO vectors stored here; isolated per Google UID)
 export async function saveIdentityMetadata({ identityRef, displayName, registeredModalities, featureVersion }) {
   const uid = auth.currentUser?.uid;
   if (!uid) throw new Error('Not signed in');
-  const path = `identities/${identityRef}`;
+  const path = `users/${uid}/identities/${identityRef}`;
   try {
-    const ref = doc(db, 'identities', identityRef);
+    const ref = doc(db, 'users', uid, 'identities', identityRef);
     const snap = await getDoc(ref);
     if (!snap.exists()) {
       await setDoc(ref, {
@@ -206,9 +234,11 @@ export async function saveIdentityMetadata({ identityRef, displayName, registere
 }
 
 export async function updateIdentityStatusOrName(identityRef, updates) {
-  const path = `identities/${identityRef}`;
+  const uid = auth.currentUser?.uid;
+  if (!uid) throw new Error('Not signed in');
+  const path = `users/${uid}/identities/${identityRef}`;
   try {
-    await updateDoc(doc(db, 'identities', identityRef), {
+    await updateDoc(doc(db, 'users', uid, 'identities', identityRef), {
       ...updates,
       updatedAt: serverTimestamp(),
     });
@@ -218,30 +248,30 @@ export async function updateIdentityStatusOrName(identityRef, updates) {
 }
 
 export async function deleteIdentityMetadata(identityRef) {
-  const path = `identities/${identityRef}`;
+  const uid = auth.currentUser?.uid;
+  if (!uid) throw new Error('Not signed in');
+  const path = `users/${uid}/identities/${identityRef}`;
   try {
-    await deleteDoc(doc(db, 'identities', identityRef));
+    await deleteDoc(doc(db, 'users', uid, 'identities', identityRef));
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, path);
   }
 }
 
-export function subscribeIdentities(role, uid, onData, onErr) {
-  const isOp = ['super_admin', 'administrator', 'security_analyst', 'operator'].includes(role);
-  const q = isOp
-    ? query(collection(db, 'identities'), orderBy('updatedAt', 'desc'), limit(150))
-    : query(collection(db, 'identities'), where('createdBy', '==', uid), limit(100));
+export function subscribeIdentities(_role, uid, onData, onErr) {
+  const path = `users/${uid}/identities`;
+  const q = query(collection(db, 'users', uid, 'identities'), orderBy('updatedAt', 'desc'), limit(150));
   return onSnapshot(
     q,
     (snap) => onData(snap.docs.map((d) => d.data())),
     (err) => {
       if (onErr) onErr(err);
-      else handleFirestoreError(err, OperationType.LIST, 'identities');
+      else handleFirestoreError(err, OperationType.LIST, path);
     }
   );
 }
 
-// Verification Records
+// Verification Records (isolated per Google UID)
 export async function recordVerificationMetadata({
   identityRef,
   modalities,
@@ -249,6 +279,14 @@ export async function recordVerificationMetadata({
   outcome,
   reasonCode,
   score,
+  confidence,
+  confidenceBand,
+  conflictDetected,
+  processingTimeMs,
+  featureVersion,
+  groundTruth = 'unlabeled',
+  isTestProbe = false,
+  modalityEvaluations,
   riskScore,
   riskLevel,
   livenessPassed,
@@ -258,7 +296,8 @@ export async function recordVerificationMetadata({
   const uid = auth.currentUser?.uid;
   if (!uid) throw new Error('Not signed in');
   const verificationId = makeId('ver');
-  const path = `verification_records/${verificationId}`;
+  const path = `users/${uid}/verification_records/${verificationId}`;
+  const t0 = performance.now();
   try {
     const docData = {
       verificationId,
@@ -277,34 +316,60 @@ export async function recordVerificationMetadata({
     if (typeof livenessPassed === 'boolean') docData.livenessPassed = livenessPassed;
     if (typeof livenessScore === 'number') docData.livenessScore = Number(Math.min(1, Math.max(0, livenessScore)).toFixed(2));
     if (typeof adaptiveApplied === 'boolean') docData.adaptiveApplied = adaptiveApplied;
+    if (['genuine', 'impostor', 'unlabeled'].includes(groundTruth)) docData.groundTruth = groundTruth;
+    if (typeof isTestProbe === 'boolean') docData.isTestProbe = isTestProbe;
+    if (typeof processingTimeMs === 'number' && Number.isFinite(processingTimeMs)) {
+      docData.processingTimeMs = Math.min(120000, Math.max(0, Number(processingTimeMs.toFixed(1))));
+    }
+    if (typeof confidence === 'number' && Number.isFinite(confidence)) {
+      docData.confidence = Math.min(1, Math.max(0, Number(confidence.toFixed(3))));
+    }
+    if (['high', 'moderate', 'low'].includes(confidenceBand)) docData.confidenceBand = confidenceBand;
+    if (typeof conflictDetected === 'boolean') docData.conflictDetected = conflictDetected;
+    if (typeof featureVersion === 'string' && featureVersion.length > 0) {
+      docData.featureVersion = featureVersion.slice(0, 32);
+    }
 
-    await setDoc(doc(db, 'verification_records', verificationId), docData);
+    if (modalityEvaluations?.face) {
+      docData.faceScore = Number(Math.min(1, Math.max(0, modalityEvaluations.face.score)).toFixed(4));
+      docData.faceQuality = Math.min(100, Math.max(0, Math.round(modalityEvaluations.face.qualityScore)));
+    }
+    if (modalityEvaluations?.voice) {
+      docData.voiceScore = Number(Math.min(1, Math.max(0, modalityEvaluations.voice.score)).toFixed(4));
+      docData.voiceQuality = Math.min(100, Math.max(0, Math.round(modalityEvaluations.voice.qualityScore)));
+    }
+    if (modalityEvaluations?.fingerprint) {
+      docData.fingerprintScore = Number(Math.min(1, Math.max(0, modalityEvaluations.fingerprint.score)).toFixed(4));
+      docData.fingerprintQuality = Math.min(100, Math.max(0, Math.round(modalityEvaluations.fingerprint.qualityScore)));
+    }
+
+    await setDoc(doc(db, 'users', uid, 'verification_records', verificationId), docData);
+    trackFsOp('write', t0, true);
     return verificationId;
   } catch (err) {
+    trackFsOp('write', t0, false);
     handleFirestoreError(err, OperationType.CREATE, path);
   }
 }
 
-export function subscribeVerificationRecords(role, uid, onData) {
-  const isAnalyst = ['super_admin', 'administrator', 'security_analyst'].includes(role);
-  const q = isAnalyst
-    ? query(collection(db, 'verification_records'), orderBy('createdAt', 'desc'), limit(200))
-    : query(collection(db, 'verification_records'), where('operatorUid', '==', uid), limit(150));
+export function subscribeVerificationRecords(_role, uid, onData) {
+  const path = `users/${uid}/verification_records`;
+  const q = query(collection(db, 'users', uid, 'verification_records'), orderBy('createdAt', 'desc'), limit(200));
   return onSnapshot(
     q,
     (snap) => onData(snap.docs.map((d) => d.data())),
-    (err) => handleFirestoreError(err, OperationType.LIST, 'verification_records')
+    (err) => handleFirestoreError(err, OperationType.LIST, path)
   );
 }
 
-// Append-only Audit Logs
+// Append-only Audit Logs (isolated per Google UID)
 export async function appendAuditLog({ action, resourceType, resourceId, result, requestId }) {
   const uid = auth.currentUser?.uid;
   if (!uid) return null;
   const eventId = makeId('aud');
-  const path = `audit_logs/${eventId}`;
+  const path = `users/${uid}/audit_logs/${eventId}`;
   try {
-    await setDoc(doc(db, 'audit_logs', eventId), {
+    await setDoc(doc(db, 'users', uid, 'audit_logs', eventId), {
       eventId,
       actorUid: uid,
       action: String(action).slice(0, 80),
@@ -320,26 +385,24 @@ export async function appendAuditLog({ action, resourceType, resourceId, result,
   }
 }
 
-export function subscribeAuditLogs(role, uid, onData) {
-  const isAnalyst = ['super_admin', 'administrator', 'security_analyst'].includes(role);
-  const q = isAnalyst
-    ? query(collection(db, 'audit_logs'), orderBy('timestamp', 'desc'), limit(200))
-    : query(collection(db, 'audit_logs'), where('actorUid', '==', uid), limit(100));
+export function subscribeAuditLogs(_role, uid, onData) {
+  const path = `users/${uid}/audit_logs`;
+  const q = query(collection(db, 'users', uid, 'audit_logs'), orderBy('timestamp', 'desc'), limit(200));
   return onSnapshot(
     q,
     (snap) => onData(snap.docs.map((d) => d.data())),
-    (err) => handleFirestoreError(err, OperationType.LIST, 'audit_logs')
+    (err) => handleFirestoreError(err, OperationType.LIST, path)
   );
 }
 
-// Notifications
-export async function pushNotification({ title, message, type = 'info', targetUid = null }) {
-  const uid = targetUid || auth.currentUser?.uid;
+// Notifications (isolated per Google UID)
+export async function pushNotification({ title, message, type = 'info' }) {
+  const uid = auth.currentUser?.uid;
   if (!uid) return null;
   const notificationId = makeId('ntf');
-  const path = `notifications/${notificationId}`;
+  const path = `users/${uid}/notifications/${notificationId}`;
   try {
-    await setDoc(doc(db, 'notifications', notificationId), {
+    await setDoc(doc(db, 'users', uid, 'notifications', notificationId), {
       notificationId,
       userUid: uid,
       title: String(title).slice(0, 140),
@@ -354,39 +417,40 @@ export async function pushNotification({ title, message, type = 'info', targetUi
 }
 
 export async function markNotificationRead(notificationId) {
+  const uid = auth.currentUser?.uid;
+  if (!uid) throw new Error('Not signed in');
+  const path = `users/${uid}/notifications/${notificationId}`;
   try {
-    await updateDoc(doc(db, 'notifications', notificationId), { read: true });
+    await updateDoc(doc(db, 'users', uid, 'notifications', notificationId), { read: true });
   } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `notifications/${notificationId}`);
+    handleFirestoreError(err, OperationType.UPDATE, path);
   }
 }
 
 export function subscribeNotifications(uid, onData) {
-  const q = query(collection(db, 'notifications'), where('userUid', '==', uid), limit(60));
+  const path = `users/${uid}/notifications`;
+  const q = query(collection(db, 'users', uid, 'notifications'), orderBy('createdAt', 'desc'), limit(60));
   return onSnapshot(
     q,
-    (snap) => {
-      const items = snap.docs.map((d) => d.data());
-      items.sort((a, b) => (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
-      onData(items);
-    },
-    (err) => handleFirestoreError(err, OperationType.LIST, 'notifications')
+    (snap) => onData(snap.docs.map((d) => d.data())),
+    (err) => handleFirestoreError(err, OperationType.LIST, path)
   );
 }
 
-// Security Alerts (Threat Intelligence)
+// Security Alerts (Threat Intelligence, isolated per Google UID)
 export async function createSecurityAlert({ severity, category, description, assignedTo = '' }) {
   const uid = auth.currentUser?.uid;
   if (!uid) throw new Error('Not signed in');
   const alertId = makeId('alr');
+  const path = `users/${uid}/security_alerts/${alertId}`;
   try {
-    await setDoc(doc(db, 'security_alerts', alertId), {
+    await setDoc(doc(db, 'users', uid, 'security_alerts', alertId), {
       alertId,
       severity,
       category: String(category).slice(0, 80),
       description: String(description).slice(0, 600),
       status: 'open',
-      assignedTo: String(assignedTo).slice(0, 128),
+      assignedTo: String(assignedTo || uid).slice(0, 128),
       notes: '',
       createdBy: uid,
       createdAt: serverTimestamp(),
@@ -394,37 +458,42 @@ export async function createSecurityAlert({ severity, category, description, ass
     });
     return alertId;
   } catch (err) {
-    handleFirestoreError(err, OperationType.CREATE, `security_alerts/${alertId}`);
+    handleFirestoreError(err, OperationType.CREATE, path);
   }
 }
 
 export async function updateSecurityAlert(alertId, updates) {
+  const uid = auth.currentUser?.uid;
+  if (!uid) throw new Error('Not signed in');
+  const path = `users/${uid}/security_alerts/${alertId}`;
   try {
-    await updateDoc(doc(db, 'security_alerts', alertId), {
+    await updateDoc(doc(db, 'users', uid, 'security_alerts', alertId), {
       ...updates,
       updatedAt: serverTimestamp(),
     });
   } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `security_alerts/${alertId}`);
+    handleFirestoreError(err, OperationType.UPDATE, path);
   }
 }
 
-export function subscribeSecurityAlerts(onData) {
-  const q = query(collection(db, 'security_alerts'), orderBy('updatedAt', 'desc'), limit(100));
+export function subscribeSecurityAlerts(uid, onData) {
+  const path = `users/${uid}/security_alerts`;
+  const q = query(collection(db, 'users', uid, 'security_alerts'), orderBy('updatedAt', 'desc'), limit(100));
   return onSnapshot(
     q,
     (snap) => onData(snap.docs.map((d) => d.data())),
-    (err) => handleFirestoreError(err, OperationType.LIST, 'security_alerts')
+    (err) => handleFirestoreError(err, OperationType.LIST, path)
   );
 }
 
-// Automation Workflows
+// Automation Workflows (isolated per Google UID)
 export async function createWorkflowDoc({ workflowId, name, description, trigger, actions }) {
   const uid = auth.currentUser?.uid;
   if (!uid) throw new Error('Not signed in');
   const id = (workflowId || makeId('wf')).replace(/[^a-zA-Z0-9_-]/g, '');
+  const path = `users/${uid}/automation_workflows/${id}`;
   try {
-    await setDoc(doc(db, 'automation_workflows', id), {
+    await setDoc(doc(db, 'users', uid, 'automation_workflows', id), {
       workflowId: id,
       name: String(name).slice(0, 120),
       description: String(description || '').slice(0, 400),
@@ -437,45 +506,54 @@ export async function createWorkflowDoc({ workflowId, name, description, trigger
     });
     return id;
   } catch (err) {
-    handleFirestoreError(err, OperationType.CREATE, `automation_workflows/${id}`);
+    handleFirestoreError(err, OperationType.CREATE, path);
   }
 }
 
 export async function updateWorkflowDoc(workflowId, updates) {
+  const uid = auth.currentUser?.uid;
+  if (!uid) throw new Error('Not signed in');
+  const path = `users/${uid}/automation_workflows/${workflowId}`;
   try {
-    await updateDoc(doc(db, 'automation_workflows', workflowId), {
+    await updateDoc(doc(db, 'users', uid, 'automation_workflows', workflowId), {
       ...updates,
       updatedAt: serverTimestamp(),
     });
   } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `automation_workflows/${workflowId}`);
+    handleFirestoreError(err, OperationType.UPDATE, path);
   }
 }
 
-export function subscribeWorkflows(onData) {
-  const q = query(collection(db, 'automation_workflows'), limit(100));
+export function subscribeWorkflows(uid, onData) {
+  const path = `users/${uid}/automation_workflows`;
+  const q = query(collection(db, 'users', uid, 'automation_workflows'), limit(100));
   return onSnapshot(
     q,
     (snap) => onData(snap.docs.map((d) => d.data())),
-    (err) => handleFirestoreError(err, OperationType.LIST, 'automation_workflows')
+    (err) => handleFirestoreError(err, OperationType.LIST, path)
   );
 }
 
-// System Settings
+// System Settings (isolated per Google UID)
 export async function loadSystemSettings() {
+  const uid = auth.currentUser?.uid;
+  if (!uid) return null;
+  const path = `users/${uid}/system_settings/default`;
   try {
-    const snap = await getDoc(doc(db, 'system_settings', 'default'));
+    const snap = await getDoc(doc(db, 'users', uid, 'system_settings', 'default'));
     return snap.exists() ? snap.data() : null;
   } catch (err) {
-    handleFirestoreError(err, OperationType.GET, 'system_settings/default');
+    handleFirestoreError(err, OperationType.GET, path);
   }
 }
 
 export async function saveSystemSettings(cfg) {
   const uid = auth.currentUser?.uid;
   if (!uid) throw new Error('Not signed in');
+  const path = `users/${uid}/system_settings/default`;
+  const t0 = performance.now();
   try {
-    await setDoc(doc(db, 'system_settings', 'default'), {
+    const payload = {
       settingId: 'default',
       organizationName: String(cfg.organizationName || 'BioGuard X Research').slice(0, 120),
       faceThreshold: Number(cfg.faceThreshold ?? 0.72),
@@ -485,25 +563,35 @@ export async function saveSystemSettings(cfg) {
       maxHoldHours: Math.min(4, Math.max(1, Number(cfg.maxHoldHours ?? 4))),
       updatedAt: serverTimestamp(),
       updatedBy: uid,
-    });
+    };
+    if (['weighted_score', 'strict_and', 'hierarchical_adaptive'].includes(cfg.fusionPolicy)) {
+      payload.fusionPolicy = cfg.fusionPolicy;
+    }
+    if (['balanced', 'strict', 'convenience', 'custom'].includes(cfg.securityPreset)) {
+      payload.securityPreset = cfg.securityPreset;
+    }
+    await setDoc(doc(db, 'users', uid, 'system_settings', 'default'), payload);
+    trackFsOp('write', t0, true);
   } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, 'system_settings/default');
+    trackFsOp('write', t0, false);
+    handleFirestoreError(err, OperationType.WRITE, path);
   }
 }
 
-// Approval Workflow Requests
+// Approval Workflow Requests (isolated per Google UID)
 export async function createApprovalRequest({ requestType = 'biometric_deletion', targetIdentityRef, reason }) {
   const user = auth.currentUser;
   if (!user) throw new Error('Not signed in');
+  const uid = user.uid;
   const requestId = makeId('apr');
-  const path = `approval_requests/${requestId}`;
+  const path = `users/${uid}/approval_requests/${requestId}`;
   try {
-    await setDoc(doc(db, 'approval_requests', requestId), {
+    await setDoc(doc(db, 'users', uid, 'approval_requests', requestId), {
       requestId,
       requestType,
       targetIdentityRef: String(targetIdentityRef).slice(0, 64),
       reason: String(reason).slice(0, 500),
-      requestedBy: user.uid,
+      requestedBy: uid,
       requestedByEmail: String(user.email || 'unknown@user').slice(0, 180),
       status: 'pending',
       createdAt: serverTimestamp(),
@@ -518,9 +606,9 @@ export async function createApprovalRequest({ requestType = 'biometric_deletion'
 export async function reviewApprovalRequest(requestId, { status, reviewNotes = '' }) {
   const uid = auth.currentUser?.uid;
   if (!uid) throw new Error('Not signed in');
-  const path = `approval_requests/${requestId}`;
+  const path = `users/${uid}/approval_requests/${requestId}`;
   try {
-    await updateDoc(doc(db, 'approval_requests', requestId), {
+    await updateDoc(doc(db, 'users', uid, 'approval_requests', requestId), {
       status,
       reviewedBy: uid,
       reviewNotes: String(reviewNotes).slice(0, 500),
@@ -531,18 +619,12 @@ export async function reviewApprovalRequest(requestId, { status, reviewNotes = '
   }
 }
 
-export function subscribeApprovalRequests(role, uid, onData) {
-  const isAdminRole = ['super_admin', 'administrator'].includes(role);
-  const q = isAdminRole
-    ? query(collection(db, 'approval_requests'), orderBy('updatedAt', 'desc'), limit(100))
-    : query(collection(db, 'approval_requests'), where('requestedBy', '==', uid), limit(60));
+export function subscribeApprovalRequests(_role, uid, onData) {
+  const path = `users/${uid}/approval_requests`;
+  const q = query(collection(db, 'users', uid, 'approval_requests'), orderBy('updatedAt', 'desc'), limit(100));
   return onSnapshot(
     q,
-    (snap) => {
-      const items = snap.docs.map((d) => d.data());
-      items.sort((a, b) => (b.updatedAt?.toMillis?.() || 0) - (a.updatedAt?.toMillis?.() || 0));
-      onData(items);
-    },
-    (err) => handleFirestoreError(err, OperationType.LIST, 'approval_requests')
+    (snap) => onData(snap.docs.map((d) => d.data())),
+    (err) => handleFirestoreError(err, OperationType.LIST, path)
   );
 }

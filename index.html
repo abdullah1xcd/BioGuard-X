@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>BioGuard X — Multimodal Biometric Security &amp; Automation</title>
     <meta
       name="description"
@@ -15,6 +15,13 @@
     />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#070d1a" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="BioGuard X" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -23,6 +30,11 @@
     />
   </head>
   <body>
+    <!-- Offline Status Banner (PWA) -->
+    <div id="offline-banner" class="offline-banner" hidden role="status">
+      <span>Offline mode — API biometric matching and Firestore sync require a live connection.</span>
+    </div>
+
     <!-- Google Sign-In Gate -->
     <div id="auth-gate" class="auth-gate">
       <div class="auth-card">
@@ -35,7 +47,7 @@
         </div>
 
         <p class="auth-desc">
-          Sign in with your verified Google account via Firebase Authentication to access biometric enrollment, multimodal verification, risk &amp; liveness analysis, approval workflows, and the AI Security Analyst.
+          Sign in with your verified Google account via Firebase Authentication to access biometric enrollment, multimodal verification, 1:1 &amp; 1:N identity search, risk &amp; liveness analysis, and the AI Security Analyst.
         </p>
 
         <div id="auth-error" class="notice-strip danger" hidden></div>
@@ -99,6 +111,18 @@
           </div>
 
           <div class="topbar-actions">
+            <div id="pwa-install-slot" hidden>
+              <button
+                id="pwa-install-btn"
+                class="btn btn-secondary btn-sm"
+                type="button"
+                aria-label="Install BioGuard X app"
+                title="Install BioGuard X as an app"
+              >
+                Install App
+              </button>
+            </div>
+
             <button
               id="theme-toggle-btn"
               class="icon-btn"
@@ -110,7 +134,7 @@
             <div class="popover-anchor">
               <button id="notif-toggle-btn" class="btn btn-secondary btn-sm" type="button" aria-label="Notifications">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
-                <span>Alerts</span>
+                <span class="hide-xs">Alerts</span>
                 <span id="notif-unread-count" class="mono">0</span>
               </button>
               <div id="notif-popover" class="popover-panel" hidden></div>
@@ -129,6 +153,15 @@
 
         <main id="main-content" class="main-content" tabindex="-1"></main>
       </div>
+
+      <!-- Mobile Bottom Navigation Bar -->
+      <nav id="mobile-bottom-nav" class="mobile-bottom-nav" aria-label="Mobile quick navigation">
+        <button type="button" class="mbn-btn" data-route="overview"><span>Home</span></button>
+        <button type="button" class="mbn-btn" data-route="verification"><span>Verify</span></button>
+        <button type="button" class="mbn-btn" data-route="compare"><span>Compare</span></button>
+        <button type="button" class="mbn-btn" data-route="analytics"><span>Stats</span></button>
+        <button type="button" class="mbn-btn" id="mbn-more-btn"><span>Menu</span></button>
+      </nav>
     </div>
 
     <div id="modal-root" class="modal-root" hidden role="dialog" aria-modal="true" aria-labelledby="modal-title">
