@@ -136,9 +136,17 @@ function estimatePitchF0(frame: Float32Array, sampleRate: number): { f0: number;
   return { f0: sampleRate / bestLag, strength: bestCorr };
 }
 
+export type VoiceFeedbackCode =
+  | 'voice_quality_good'
+  | 'recording_too_short'
+  | 'insufficient_audio'
+  | 'background_noise_detected'
+  | 'spoof_replay_suspected';
+
 export interface VoiceExtractionStats {
   durationSec: number;
   activeSpeechSec: number;
+  inputSampleRate: number;
   meanRms: number;
   meanZcr: number;
   speechSegments: number;
@@ -152,6 +160,10 @@ export interface VoiceExtractionStats {
   f0Jitter: number;
   snrEstimateDb: number;
   voiceQualityScore: number;
+  qualityBand: 'good' | 'borderline' | 'poor';
+  feedbackCode: VoiceFeedbackCode;
+  feedbackLabel: string;
+  speakerNote: string;
   voiceLivenessScore: number;
   spoofSignals: string[];
   captureSource?: string;
@@ -169,6 +181,14 @@ export function extractVoiceFeaturesV2(
   inputSampleRate = TARGET_SAMPLE_RATE,
   captureSource = 'upload'
 ): VoiceExtractionResult {
+  if (
+    typeof inputSampleRate !== 'number' ||
+    !Number.isFinite(inputSampleRate) ||
+    inputSampleRate < 8000 ||
+    inputSampleRate > 192000
+  ) {
+    throw new Error('Invalid audio sample rate (expected 8,000–192,000 Hz PCM).');
+  }
   const rawFloat = rawSamples instanceof Float32Array ? rawSamples : new Float32Array(rawSamples);
   if (!rawFloat || rawFloat.length < 400) {
     throw new Error('Audio buffer too short for acoustic extraction.');
@@ -532,6 +552,27 @@ export function extractVoiceFeaturesV2(
     spoofSignals.push('Severe high-frequency rolloff (<2.1 kHz) indicative of low-bitrate speaker replay');
   }
 
+  const finalQualityScore = Math.max(0, Math.min(100, Math.round(qScore)));
+  const finalLivenessScore = Number(Math.max(0.05, Math.min(0.99, livenessScore)).toFixed(2));
+  const qualityBand: 'good' | 'borderline' | 'poor' =
+    finalQualityScore >= 68 ? 'good' : finalQualityScore >= 45 ? 'borderline' : 'poor';
+
+  let feedbackCode: VoiceFeedbackCode = 'voice_quality_good';
+  let feedbackLabel = 'Voice Quality Good';
+  if (meanRms < 0.004 || activeSpeechSec < 0.35 || speechSegments < 1) {
+    feedbackCode = 'insufficient_audio';
+    feedbackLabel = 'Insufficient Audio';
+  } else if (durationSec < 0.65) {
+    feedbackCode = 'recording_too_short';
+    feedbackLabel = 'Recording Too Short';
+  } else if (snrEstimateDb < 6.5 && captureSource !== 'test_sample') {
+    feedbackCode = 'background_noise_detected';
+    feedbackLabel = 'Background Noise Detected';
+  } else if (spoofSignals.length > 0 && finalLivenessScore < 0.62) {
+    feedbackCode = 'spoof_replay_suspected';
+    feedbackLabel = 'Replay / Synthetic Anomaly Detected';
+  }
+
   return {
     vector,
     dim: vector.length,
@@ -539,6 +580,7 @@ export function extractVoiceFeaturesV2(
     stats: {
       durationSec,
       activeSpeechSec,
+      inputSampleRate,
       meanRms: Number(meanRms.toFixed(4)),
       meanZcr: Number(meanZcr.toFixed(4)),
       speechSegments,
@@ -551,8 +593,13 @@ export function extractVoiceFeaturesV2(
       medianF0Hz: Number(medianF0.toFixed(1)),
       f0Jitter,
       snrEstimateDb,
-      voiceQualityScore: Math.max(0, Math.min(100, Math.round(qScore))),
-      voiceLivenessScore: Number(Math.max(0.05, Math.min(0.99, livenessScore)).toFixed(2)),
+      voiceQualityScore: finalQualityScore,
+      qualityBand,
+      feedbackCode,
+      feedbackLabel,
+      speakerNote:
+        'Speaker verification evaluates vocal-tract timbral & pitch dynamics (96-D CMVN MFCC+Delta+F0), not spoken phrase content (speech-to-text).',
+      voiceLivenessScore: finalLivenessScore,
       spoofSignals,
       captureSource,
     },

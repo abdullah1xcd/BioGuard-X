@@ -68,16 +68,20 @@
         "modalities": { "type": "array" },
         "pipeline": { "type": "string", "minLength": 1, "maxLength": 64 },
         "outcome": { "type": "string", "enum": ["match", "no_match", "not_evaluated"] },
+        "finalDecision": { "type": "string", "enum": ["VERIFIED", "REJECTED", "INCONCLUSIVE"] },
         "policyDecision": { "type": "string", "enum": ["pending"] },
         "reasonCode": { "type": "string", "minLength": 1, "maxLength": 80 },
         "score": { "type": "number" },
         "riskScore": { "type": "number" },
         "riskLevel": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
         "livenessPassed": { "type": "boolean" },
+        "livenessStatus": { "type": "string", "enum": ["LIVENESS PASSED", "LIVENESS FAILED", "INCONCLUSIVE", "NOT SUPPORTED"] },
         "livenessScore": { "type": "number" },
         "adaptiveApplied": { "type": "boolean" },
         "groundTruth": { "type": "string", "enum": ["genuine", "impostor", "unlabeled"] },
+        "datasetCategory": { "type": "string", "enum": ["operational", "synthetic_qa", "benchmark_eval"] },
         "isTestProbe": { "type": "boolean" },
+        "captureFailure": { "type": "boolean" },
         "processingTimeMs": { "type": "number" },
         "confidence": { "type": "number" },
         "confidenceBand": { "type": "string", "enum": ["high", "moderate", "low"] },
@@ -89,10 +93,27 @@
         "faceQuality": { "type": "number" },
         "voiceQuality": { "type": "number" },
         "fingerprintQuality": { "type": "number" },
+        "faceStatus": { "type": "string", "enum": ["MATCH", "NO MATCH", "INCONCLUSIVE", "NOT EVALUATED"] },
+        "voiceStatus": { "type": "string", "enum": ["MATCH", "NO MATCH", "INCONCLUSIVE", "NOT EVALUATED"] },
+        "fingerprintStatus": { "type": "string", "enum": ["MATCH", "NO MATCH", "INCONCLUSIVE", "NOT EVALUATED"] },
+        "matchedMinutiae": { "type": "number" },
+        "probeMinutiae": { "type": "number" },
         "operatorUid": { "type": "string", "minLength": 1, "maxLength": 128 },
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["verificationId", "identityRef", "modalities", "outcome", "policyDecision", "reasonCode", "operatorUid", "createdAt"]
+    },
+    "RateLimitBucket": {
+      "title": "RateLimitBucket",
+      "description": "Persistent per-user monotonic rate-limit counter bucket",
+      "type": "object",
+      "properties": {
+        "bucketId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "windowStartMs": { "type": "number" },
+        "count": { "type": "integer" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["bucketId", "windowStartMs", "count", "updatedAt"]
     },
     "AuditLog": {
       "title": "AuditLog",
@@ -219,6 +240,10 @@
     "/users/{userId}/verification_records/{verificationId}": {
       "schema": { "$ref": "#/entities/VerificationRecord" },
       "description": "Per-account verification event metadata records"
+    },
+    "/users/{userId}/rate_limits/{bucketId}": {
+      "schema": { "$ref": "#/entities/RateLimitBucket" },
+      "description": "Per-account monotonic rate limit counters"
     },
     "/users/{userId}/audit_logs/{eventId}": {
       "schema": { "$ref": "#/entities/AuditLog" },

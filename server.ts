@@ -9,10 +9,11 @@ import {
   scoreVectorRefs,
   scoreFingerprintAgainstRefs,
   type FusionPolicy,
+  type LivenessStatus,
   type ModalityName,
   type ThresholdConfig,
 } from './src/shared/fusionEngine.ts';
-import type { FingerprintTemplate } from './src/shared/fingerprintEngine.ts';
+import type { FingerprintQualityLabel, FingerprintTemplate } from './src/shared/fingerprintEngine.ts';
 
 interface FirebaseConfig {
   projectId: string;
@@ -75,6 +76,8 @@ interface ModalityQualityInput {
     spoofRiskFlag?: boolean;
     isLiveCapture?: boolean;
     frameMotionScore?: number;
+    frameConsistencyCosine?: number;
+    multiFrameVerified?: boolean;
     antispoofScore?: number | null;
     livenessNetScore?: number | null;
     detectionConfidence?: number;
@@ -88,6 +91,7 @@ interface ModalityQualityInput {
   voice?: {
     durationSec?: number;
     activeSpeechSec?: number;
+    inputSampleRate?: number;
     meanRms?: number;
     meanZcr?: number;
     speechSegments?: number;
@@ -96,6 +100,7 @@ interface ModalityQualityInput {
     snrEstimateDb?: number;
     voiceQualityScore?: number;
     voiceLivenessScore?: number;
+    feedbackLabel?: string;
     spoofSignals?: string[];
     captureSource?: string;
   };
@@ -104,50 +109,108 @@ interface ModalityQualityInput {
     minutiaeHeuristicCount?: number;
     meanCoherence?: number;
     foregroundRatio?: number;
+    sharpness?: number;
+    meanWavelengthPx?: number;
     qualityScore?: number;
+    qualityLabel?: FingerprintQualityLabel;
+    templateStatus?: string;
     validPrint?: boolean;
     captureSource?: string;
   };
 }
 
-// AES-256-GCM encrypted biometric templates stored durably in Firestore.
-// Vercel function filesystems are ephemeral; never persist biometric templates on local disk.
-function getVaultKey(): Buffer {
-  const envSecret = process.env.BIOGUARD_VAULT_SECRET?.trim();
-  const effectiveSecret =
-    envSecret && envSecret.length >= 32
-      ? envSecret
-      : `${firebaseConfig.projectId}:${firebaseConfig.firestoreDatabaseId}:bioguard-aistudio-vault`;
-  return crypto.scryptSync(effectiveSecret, 'bioguard-x-salt-v1', 32);
+export class VaultSecretError extends Error {
+  status = 503;
+  code = 'vault_secret_not_configured';
+  constructor(message = 'BIOGUARD_VAULT_SECRET environment variable must be set to at least 32 characters.') {
+    super(message);
+    this.name = 'VaultSecretError';
+  }
 }
 
-export function encryptVaultMap(map: Record<string, VaultEntry>): string {
+export function isVaultSecretConfigured(): boolean {
+  return Boolean(process.env.BIOGUARD_VAULT_SECRET && process.env.BIOGUARD_VAULT_SECRET.trim().length >= 32);
+}
+
+function getVaultSecrets(overrideSecret?: string): { primary: string; previous: string | null } {
+  if (overrideSecret !== undefined) {
+    const clean = overrideSecret.trim();
+    if (clean.length < 32) {
+      throw new VaultSecretError('Provided vault secret must be at least 32 characters.');
+    }
+    return { primary: clean, previous: null };
+  }
+  const primary = process.env.BIOGUARD_VAULT_SECRET?.trim() || '';
+  if (primary.length < 32) {
+    throw new VaultSecretError();
+  }
+  const prevRaw = process.env.BIOGUARD_VAULT_SECRET_PREVIOUS?.trim() || '';
+  const previous = prevRaw.length >= 32 && prevRaw !== primary ? prevRaw : null;
+  return { primary, previous };
+}
+
+// AES-256-GCM encrypted biometric templates stored durably in Firestore.
+// v2 uses per-record 16-byte random salt + scryptSync and fails closed if BIOGUARD_VAULT_SECRET is unset.
+export function encryptVaultMap(map: Record<string, VaultEntry>, overrideSecret?: string): string {
+  const { primary } = getVaultSecrets(overrideSecret);
+  const salt = crypto.randomBytes(16);
+  const key = crypto.scryptSync(primary, salt, 32);
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', getVaultKey(), iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const plaintext = Buffer.from(JSON.stringify(map), 'utf8');
   const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
   return JSON.stringify({
+    v: 2,
+    kdf: 'scrypt',
     alg: 'aes-256-gcm',
+    salt: salt.toString('base64'),
     iv: iv.toString('base64'),
     tag: tag.toString('base64'),
     ciphertext: encrypted.toString('base64'),
   });
 }
 
-export function decryptVaultMap(raw: string): Record<string, VaultEntry> {
-  const parsed = JSON.parse(raw) as { iv: string; tag: string; ciphertext: string };
-  const decipher = crypto.createDecipheriv(
-    'aes-256-gcm',
-    getVaultKey(),
-    Buffer.from(parsed.iv, 'base64')
-  );
-  decipher.setAuthTag(Buffer.from(parsed.tag, 'base64'));
-  const dec = Buffer.concat([
-    decipher.update(Buffer.from(parsed.ciphertext, 'base64')),
-    decipher.final(),
-  ]);
-  return JSON.parse(dec.toString('utf8')) as Record<string, VaultEntry>;
+export function decryptVaultMapWithMeta(
+  raw: string,
+  overrideSecret?: string
+): { map: Record<string, VaultEntry>; version: number; rotatedFromPrevious: boolean; needsRotation: boolean } {
+  const { primary, previous } = getVaultSecrets(overrideSecret);
+  const parsed = JSON.parse(raw) as { v?: number; salt?: string; iv: string; tag: string; ciphertext: string };
+  const isV2 = parsed.v === 2 && typeof parsed.salt === 'string' && parsed.salt.length > 0;
+  const salt: Buffer | string = isV2 ? Buffer.from(parsed.salt!, 'base64') : 'bioguard-x-salt-v1';
+  const candidates = previous ? [primary, previous] : [primary];
+
+  let lastErr: unknown = null;
+  for (let i = 0; i < candidates.length; i++) {
+    try {
+      const key = crypto.scryptSync(candidates[i], salt, 32);
+      const decipher = crypto.createDecipheriv(
+        'aes-256-gcm',
+        key,
+        Buffer.from(parsed.iv, 'base64')
+      );
+      decipher.setAuthTag(Buffer.from(parsed.tag, 'base64'));
+      const dec = Buffer.concat([
+        decipher.update(Buffer.from(parsed.ciphertext, 'base64')),
+        decipher.final(),
+      ]);
+      const map = JSON.parse(dec.toString('utf8')) as Record<string, VaultEntry>;
+      return {
+        map,
+        version: isV2 ? 2 : 1,
+        rotatedFromPrevious: i > 0,
+        needsRotation: !isV2 || i > 0,
+      };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('Failed to decrypt biometric vault record.');
+}
+
+export function decryptVaultMap(raw: string, overrideSecret?: string): Record<string, VaultEntry> {
+  return decryptVaultMapWithMeta(raw, overrideSecret).map;
 }
 
 function firestoreDocUrl(docPath: string): string {
@@ -172,14 +235,18 @@ async function loadVaultEntry(uid: string, identityRef: string, idToken: string)
   return decrypted[identityRef] || null;
 }
 
-async function listVaultEntries(uid: string, idToken: string, maxDocs = 500): Promise<VaultEntry[]> {
-  const entries: VaultEntry[] = [];
+async function listVaultEntriesWithMeta(
+  uid: string,
+  idToken: string,
+  maxDocs = 500
+): Promise<Array<{ entry: VaultEntry; needsRotation: boolean }>> {
+  const results: Array<{ entry: VaultEntry; needsRotation: boolean }> = [];
   let pageToken = '';
   do {
     const qs = new URLSearchParams({ pageSize: '150' });
     if (pageToken) qs.set('pageToken', pageToken);
     const url = `${firestoreDocUrl(`users/${encodeURIComponent(uid)}/biometric_vault`)}?${qs.toString()}`;
-    const response = await fetch(url, { headers: { Authorization: `Bearer ${idToken}` } });
+    const response = await fetch(url, { headers: { Authorization: `Bearer ${idToken}` }, signal: AbortSignal.timeout(8000) });
     if (response.status === 404) break;
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
@@ -199,20 +266,23 @@ async function listVaultEntries(uid: string, idToken: string, maxDocs = 500): Pr
       const enc = d.fields?.encryptedPayload?.stringValue;
       if (!enc) continue;
       try {
-        const decrypted = decryptVaultMap(enc);
-        if (ref && decrypted[ref]) entries.push(decrypted[ref]);
-        else {
-          const first = Object.values(decrypted)[0];
-          if (first) entries.push(first);
-        }
-      } catch {
-        // Skip corrupt document rather than aborting 1:N search
+        const decMeta = decryptVaultMapWithMeta(enc);
+        const entry = (ref && decMeta.map[ref]) || Object.values(decMeta.map)[0];
+        if (entry) results.push({ entry, needsRotation: decMeta.needsRotation });
+      } catch (err) {
+        if (err instanceof VaultSecretError) throw err;
+        // Skip individually corrupt ciphertext document rather than blocking 1:N search
       }
-      if (entries.length >= maxDocs) break;
+      if (results.length >= maxDocs) break;
     }
     pageToken = payload.nextPageToken || '';
-  } while (pageToken && entries.length < maxDocs);
-  return entries;
+  } while (pageToken && results.length < maxDocs);
+  return results;
+}
+
+async function listVaultEntries(uid: string, idToken: string, maxDocs = 500): Promise<VaultEntry[]> {
+  const rows = await listVaultEntriesWithMeta(uid, idToken, maxDocs);
+  return rows.map((r) => r.entry);
 }
 
 async function saveVaultEntry(uid: string, entry: VaultEntry, idToken: string): Promise<void> {
@@ -309,14 +379,20 @@ function parseFingerprintSample(raw: unknown): { template: FingerprintTemplate |
     ) {
       return null;
     }
+    const rawNeighbors = Array.isArray(m.neighbors)
+      ? m.neighbors.filter((n): n is number => typeof n === 'number' && Number.isFinite(n)).slice(0, 4)
+      : undefined;
     minutiae.push({
       x: m.x,
       y: m.y,
       theta: m.theta,
       type: m.type as 'ending' | 'bifurcation',
       quality: typeof m.quality === 'number' && Number.isFinite(m.quality) ? m.quality : 0.7,
+      ...(rawNeighbors && rawNeighbors.length >= 2 ? { neighbors: rawNeighbors } : {}),
     });
   }
+  const qualityScore = typeof obj.qualityScore === 'number' ? obj.qualityScore : 70;
+  const validPrint = typeof obj.validPrint === 'boolean' ? obj.validPrint : minutiae.length >= 4;
   return {
     isLegacy: false,
     template: {
@@ -326,8 +402,14 @@ function parseFingerprintSample(raw: unknown): { template: FingerprintTemplate |
       ridgeDensity: typeof obj.ridgeDensity === 'number' ? obj.ridgeDensity : 40,
       meanCoherence: typeof obj.meanCoherence === 'number' ? obj.meanCoherence : 0.5,
       foregroundRatio: typeof obj.foregroundRatio === 'number' ? obj.foregroundRatio : 0.5,
-      qualityScore: typeof obj.qualityScore === 'number' ? obj.qualityScore : 70,
-      validPrint: typeof obj.validPrint === 'boolean' ? obj.validPrint : minutiae.length >= 4,
+      ...(typeof obj.sharpness === 'number' ? { sharpness: obj.sharpness } : {}),
+      ...(typeof obj.meanWavelengthPx === 'number' ? { meanWavelengthPx: obj.meanWavelengthPx } : {}),
+      qualityScore,
+      ...(typeof obj.qualityLabel === 'string' ? { qualityLabel: obj.qualityLabel as FingerprintQualityLabel } : {}),
+      ...(typeof obj.templateStatus === 'string'
+        ? { templateStatus: obj.templateStatus as 'Valid Minutiae Template' | 'Insufficient Features' }
+        : {}),
+      validPrint,
     },
   };
 }
@@ -408,16 +490,20 @@ function evaluateModalityQuality(
       if (typeof fpq.qualityScore === 'number') {
         qualityScores.fingerprint = Math.max(0, Math.min(100, Math.round(fpq.qualityScore)));
       }
-      if (!isSynthetic && fpq.validPrint === false) {
+      if (!isSynthetic && fpq.qualityLabel === 'Image Too Blurry') {
+        errors.push(`Image Too Blurry: Fingerprint sharpness (${fpq.sharpness ?? 'low'}) is insufficient for reliable ridge extraction.`);
+      } else if (!isSynthetic && fpq.qualityLabel === 'Insufficient Ridge Details') {
+        errors.push(`Insufficient Ridge Details: Only ${fpq.minutiaeHeuristicCount ?? 0} valid minutiae extracted.`);
+      } else if (!isSynthetic && fpq.validPrint === false) {
         errors.push(
-          `Fingerprint rejected: invalid ridge clarity (coherence=${fpq.meanCoherence ?? 'low'}, density=${fpq.ridgeDensity ?? '—'}%, minutiae=${fpq.minutiaeHeuristicCount ?? 0}).`
+          `${fpq.qualityLabel || 'Poor Quality'}: Fingerprint failed ridge validation (coherence=${fpq.meanCoherence ?? 'low'}, density=${fpq.ridgeDensity ?? '—'}%, minutiae=${fpq.minutiaeHeuristicCount ?? 0}).`
         );
       } else if (typeof fpq.ridgeDensity === 'number' && (fpq.ridgeDensity < 6 || fpq.ridgeDensity > 94)) {
-        errors.push(`Fingerprint rejected: abnormal ridge density (${fpq.ridgeDensity}%).`);
+        errors.push(`Insufficient Ridge Details: abnormal ridge density (${fpq.ridgeDensity}%).`);
       } else if (typeof fpq.minutiaeHeuristicCount === 'number' && fpq.minutiaeHeuristicCount < 4) {
-        errors.push('Fingerprint rejected: insufficient ridge/minutiae structure detected (<4 minutiae).');
+        errors.push('Insufficient Ridge Details: fewer than 4 reliable minutiae detected.');
       } else {
-        checks.fingerprint = `Gabor+Thinning quality passed (${fpq.minutiaeHeuristicCount ?? 'OK'} minutiae, ${qualityScores.fingerprint}/100)`;
+        checks.fingerprint = `Adaptive Gabor+ZhangSuen quality passed (${fpq.qualityLabel || 'Good Quality'}, ${fpq.minutiaeHeuristicCount ?? 'OK'} minutiae, ${qualityScores.fingerprint}/100)`;
       }
     } else {
       checks.fingerprint = 'Fingerprint template integrity verified';
@@ -427,84 +513,131 @@ function evaluateModalityQuality(
   return { ok: errors.length === 0, errors, warnings, checks, qualityScores };
 }
 
-// Liveness & Anti-Spoofing Evaluator
+// Honest 4-state Liveness & Anti-Spoofing Evaluator
+// Never falsely reports LIVENESS PASSED on static uploads or browser fingerprint images without hardware PAD sensors.
 function evaluateLiveness(
   modalities: { face: boolean; voice: boolean; fingerprint: boolean },
   quality: ModalityQualityInput | undefined
-): { passed: boolean; score: number; spoofSignals: string[]; checks: string[] } {
-  let score = 0.88;
+): {
+  passed: boolean;
+  status: LivenessStatus;
+  score: number;
+  perModality: Record<string, LivenessStatus>;
+  spoofSignals: string[];
+  checks: string[];
+} {
+  let score = 0.78;
   const spoofSignals: string[] = [];
   const checks: string[] = [];
+  const perModality: Record<string, LivenessStatus> = {};
 
-  if (modalities.face && quality?.face) {
-    const fq = quality.face;
-    const isSynthetic = fq.captureSource === 'test_sample' || fq.captureSource === 'test_impostor';
-    if (isSynthetic) {
-      checks.push('Synthetic QA probe — camera liveness bypassed for deterministic pipeline evaluation');
+  if (modalities.face) {
+    const fq = quality?.face;
+    const isSynthetic = fq?.captureSource === 'test_sample' || fq?.captureSource === 'test_impostor';
+    if (!fq) {
+      perModality.face = 'INCONCLUSIVE';
+      checks.push('Face liveness: INCONCLUSIVE (no telemetry supplied)');
+    } else if (isSynthetic) {
+      perModality.face = 'NOT SUPPORTED';
+      checks.push('Synthetic QA probe — physical camera liveness NOT SUPPORTED');
     } else {
-      if (fq.isLiveCapture && typeof fq.frameMotionScore === 'number') {
-        if (fq.frameMotionScore >= 0.008) {
-          score = Math.min(0.98, score + 0.06);
-          checks.push(`Live webcam motion verified (delta=${fq.frameMotionScore})`);
-        } else {
-          score -= 0.36;
-          spoofSignals.push(`Static webcam feed detected (motion=${fq.frameMotionScore}; possible photo/screen spoof)`);
-        }
-      } else {
-        checks.push('Static upload screened for texture/anti-spoof cues');
+      let faceFailed = false;
+      if (typeof fq.antispoofScore === 'number' && fq.antispoofScore < 0.45) {
+        score -= 0.40;
+        faceFailed = true;
+        spoofSignals.push(`Neural anti-spoof rejected frame (score=${fq.antispoofScore})`);
       }
-      if (typeof fq.antispoofScore === 'number') {
-        if (fq.antispoofScore >= 0.5) {
-          checks.push(`Neural anti-spoof confidence ${(fq.antispoofScore * 100).toFixed(0)}%`);
-        } else {
-          score -= 0.38;
-          spoofSignals.push(`Neural anti-spoof rejected frame (score=${fq.antispoofScore})`);
-        }
-      }
-      if (typeof fq.livenessNetScore === 'number' && fq.livenessNetScore < 0.38) {
+      if (typeof fq.livenessNetScore === 'number' && fq.livenessNetScore < 0.35) {
         score -= 0.25;
+        faceFailed = true;
         spoofSignals.push(`Face liveness network low confidence (${fq.livenessNetScore})`);
       }
       if (fq.spoofRiskFlag && (typeof fq.antispoofScore !== 'number' || fq.antispoofScore < 0.5)) {
-        score -= 0.32;
+        score -= 0.30;
+        faceFailed = true;
         spoofSignals.push('Low facial high-frequency detail (possible printed photo or screen replay)');
       }
-    }
-  }
 
-  if (modalities.voice && quality?.voice) {
-    const vq = quality.voice;
-    const isSynthetic = vq.captureSource === 'test_sample' || vq.captureSource === 'test_impostor';
-    if (!isSynthetic) {
-      if (typeof vq.clippingRatio === 'number' && vq.clippingRatio > 0.12) {
-        score -= 0.34;
-        spoofSignals.push(`Audio clipping (${(vq.clippingRatio * 100).toFixed(1)}%) indicates possible speaker replay`);
-      } else if (typeof vq.dynamicRangeDb === 'number' && vq.dynamicRangeDb < 6) {
-        score -= 0.30;
-        spoofSignals.push(`Low acoustic dynamic range (${vq.dynamicRangeDb} dB)`);
-      } else if (Array.isArray(vq.spoofSignals) && vq.spoofSignals.length > 0) {
-        score -= 0.28;
-        spoofSignals.push(...vq.spoofSignals);
+      if (fq.isLiveCapture) {
+        const motionOk = typeof fq.frameMotionScore === 'number' && fq.frameMotionScore >= 0.005;
+        if (!motionOk) {
+          score -= 0.36;
+          faceFailed = true;
+          spoofSignals.push(`Static webcam feed detected (motion=${fq.frameMotionScore ?? 0}; possible photo/screen spoof)`);
+        }
+        if (faceFailed) {
+          perModality.face = 'LIVENESS FAILED';
+        } else {
+          score = Math.min(0.98, Math.max(score, 0.86) + 0.08);
+          perModality.face = 'LIVENESS PASSED';
+          checks.push(`Live multi-frame motion verified (delta=${fq.frameMotionScore}${typeof fq.antispoofScore === 'number' ? `, neural=${Math.round(fq.antispoofScore * 100)}%` : ''})`);
+        }
       } else {
-        checks.push(`Voice anti-spoofing passed (DR=${vq.dynamicRangeDb ?? '—'}dB, SNR=${vq.snrEstimateDb ?? '—'}dB)`);
+        perModality.face = faceFailed ? 'LIVENESS FAILED' : 'INCONCLUSIVE';
+        if (!faceFailed) {
+          score = Math.min(score, 0.68);
+          checks.push('Static image upload: active liveness challenge INCONCLUSIVE (pass-through texture screening only)');
+        }
       }
     }
   }
 
-  if (modalities.fingerprint && quality?.fingerprint) {
-    const fpq = quality.fingerprint;
-    if (fpq.validPrint === false && fpq.captureSource !== 'test_sample') {
-      score -= 0.40;
+  if (modalities.voice) {
+    const vq = quality?.voice;
+    const isSynthetic = vq?.captureSource === 'test_sample' || vq?.captureSource === 'test_impostor';
+    if (!vq) {
+      perModality.voice = 'INCONCLUSIVE';
+      checks.push('Voice liveness: INCONCLUSIVE (no acoustic telemetry)');
+    } else if (isSynthetic) {
+      perModality.voice = 'NOT SUPPORTED';
+    } else if (typeof vq.clippingRatio === 'number' && vq.clippingRatio > 0.12) {
+      score -= 0.34;
+      perModality.voice = 'LIVENESS FAILED';
+      spoofSignals.push(`Audio clipping (${(vq.clippingRatio * 100).toFixed(1)}%) indicates possible speaker replay`);
+    } else if (typeof vq.dynamicRangeDb === 'number' && vq.dynamicRangeDb < 6) {
+      score -= 0.30;
+      perModality.voice = 'LIVENESS FAILED';
+      spoofSignals.push(`Low acoustic dynamic range (${vq.dynamicRangeDb} dB)`);
+    } else if (Array.isArray(vq.spoofSignals) && vq.spoofSignals.length > 0) {
+      score -= 0.28;
+      perModality.voice = 'LIVENESS FAILED';
+      spoofSignals.push(...vq.spoofSignals);
+    } else {
+      perModality.voice = 'INCONCLUSIVE';
+      checks.push(`Voice spectral replay check clean (DR=${vq.dynamicRangeDb ?? '—'}dB, SNR=${vq.snrEstimateDb ?? '—'}dB); randomized passphrase challenge not enforced (INCONCLUSIVE)`);
+    }
+  }
+
+  if (modalities.fingerprint) {
+    const fpq = quality?.fingerprint;
+    if (fpq && fpq.validPrint === false && fpq.captureSource !== 'test_sample') {
+      score -= 0.38;
+      perModality.fingerprint = 'LIVENESS FAILED';
       spoofSignals.push('Fingerprint ridge coherence/structure outside natural bounds');
     } else {
-      checks.push(`Fingerprint ridge continuity verified (coherence=${fpq.meanCoherence ?? 'OK'})`);
+      perModality.fingerprint = 'NOT SUPPORTED';
+      checks.push('Fingerprint hardware PAD / live sweat-pore liveness sensor NOT SUPPORTED in browser upload mode');
     }
+  }
+
+  const vals = Object.values(perModality);
+  let status: LivenessStatus = 'INCONCLUSIVE';
+  if (vals.includes('LIVENESS FAILED') || spoofSignals.length > 0) {
+    status = 'LIVENESS FAILED';
+  } else if (perModality.face === 'LIVENESS PASSED') {
+    status = 'LIVENESS PASSED';
+  } else if (vals.length > 0 && vals.every((v) => v === 'NOT SUPPORTED')) {
+    status = 'NOT SUPPORTED';
+  } else {
+    status = 'INCONCLUSIVE';
   }
 
   const clamped = Number(Math.max(0.05, Math.min(0.99, score)).toFixed(2));
   return {
-    passed: clamped >= 0.50 && spoofSignals.length === 0,
+    passed: status !== 'LIVENESS FAILED' && clamped >= 0.45,
+    status,
     score: clamped,
+    perModality,
     spoofSignals,
     checks,
   };
@@ -593,20 +726,42 @@ async function fetchUserFirestoreRole(
   try {
     const res = await fetch(firestoreDocUrl(`users/${encodeURIComponent(uid)}`), {
       headers: { Authorization: `Bearer ${idToken}` },
+      signal: AbortSignal.timeout(5000),
     });
-    if (!res.ok) return { role: 'operator', status: 'active' };
+    if (res.status === 404) {
+      // New or unprovisioned user defaults fail-closed to read-only viewer until profile creation
+      return { role: 'viewer', status: 'active' };
+    }
+    if (!res.ok) {
+      const err = new Error(`Authorization service returned ${res.status}.`) as Error & { status?: number; code?: string };
+      err.status = 503;
+      err.code = 'authorization_unavailable';
+      throw err;
+    }
     const docJson = (await res.json()) as {
       fields?: {
         role?: { stringValue?: string };
         status?: { stringValue?: string };
       };
     };
-    const rawRole = docJson.fields?.role?.stringValue as Role | undefined;
+    const rawRole = docJson.fields?.role?.stringValue;
     const rawStatus = docJson.fields?.status?.stringValue || 'active';
-    const validRole: Role = rawRole && rawRole in ROLE_CAPABILITIES ? rawRole : 'operator';
+    if (rawRole && !(rawRole in ROLE_CAPABILITIES)) {
+      const err = new Error(`Unrecognized account role "${rawRole}".`) as Error & { status?: number; code?: string };
+      err.status = 403;
+      err.code = 'invalid_role_record';
+      throw err;
+    }
+    const validRole: Role = (rawRole as Role) || 'viewer';
     return { role: validRole, status: rawStatus };
-  } catch {
-    return { role: 'operator', status: 'active' };
+  } catch (err) {
+    if (err instanceof Error && typeof (err as Error & { status?: number }).status === 'number') {
+      throw err;
+    }
+    const unavailable = new Error('Unable to verify RBAC authorization against Firestore.') as Error & { status?: number; code?: string };
+    unavailable.status = 503;
+    unavailable.code = 'authorization_unavailable';
+    throw unavailable;
   }
 }
 
@@ -623,21 +778,143 @@ interface AuthedRequest extends Request {
 }
 
 const rateBuckets = new Map<string, number[]>();
-function rateLimit(maxRequests: number, windowMs: number) {
-  return (req: AuthedRequest, res: Response, next: NextFunction) => {
-    const key = `${req.path}:${req.auth?.uid || req.ip || 'anon'}`;
-    const now = Date.now();
-    const hits = (rateBuckets.get(key) || []).filter((t) => now - t < windowMs);
-    if (hits.length >= maxRequests) {
-      res.status(429).json({
-        error: 'rate_limit_exceeded',
-        message: 'Too many requests in the current window. Please wait briefly and retry.',
+let activeRateLimitMode: 'upstash_redis' | 'firestore_persistent' | 'degraded_local_fallback' =
+  process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
+    ? 'upstash_redis'
+    : 'firestore_persistent';
+
+function checkLocalRateLimit(key: string, maxRequests: number, windowMs: number): boolean {
+  const now = Date.now();
+  const hits = (rateBuckets.get(key) || []).filter((t) => now - t < windowMs);
+  if (hits.length >= maxRequests) return false;
+  hits.push(now);
+  rateBuckets.set(key, hits);
+  return true;
+}
+
+async function consumePersistentRateLimit(
+  bucketName: string,
+  maxRequests: number,
+  windowMs: number,
+  uid: string | undefined,
+  idToken: string | undefined,
+  ip: string
+): Promise<{ allowed: boolean; mode: typeof activeRateLimitMode }> {
+  const upstashUrl = process.env.UPSTASH_REDIS_REST_URL?.trim();
+  const upstashToken = process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
+
+  if (upstashUrl && upstashToken) {
+    try {
+      const redisKey = `bgx:rl:${bucketName}:${uid || ip}`;
+      const r = await fetch(`${upstashUrl.replace(/\/$/, '')}/pipeline`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${upstashToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify([
+          ['INCR', redisKey],
+          ['PEXPIRE', redisKey, windowMs, 'NX'],
+        ]),
+        signal: AbortSignal.timeout(2500),
       });
-      return;
+      if (r.ok) {
+        const arr = (await r.json()) as Array<{ result?: number }>;
+        const count = Number(arr?.[0]?.result ?? 1);
+        activeRateLimitMode = 'upstash_redis';
+        return { allowed: count <= maxRequests, mode: 'upstash_redis' };
+      }
+    } catch {
+      // Fall through cleanly to Firestore or local fallback
     }
-    hits.push(now);
-    rateBuckets.set(key, hits);
-    next();
+  }
+
+  if (uid && idToken) {
+    try {
+      const safeBucket = bucketName.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48);
+      const docUrl = firestoreDocUrl(`users/${encodeURIComponent(uid)}/rate_limits/${encodeURIComponent(safeBucket)}`);
+      const now = Date.now();
+      const alignedWindowStart = Math.floor(now / windowMs) * windowMs;
+      const getRes = await fetch(docUrl, {
+        headers: { Authorization: `Bearer ${idToken}` },
+        signal: AbortSignal.timeout(3000),
+      });
+      if (getRes.status === 404) {
+        const createRes = await fetch(`${docUrl}?currentDocument.exists=false`, {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fields: {
+              bucketId: { stringValue: safeBucket },
+              uid: { stringValue: uid },
+              windowStartMs: { integerValue: String(alignedWindowStart) },
+              count: { integerValue: '1' },
+              updatedAt: { timestampValue: new Date(now).toISOString() },
+            },
+          }),
+          signal: AbortSignal.timeout(3000),
+        });
+        if (createRes.ok) {
+          activeRateLimitMode = 'firestore_persistent';
+          return { allowed: true, mode: 'firestore_persistent' };
+        }
+      } else if (getRes.ok) {
+        const payload = (await getRes.json()) as {
+          fields?: { windowStartMs?: { integerValue?: string }; count?: { integerValue?: string } };
+        };
+        const prevWindow = Number(payload.fields?.windowStartMs?.integerValue || 0);
+        const prevCount = Number(payload.fields?.count?.integerValue || 0);
+        const sameWindow = prevWindow >= alignedWindowStart && now - prevWindow < windowMs;
+        if (sameWindow && prevCount >= maxRequests) {
+          activeRateLimitMode = 'firestore_persistent';
+          return { allowed: false, mode: 'firestore_persistent' };
+        }
+        const nextCount = sameWindow ? prevCount + 1 : 1;
+        const nextWindow = sameWindow ? prevWindow : alignedWindowStart;
+        const patchRes = await fetch(docUrl, {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fields: {
+              bucketId: { stringValue: safeBucket },
+              uid: { stringValue: uid },
+              windowStartMs: { integerValue: String(nextWindow) },
+              count: { integerValue: String(nextCount) },
+              updatedAt: { timestampValue: new Date(now).toISOString() },
+            },
+          }),
+          signal: AbortSignal.timeout(3000),
+        });
+        if (patchRes.ok) {
+          activeRateLimitMode = 'firestore_persistent';
+          return { allowed: true, mode: 'firestore_persistent' };
+        }
+      }
+    } catch {
+      // Fall back safely to local rate bucket without breaking authenticated requests on transient blip
+    }
+  }
+
+  activeRateLimitMode = 'degraded_local_fallback';
+  const allowed = checkLocalRateLimit(`${bucketName}:${uid || ip}`, maxRequests, windowMs);
+  return { allowed, mode: 'degraded_local_fallback' };
+}
+
+function rateLimit(maxRequests: number, windowMs: number, bucketName?: string) {
+  return (req: AuthedRequest, res: Response, next: NextFunction) => {
+    const name = bucketName || req.path.replace(/[^a-zA-Z0-9_-]/g, '_');
+    void consumePersistentRateLimit(name, maxRequests, windowMs, req.auth?.uid, req.auth?.idToken, req.ip || 'anon')
+      .then((result) => {
+        if (!result.allowed) {
+          res.status(429).json({
+            error: 'rate_limit_exceeded',
+            message: 'Too many requests in the current window. Please wait briefly and retry.',
+          });
+          return;
+        }
+        next();
+      })
+      .catch(next);
   };
 }
 
@@ -659,6 +936,7 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ idToken }),
+        signal: AbortSignal.timeout(6000),
       }
     );
     if (!lookup.ok) throw new Error('Firebase rejected the ID token.');
@@ -672,6 +950,13 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
       email: firebaseUser.email,
       email_verified: firebaseUser.emailVerified === true,
     };
+    if (!decoded.email_verified) {
+      res.status(403).json({
+        error: 'email_not_verified',
+        message: 'A verified Google/Firebase email address is required to access BioGuard X.',
+      });
+      return;
+    }
     const { role, status } = await fetchUserFirestoreRole(
       decoded.uid,
       decoded.email,
@@ -693,8 +978,16 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
     };
     next();
   } catch (err) {
+    const status = typeof (err as Error & { status?: number })?.status === 'number'
+      ? (err as Error & { status: number }).status
+      : 401;
+    const code = typeof (err as Error & { code?: string })?.code === 'string'
+      ? (err as Error & { code: string }).code
+      : status === 503
+      ? 'authorization_unavailable'
+      : 'invalid_credentials';
     const message = err instanceof Error ? err.message : 'Token verification failed.';
-    res.status(401).json({ error: 'invalid_credentials', message });
+    res.status(status).json({ error: code, message });
   }
 }
 
@@ -733,6 +1026,7 @@ function parseThresholds(raw: Record<string, number> | undefined): ThresholdConf
 }
 
 export const app = express();
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '2mb' }));
 
 const asyncHandler = (
@@ -749,7 +1043,7 @@ if (process.env.VERCEL === '1') {
 
 // 1. Health Endpoint
 app.get('/api/v1/health', (_req: Request, res: Response) => {
-  const envVaultConfigured = Boolean(process.env.BIOGUARD_VAULT_SECRET && process.env.BIOGUARD_VAULT_SECRET.trim().length >= 32);
+  const envVaultConfigured = isVaultSecretConfigured();
   res.status(200).json({
     status: 'ok',
     service: 'bioguard-x-api',
@@ -758,10 +1052,11 @@ app.get('/api/v1/health', (_req: Request, res: Response) => {
     models: {
       face: 'BlazeFace+FaceMesh+FaceRes-1024D+AntiSpoof',
       voice: '16kHz-CMVN-MFCC20+Delta+F0-96D (Classical DSP)',
-      fingerprint: 'Gabor+ZhangSuen+Minutiae-RANSAC',
+      fingerprint: 'AdaptiveGabor+ZhangSuen+2NN-RANSAC',
     },
-    vault_ready: true,
-    vault_mode: envVaultConfigured ? 'env_secret' : 'runtime_fallback',
+    vault_ready: envVaultConfigured,
+    vault_mode: envVaultConfigured ? 'env_secret_v2' : 'not_configured',
+    rate_limit_mode: activeRateLimitMode,
     storage: 'firestore-encrypted-templates',
     firebase_project: firebaseConfig.projectId,
     firestore_database: firebaseConfig.firestoreDatabaseId,
@@ -769,6 +1064,109 @@ app.get('/api/v1/health', (_req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
   });
 });
+
+// 1b. Live System Health & Model Diagnostics Endpoint (Zero secrets exposed)
+app.get(
+  '/api/v1/diagnostics',
+  requireAuth,
+  rateLimit(30, 60_000, 'diagnostics'),
+  asyncHandler(async (req: AuthedRequest, res: Response) => {
+    const t0 = performance.now();
+    const envVaultConfigured = isVaultSecretConfigured();
+    const geminiConfigured = Boolean(process.env.GEMINI_API_KEY);
+
+    let firestoreStatus: 'OPERATIONAL' | 'DEGRADED' | 'OFFLINE' = 'OFFLINE';
+    let firestoreLatencyMs: number | null = null;
+    try {
+      const f0 = performance.now();
+      const fRes = await fetch(firestoreDocUrl(`users/${encodeURIComponent(req.auth!.uid)}`), {
+        headers: { Authorization: `Bearer ${req.auth!.idToken}` },
+        signal: AbortSignal.timeout(4000),
+      });
+      firestoreLatencyMs = Number((performance.now() - f0).toFixed(1));
+      firestoreStatus = fRes.ok || fRes.status === 404 ? 'OPERATIONAL' : fRes.status === 403 ? 'DEGRADED' : 'OFFLINE';
+    } catch {
+      firestoreStatus = 'OFFLINE';
+    }
+
+    let vaultNeedsRotation = 0;
+    let vaultEntriesCount = 0;
+    if (envVaultConfigured && firestoreStatus === 'OPERATIONAL') {
+      try {
+        const metaRows = await listVaultEntriesWithMeta(req.auth!.uid, req.auth!.idToken, 100);
+        vaultEntriesCount = metaRows.length;
+        vaultNeedsRotation = metaRows.filter((r) => r.needsRotation).length;
+      } catch {
+        // Non-fatal in diagnostics
+      }
+    }
+
+    res.json({
+      status: 'ok',
+      checkedAt: new Date().toISOString(),
+      latencyMs: Number((performance.now() - t0).toFixed(1)),
+      components: {
+        biometricApi: { status: 'OPERATIONAL', detail: `Express API (${FEATURE_VERSION})` },
+        firebaseAuth: { status: 'OPERATIONAL', detail: `Verified session (${req.auth!.role})` },
+        cloudFirestore: {
+          status: firestoreStatus,
+          detail: firestoreLatencyMs !== null ? `Reachable (${firestoreLatencyMs} ms)` : 'Unreachable',
+        },
+        vaultStorage: {
+          status: envVaultConfigured ? 'OPERATIONAL' : 'NOT CONFIGURED',
+          detail: envVaultConfigured
+            ? `AES-256-GCM v2 active (${vaultEntriesCount} record(s), ${vaultNeedsRotation} legacy/rotated)`
+            : 'BIOGUARD_VAULT_SECRET (>=32 chars) not configured',
+          needsRotationCount: vaultNeedsRotation,
+        },
+        rateLimiter: {
+          status: activeRateLimitMode === 'degraded_local_fallback' ? 'DEGRADED' : 'OPERATIONAL',
+          mode: activeRateLimitMode,
+          detail:
+            activeRateLimitMode === 'upstash_redis'
+              ? 'Upstash Redis REST persistent limiter'
+              : activeRateLimitMode === 'firestore_persistent'
+              ? 'Firestore monotonic persistent limiter'
+              : 'In-memory local fallback active',
+        },
+        aiAnalyst: {
+          status: geminiConfigured ? 'OPERATIONAL' : 'NOT CONFIGURED',
+          detail: geminiConfigured ? 'Gemini server-side endpoint ready' : 'GEMINI_API_KEY not set',
+        },
+        models: {
+          face: { status: 'OPERATIONAL', detail: 'Client BlazeFace + FaceMesh + HSE-FaceRes 1024-D + AntiSpoof' },
+          voice: { status: 'OPERATIONAL', detail: '16kHz CMVN 20-MFCC + Delta + Delta-Delta + F0 96-D' },
+          fingerprint: { status: 'OPERATIONAL', detail: 'Adaptive Gabor + Zhang-Suen Thinning + 2NN-RANSAC' },
+        },
+      },
+    });
+  })
+);
+
+// 1c. Vault Key / v2 Encryption Migration Endpoint
+app.post(
+  '/api/v1/vault/rotate',
+  requireAuth,
+  requireCapability('manage_roles'),
+  rateLimit(5, 60_000, 'vault_rotate'),
+  asyncHandler(async (req: AuthedRequest, res: Response) => {
+    const force = Boolean((req.body as { force?: boolean } | undefined)?.force);
+    const entries = await listVaultEntriesWithMeta(req.auth!.uid, req.auth!.idToken, 500);
+    let rotatedCount = 0;
+    for (const item of entries) {
+      if (force || item.needsRotation) {
+        await saveVaultEntry(req.auth!.uid, item.entry, req.auth!.idToken);
+        rotatedCount++;
+      }
+    }
+    res.json({
+      status: 'ok',
+      rotatedCount,
+      totalEntries: entries.length,
+      vaultVersion: 2,
+    });
+  })
+);
 
 // 2. Authenticated Session Introspection
 app.get('/api/v1/auth/me', requireAuth, (req: AuthedRequest, res: Response) => {
@@ -1038,8 +1436,10 @@ app.post(
       }
     }
 
+    const thr = parseThresholds(body.thresholds);
+
     if (fpParsed && refsFp.length > 0) {
-      const scored = scoreFingerprintAgainstRefs(fpParsed.template, refsFp);
+      const scored = scoreFingerprintAgainstRefs(fpParsed.template, refsFp, thr.fingerprint);
       if (scored.details?.incompatibleTemplate) {
         versionMismatches.push('fingerprint (minutiae template vs legacy 130-D enrolled vector)');
       } else {
@@ -1047,6 +1447,8 @@ app.post(
         available.fingerprint = {
           score: scored.score,
           qualityScore: qualityReport.qualityScores.fingerprint,
+          inconclusive: scored.decision === 'INCONCLUSIVE',
+          decision: scored.decision,
           details: scored.details,
         };
       }
@@ -1068,13 +1470,13 @@ app.post(
       body.quality
     );
 
-    const thr = parseThresholds(body.thresholds);
     const fusion = fuseMultimodalScores({
       pipeline,
       fusionPolicy,
       thresholds: thr,
       available,
       livenessPassed: liveness.passed,
+      livenessStatus: liveness.status,
       livenessScore: liveness.score,
     });
 
@@ -1083,6 +1485,7 @@ app.post(
         error: fusion.reasonCode,
         message: fusion.rejectionReasons[0] || 'Required modality samples and enrolled templates are missing.',
         outcome: 'not_evaluated',
+        finalDecision: 'INCONCLUSIVE',
         policy_decision: 'pending',
         requestId,
       });
@@ -1103,6 +1506,7 @@ app.post(
 
     const isSingleModality = ['face', 'face_only', 'voice', 'voice_only', 'fingerprint', 'fingerprint_only'].includes(pipeline);
     let outcome = fusion.outcome;
+    let finalDecision = fusion.finalDecision;
     let reasonCode = fusion.reasonCode;
     let effectiveThreshold = fusion.baseThreshold;
     let adaptiveApplied = false;
@@ -1113,6 +1517,7 @@ app.post(
       adaptiveApplied = true;
       if (isSingleModality && enrolledCount >= 2) {
         outcome = 'not_evaluated';
+        finalDecision = 'INCONCLUSIVE';
         reasonCode = 'adaptive_mfa_escalation_required';
         adaptiveReason = `Risk score ${risk.riskScore}/100 requires multimodal verification instead of single-factor.`;
         rejectionReasons.push(adaptiveReason);
@@ -1121,17 +1526,19 @@ app.post(
         adaptiveReason = `Threshold tightened by +0.05 (from ${fusion.baseThreshold} to ${effectiveThreshold}) due to ${risk.riskLevel} risk.`;
         if (outcome === 'match' && fusion.finalScore < effectiveThreshold) {
           outcome = 'no_match';
+          finalDecision = 'REJECTED';
           reasonCode = 'adaptive_threshold_not_met';
           rejectionReasons.push(adaptiveReason);
         }
       }
     }
 
-    recordRiskEvent(req.auth!.uid, identityRef, outcome, !liveness.passed);
+    recordRiskEvent(req.auth!.uid, identityRef, outcome, liveness.status === 'LIVENESS FAILED');
     const processingTimeMs = Number((performance.now() - t0).toFixed(1));
 
     const details: Record<string, unknown> = {
       stage: fusion.stage,
+      fusionExplanation: fusion.fusionExplanation,
       modalityEvaluations: fusion.modalityEvaluations,
       qualityChecks: qualityReport.checks,
       qualityWarnings: qualityReport.warnings,
@@ -1164,6 +1571,9 @@ app.post(
       modalitiesEvaluated: fusion.modalitiesEvaluated,
       modalityEvaluations: fusion.modalityEvaluations,
       outcome,
+      finalDecision,
+      livenessStatus: liveness.status,
+      fusionExplanation: adaptiveReason ? `${fusion.fusionExplanation} ${adaptiveReason}` : fusion.fusionExplanation,
       policy_decision: 'pending',
       reasonCode,
       score: fusion.finalScore,
@@ -1252,7 +1662,7 @@ function compareEntriesServer(
   const fpB = entryB.modalities.fingerprint || [];
   if (fpA.length > 0 && fpB.length > 0) {
     const latestA = fpA[fpA.length - 1];
-    const scored = scoreFingerprintAgainstRefs(latestA, fpB);
+    const scored = scoreFingerprintAgainstRefs(latestA, fpB, thresholds.fingerprint);
     if (scored.details?.incompatibleTemplate) {
       incompatibleModalities.push('fingerprint (minutiae template vs legacy 130-D vector)');
     } else {
@@ -1260,6 +1670,8 @@ function compareEntriesServer(
       available.fingerprint = {
         score: scored.score,
         qualityScore: !Array.isArray(latestA) ? latestA.qualityScore : 75,
+        inconclusive: scored.decision === 'INCONCLUSIVE',
+        decision: scored.decision,
         details: scored.details,
       };
     }
@@ -1665,9 +2077,12 @@ app.post(
       '1. NEVER present AI-generated analysis or a single similarity score as guaranteed proof of identity.',
       '2. NEVER invent accuracy percentages, verification outcomes, EER/FAR/FRR figures, or unseen incidents.',
       '3. Distinguish strictly between: (a) Model Similarity Score, (b) Verification Confidence, (c) Measured Classification Accuracy (ground-truth labeled trials only), and (d) Operational Verification Success Rate.',
-      '4. Explicitly highlight insufficient sample counts, modality conflicts, spoof/liveness triggers, or low signal quality when present in the context.',
+      '4. Explicitly highlight insufficient sample counts, modality conflicts, spoof/liveness triggers, inconclusive states, or low signal quality when present in the context.',
       '5. NEVER grant/deny physical access or override RBAC authorization.',
-      '6. Provide concise, structured findings with concrete next steps (e.g., secondary factor escalation, threshold calibration, identity re-enrollment, or security alert triage).',
+      '6. Format EVERY response using these exact 3 markdown sections:',
+      '   ## Observed Facts & Telemetry',
+      '   ## AI-Generated Hypotheses & Risk Assessment',
+      '   ## Recommended Next Steps',
     ].join('\n');
 
     const safeContext = JSON.stringify(body.context || {}).slice(0, 9500);
@@ -1715,10 +2130,23 @@ app.post(
 );
 
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-  console.error('BioGuard X API request failed:', err);
-  res.status(503).json({
-    error: 'backend_unavailable',
-    message: 'The backend could not complete this request. Check the Vercel function and Firestore configuration.',
+  const errObj = err as Error & { status?: number; code?: string };
+  if (err instanceof VaultSecretError || errObj?.code === 'vault_secret_not_configured') {
+    res.status(503).json({
+      error: 'vault_secret_not_configured',
+      message: 'BIOGUARD_VAULT_SECRET (>=32 chars) is not configured on the server.',
+    });
+    return;
+  }
+  const status = typeof errObj?.status === 'number' && errObj.status >= 400 && errObj.status < 600 ? errObj.status : 503;
+  const code = typeof errObj?.code === 'string' ? errObj.code : 'backend_unavailable';
+  console.error(`BioGuard X API request failed (${status} ${code}):`, errObj?.message || 'Unknown error');
+  res.status(status).json({
+    error: code,
+    message:
+      status === 503
+        ? 'The backend could not complete this request. Check the Vercel function, vault secret, and Firestore configuration.'
+        : errObj?.message || 'Request failed.',
   });
 });
 

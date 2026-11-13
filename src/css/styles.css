@@ -1430,6 +1430,176 @@ html.light .btn-primary {
   .popover-panel { width: min(320px, calc(100vw - 24px)); right: -8px; }
 }
 
+/* 5-Step Guided Enrollment Stepper */
+.enroll-stepper {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+}
+
+.step-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  min-height: 38px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background-color var(--transition-fast), color var(--transition-fast);
+}
+
+.step-pill:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.step-pill.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.step-pill.completed {
+  border-color: rgba(20, 184, 166, 0.45);
+  color: var(--status-success);
+}
+
+.step-num {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+}
+
+/* Verification Decision Banner & Fingerprint Results Panel */
+.decision-banner {
+  padding: 16px 18px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.decision-banner.verified {
+  background: var(--status-success-bg);
+  border-color: rgba(20, 184, 166, 0.5);
+}
+
+.decision-banner.rejected {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.45);
+}
+
+.decision-banner.inconclusive {
+  background: var(--status-warning-bg);
+  border-color: rgba(245, 158, 11, 0.5);
+}
+
+.fp-results-panel {
+  padding: 14px 16px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+}
+
+.fp-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px 16px;
+  font-size: 13px;
+}
+
+/* Strict Dataset Isolation & Diagnostics Badges */
+.analytics-dataset-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.dataset-card {
+  padding: 14px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.status-badge.operational {
+  background: var(--status-success-bg);
+  color: var(--status-success);
+  border: 1px solid rgba(20, 184, 166, 0.35);
+}
+
+.status-badge.degraded {
+  background: var(--status-warning-bg);
+  color: var(--status-warning);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+}
+
+.status-badge.offline {
+  background: rgba(239, 68, 68, 0.14);
+  color: var(--status-danger);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+}
+
+.status-badge.not-configured,
+.status-badge.not-tested {
+  background: var(--bg-subtle);
+  color: var(--text-muted);
+  border: 1px solid var(--border-strong);
+}
+
+@media (max-width: 1024px) {
+  .analytics-dataset-grid,
+  .fp-meta-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 400px) {
+  .topbar { padding: 0 10px; gap: 6px; }
+  .main-content { padding: 12px 8px calc(84px + env(safe-area-inset-bottom, 0px)); gap: 12px; }
+  .panel { padding: 12px; }
+  .page-title { font-size: 19px; }
+  .enroll-stepper { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .step-pill { flex-shrink: 0; padding: 6px 10px; font-size: 12px; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }

@@ -1,24 +1,16 @@
 import {
   extractFaceFeatures,
+  captureMultiFrameFaceFeatures,
   extractVoiceFeaturesFromPCM,
   extractFingerprintFeatures,
   inspectLiveFaceGuidance,
   ensureFaceEngineReady,
-  computeFrameMotion,
   decodeAudioFileToPCM,
 } from './biometrics.js';
 import { compareIdentities, identifyBiometricProbe } from './api.js';
 import { appendAuditLog } from './firebase.js';
 import { FUSION_POLICIES } from './config.js';
 import { escapeHtml, fmtPct, showToast, loadImageFile, recordMicrophonePCM, openCameraStream, createLiveVideoElement } from './ui.js';
-
-function snapVideoFrameCanvas(videoEl, width = 320, height = 240) {
-  const c = document.createElement('canvas');
-  c.width = width;
-  c.height = height;
-  c.getContext('2d').drawImage(videoEl, 0, 0, width, height);
-  return c;
-}
 
 export function renderCompareIdentities(container, { appState, navigate }) {
   if (!appState.permissions.includes('perform_verification')) {
@@ -165,7 +157,7 @@ export function renderCompareIdentities(container, { appState, navigate }) {
 
           <div class="probe-card">
             <div class="row-between"><strong>Fingerprint Probe</strong><span id="idn-fp-st" class="state-text state-neutral">Optional</span></div>
-            <div id="idn-fp-q" class="meta-line">Clear ridge image</div>
+            <div id="idn-fp-q" class="meta-line">Ridge image (&ge;96&times;96px). No browser PAD sensor.</div>
             <div class="row-wrap">
               <label class="btn btn-secondary btn-sm" style="cursor:pointer;">Upload Print<input type="file" id="idn-fp-file" accept="image/*" hidden /></label>
             </div>
@@ -423,20 +415,16 @@ export function renderCompareIdentities(container, { appState, navigate }) {
       fSnap.onclick = async () => {
         fSnap.disabled = true;
         try {
-          const f1 = snapVideoFrameCanvas(v);
-          await new Promise((r) => setTimeout(r, 250));
-          const f2 = snapVideoFrameCanvas(v);
-          const motion = computeFrameMotion(f1, f2);
+          const res = await captureMultiFrameFaceFeatures(v, 220);
           haltIdnCam();
-          const res = await extractFaceFeatures(f2, { isLiveCapture: true, frameMotionScore: motion, captureSource: 'webcam' });
           faceVec = res.vector;
           faceQuality = res.quality;
           fSt.className = 'state-text state-success';
-          fSt.textContent = 'Ready ✓';
-          fQ.textContent = `Quality: ${faceQuality.faceQualityScore}/100`;
+          fSt.textContent = 'Live 3-Frame ✓';
+          fQ.textContent = `Q:${faceQuality.faceQualityScore}/100 · Cons:${faceQuality.frameConsistencyCosine}`;
         } catch (err) {
           fSt.className = 'state-text state-danger';
-          fSt.textContent = 'Rejected';
+          fSt.textContent = err.feedbackLabel || 'Rejected';
           fQ.textContent = err.message;
           showToast(err.message, 'danger');
         } finally {
@@ -514,11 +502,11 @@ export function renderCompareIdentities(container, { appState, navigate }) {
     try {
       const res = extractFingerprintFeatures(await loadImageFile(f), 'upload');
       fpTemplate = res.template; fpQuality = res.quality;
-      fpSt.className = 'state-text state-success'; fpSt.textContent = 'Ready (Minutiae)';
-      fpQ.textContent = `Minutiae:${fpQuality.minutiaeHeuristicCount} · Q:${fpQuality.qualityScore}/100`;
+      fpSt.className = 'state-text state-success'; fpSt.textContent = fpQuality.qualityLabel || 'Good Quality';
+      fpQ.textContent = `${fpQuality.qualityLabel || 'Good Quality'} · Minutiae:${fpQuality.minutiaeHeuristicCount} · Q:${fpQuality.qualityScore}/100`;
     } catch (err) {
       fpTemplate = null; fpQuality = null;
-      fpSt.className = 'state-text state-danger'; fpSt.textContent = 'Rejected';
+      fpSt.className = 'state-text state-danger'; fpSt.textContent = err.qualityLabel || 'Rejected';
       fpQ.textContent = err.message; showToast(err.message, 'danger');
     }
   });

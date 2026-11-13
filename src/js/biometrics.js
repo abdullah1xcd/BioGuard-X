@@ -16,6 +16,7 @@ import {
 } from '../shared/metrics.ts';
 import {
   extractPretrainedFaceFeatures,
+  captureMultiFrameFaceFeatures,
   inspectLiveFaceGuidance,
   ensureFaceEngineReady,
   getFaceEngineStatus,
@@ -23,6 +24,7 @@ import {
 
 export {
   extractPretrainedFaceFeatures,
+  captureMultiFrameFaceFeatures,
   inspectLiveFaceGuidance,
   ensureFaceEngineReady,
   getFaceEngineStatus,
@@ -81,13 +83,26 @@ export function extractVoiceFeaturesFromPCM(samples, sampleRate = 16000, capture
 
 // Real Fingerprint Extraction via Gabor Ridge Enhancement + Thinning + Minutiae Template
 export function extractFingerprintFeatures(source, captureSource = 'upload') {
+  const w = source?.naturalWidth || source?.videoWidth || source?.width || 0;
+  const h = source?.naturalHeight || source?.videoHeight || source?.height || 0;
+  if (captureSource !== 'test_sample' && (w < 96 || h < 96)) {
+    const err = new Error(
+      `Poor Quality: Fingerprint image resolution too low (${w}×${h}px, minimum 96×96px required).`
+    );
+    err.code = 'low_fingerprint_resolution';
+    err.qualityLabel = 'Poor Quality';
+    throw err;
+  }
+
   const { gray } = sourceToGray(source, FP_SIZE);
   const tpl = extractFingerprintTemplateFromGray128(gray);
   if (!tpl.validPrint && captureSource !== 'test_sample') {
     const err = new Error(
-      `Invalid or low-quality fingerprint image (coherence=${tpl.meanCoherence}, ridgeDensity=${tpl.ridgeDensity}%, minutiae=${tpl.minutiae.length}). Upload a clear fingerprint ridge scan.`
+      `${tpl.qualityLabel}: Could not extract valid fingerprint template (minutiae=${tpl.minutiae.length}, coherence=${tpl.meanCoherence}, sharpness=${tpl.sharpness}, ridgeDensity=${tpl.ridgeDensity}%).`
     );
     err.code = 'invalid_fingerprint_image';
+    err.template = tpl;
+    err.qualityLabel = tpl.qualityLabel;
     throw err;
   }
   return {
@@ -100,7 +115,11 @@ export function extractFingerprintFeatures(source, captureSource = 'upload') {
       minutiaeHeuristicCount: tpl.minutiae.length,
       meanCoherence: tpl.meanCoherence,
       foregroundRatio: tpl.foregroundRatio,
+      sharpness: tpl.sharpness,
+      meanWavelengthPx: tpl.meanWavelengthPx,
       qualityScore: tpl.qualityScore,
+      qualityLabel: tpl.qualityLabel,
+      templateStatus: tpl.templateStatus,
       validPrint: tpl.validPrint,
       captureSource,
     },

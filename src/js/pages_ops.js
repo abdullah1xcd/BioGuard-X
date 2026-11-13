@@ -17,6 +17,7 @@ import {
   drawFarFrrChart,
   drawVerificationTrendChart,
   drawModalityComparisonChart,
+  observeResponsiveChart,
 } from './charts.js';
 import { escapeHtml, fmtPct, showToast, openModal, downloadFile } from './ui.js';
 
@@ -92,6 +93,8 @@ export function renderAnalytics(container, { appState }) {
 
     <div class="kpi-strip" id="an-kpis"></div>
 
+    <section class="panel stack-md" id="an-datasets-panel"></section>
+
     <section class="panel stack-md" id="an-classification-panel"></section>
 
     <div class="grid-2">
@@ -131,8 +134,14 @@ export function renderAnalytics(container, { appState }) {
   };
 
   let latestReport = null;
+  let chartCleanups = [];
+  const clearCharts = () => {
+    chartCleanups.forEach((fn) => fn());
+    chartCleanups = [];
+  };
 
   const renderStats = () => {
+    clearCharts();
     const verifications = getFilteredVerifications();
     const s = appState.settings || {};
     const activeCount = appState.identities.filter((i) => i.status === 'active').length;
@@ -145,28 +154,80 @@ export function renderAnalytics(container, { appState }) {
     latestReport = report;
 
     const livenessPct = report.livenessKnownCount ? fmtPct(report.livenessSuccessRate) : '—';
-    const opPct = report.totalAttempts > 0 ? fmtPct(report.operationalVerificationSuccessRate) : '—';
+    const opPct = report.datasets.operational.attempts > 0 ? fmtPct(report.datasets.operational.operationalMatchRate) : '—';
+    const capFailPct = fmtPct(report.datasets.operational.captureFailureRate);
 
     container.querySelector('#an-kpis').innerHTML = `
       <div class="kpi-cell">
         <span class="kpi-label">Registered Identities</span>
         <span class="kpi-value">${report.totalIdentities}</span>
-        <span class="kpi-meta">${report.activeIdentities} active · ${report.totalAttempts} verification(s) in range</span>
+        <span class="kpi-meta">${report.activeIdentities} active · ${report.totalAttempts} record(s) in range</span>
       </div>
       <div class="kpi-cell">
-        <span class="kpi-label">Verification Outcomes</span>
-        <span class="kpi-value">${report.successfulVerifications} / ${report.rejectedVerifications}</span>
-        <span class="kpi-meta">Match / Rejected (${report.notEvaluatedVerifications} not evaluated)</span>
+        <span class="kpi-label">Verified / Rejected / Inc.</span>
+        <span class="kpi-value">${report.successfulVerifications} / ${report.rejectedVerifications} / ${report.notEvaluatedVerifications}</span>
+        <span class="kpi-meta">Capture failure rate: ${capFailPct}</span>
       </div>
       <div class="kpi-cell">
-        <span class="kpi-label">Operational Success Rate</span>
+        <span class="kpi-label">Operational Match Rate</span>
         <span class="kpi-value">${opPct}</span>
-        <span class="kpi-meta">${report.operationalAttempts} operational · ${report.testProbeAttempts} QA probe(s)</span>
+        <span class="kpi-meta">${report.datasets.operational.attempts} real ops · ${report.datasets.syntheticQa.attempts} QA probe(s)</span>
       </div>
       <div class="kpi-cell">
-        <span class="kpi-label">Liveness Pass Rate</span>
+        <span class="kpi-label">Confirmed Liveness Rate</span>
         <span class="kpi-value">${livenessPct}</span>
-        <span class="kpi-meta">${report.livenessKnownCount} check(s) · ${report.conflictCount} conflict block(s)</span>
+        <span class="kpi-meta">${report.livenessKnownCount} live/spoof check(s) · ${report.conflictCount} conflict(s)</span>
+      </div>
+    `;
+
+    const dsOp = report.datasets.operational;
+    const dsQa = report.datasets.syntheticQa;
+    const dsBm = report.datasets.benchmark;
+
+    container.querySelector('#an-datasets-panel').innerHTML = `
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">Dataset Provenance &amp; Strict Isolation</h2>
+          <p class="panel-subtitle">Real Operational traffic, Synthetic QA probes, and Benchmark Labeled trials are isolated — never blended into fake accuracy claims</p>
+        </div>
+      </div>
+      <div class="analytics-dataset-grid">
+        <div class="dataset-card">
+          <div class="row-between">
+            <strong>1. Real Operational Data</strong>
+            <span class="state-text state-success">${dsOp.attempts} attempt(s)</span>
+          </div>
+          <div class="divider-list" style="font-size:12.5px;">
+            <div class="divider-row"><span>Verified / Rejected / Inconclusive</span><span class="mono">${dsOp.verifiedCount} / ${dsOp.rejectedCount} / ${dsOp.inconclusiveCount}</span></div>
+            <div class="divider-row"><span>Operational Match Rate</span><span class="mono">${dsOp.attempts ? fmtPct(dsOp.operationalMatchRate) : '—'}</span></div>
+            <div class="divider-row"><span>Capture Failures / Rate</span><span class="mono">${dsOp.captureFailureCount} (${fmtPct(dsOp.captureFailureRate)})</span></div>
+            <div class="divider-row"><span>Liveness Pass / Fail / Inc. / NS</span><span class="mono">${dsOp.livenessPassedCount} / ${dsOp.livenessFailedCount} / ${dsOp.livenessInconclusiveCount} / ${dsOp.livenessNotSupportedCount}</span></div>
+          </div>
+        </div>
+
+        <div class="dataset-card">
+          <div class="row-between">
+            <strong>2. Synthetic QA / Testing Data</strong>
+            <span class="state-text state-warning">${dsQa.attempts} probe(s)</span>
+          </div>
+          <div class="divider-list" style="font-size:12.5px;">
+            <div class="divider-row"><span>Verified / Rejected / Inconclusive</span><span class="mono">${dsQa.verifiedCount} / ${dsQa.rejectedCount} / ${dsQa.inconclusiveCount}</span></div>
+            <div class="divider-row"><span>Genuine / Impostor QA Labels</span><span class="mono">${dsQa.genuineCount} / ${dsQa.impostorCount}</span></div>
+            <div class="divider-row"><span>Operational Contamination</span><span class="state-text state-success">Excluded (0%)</span></div>
+          </div>
+        </div>
+
+        <div class="dataset-card">
+          <div class="row-between">
+            <strong>3. Labeled Benchmark Evaluation</strong>
+            <span class="state-text ${dsBm.insufficientData ? 'state-warning' : 'state-success'}">${dsBm.sampleCount} trial(s)</span>
+          </div>
+          <div class="divider-list" style="font-size:12.5px;">
+            <div class="divider-row"><span>Operational vs Synthetic Labeled</span><span class="mono">${dsBm.operationalLabeledTrials} ops · ${dsBm.syntheticLabeledTrials} synth</span></div>
+            <div class="divider-row"><span>Genuine / Impostor Counts</span><span class="mono">${dsBm.genuineCount} / ${dsBm.impostorCount}</span></div>
+            <div class="divider-row"><span>Statistical Readiness</span><span class="state-text ${dsBm.insufficientData ? 'state-warning' : 'state-success'}">${dsBm.insufficientData ? 'Insufficient evaluation data.' : 'Ready (≥3 per class)'}</span></div>
+          </div>
+        </div>
       </div>
     `;
 
@@ -178,15 +239,15 @@ export function renderAnalytics(container, { appState }) {
     container.querySelector('#an-classification-panel').innerHTML = `
       <div class="panel-header">
         <div>
-          <h2 class="panel-title">Measured Classification Accuracy (Ground-Truth Labeled Trials)</h2>
+          <h2 class="panel-title">Measured Classification Accuracy (Benchmark Labeled Trials)</h2>
           <p class="panel-subtitle">Sample size: ${c.sampleCount} labeled (${c.genuineCount} genuine, ${c.impostorCount} impostor) · ${report.unlabeledAttempts} unlabeled excluded · Range: ${escapeHtml(drStart)} → ${escapeHtml(drEnd)}</p>
         </div>
-        <span class="state-text ${c.insufficientData ? 'state-warning' : 'state-success'}">${c.insufficientData ? 'Insufficient Ground-Truth Data' : 'Statistically Grounded'}</span>
+        <span class="state-text ${c.insufficientData ? 'state-warning' : 'state-success'}">${c.insufficientData ? 'Insufficient evaluation data.' : 'Statistically Grounded'}</span>
       </div>
 
       ${
         c.insufficientData
-          ? `<div class="notice-strip warning"><div><strong>Insufficient Test Data for Reliable Classification Bounds</strong><div>${escapeHtml(c.insufficientReason)} Run labeled Genuine and Impostor trials in Verification to establish statistically reliable genuine vs. impostor separation.</div></div></div>`
+          ? `<div class="notice-strip warning"><div><strong>${escapeHtml(dsBm.insufficientDataMessage || 'Insufficient evaluation data.')}</strong><div>${escapeHtml(c.insufficientReason)} Run at least 3 Genuine and 3 Impostor labeled evaluation trials to report statistically valid FAR, FRR, and EER bounds.</div></div></div>`
           : ''
       }
 
@@ -243,7 +304,7 @@ export function renderAnalytics(container, { appState }) {
             </tbody>
           </table>
         </div>`
-          : `<div class="empty-state"><div class="empty-title">No labeled genuine/impostor trials in selected window</div><div class="empty-desc">Operational traffic remains excluded from accuracy claims unless explicitly labeled as genuine or impostor.</div></div>`
+          : `<div class="empty-state"><div class="empty-title">Insufficient evaluation data.</div><div class="empty-desc">Operational traffic remains excluded from accuracy claims unless explicitly labeled as genuine or impostor.</div></div>`
       }
     `;
 
@@ -253,7 +314,11 @@ export function renderAnalytics(container, { appState }) {
       </div>
       <canvas class="chart-canvas" id="an-trend-canvas" width="520" height="220"></canvas>
     `;
-    drawVerificationTrendChart(container.querySelector('#an-trend-canvas'), verifications);
+    chartCleanups.push(
+      observeResponsiveChart(container.querySelector('#an-trend-canvas'), (cv) =>
+        drawVerificationTrendChart(cv, verifications)
+      )
+    );
 
     container.querySelector('#an-modcomp-panel').innerHTML = `
       <div class="panel-header">
@@ -261,7 +326,11 @@ export function renderAnalytics(container, { appState }) {
       </div>
       <canvas class="chart-canvas" id="an-modcomp-canvas" width="520" height="220"></canvas>
     `;
-    drawModalityComparisonChart(container.querySelector('#an-modcomp-canvas'), report.perModality);
+    chartCleanups.push(
+      observeResponsiveChart(container.querySelector('#an-modcomp-canvas'), (cv) =>
+        drawModalityComparisonChart(cv, report.perModality)
+      )
+    );
 
     const rocPanel = container.querySelector('#an-roc-panel');
     const currentThr = Number(s.faceThreshold ?? 0.72);
@@ -272,7 +341,7 @@ export function renderAnalytics(container, { appState }) {
         </div>
         <div class="empty-state">
           <div class="empty-title">Need both Genuine and Impostor labeled trials for ROC &amp; EER curves</div>
-          <div class="empty-desc">Run at least one Genuine-labeled trial and one Impostor-labeled trial in Verification Center to plot true FAR, FRR, EER, and AUC curves.</div>
+          <div class="empty-desc">Run Genuine-labeled and Impostor-labeled evaluation trials to plot true FAR, FRR, EER, and AUC curves.</div>
         </div>
       `;
     } else {
@@ -295,8 +364,14 @@ export function renderAnalytics(container, { appState }) {
           </div>
         </div>
       `;
-      drawRocChart(rocPanel.querySelector('#an-roc-canvas'), c.roc, currentThr, c.auc);
-      drawFarFrrChart(rocPanel.querySelector('#an-far-canvas'), c.roc, currentThr, c.eerThreshold);
+      chartCleanups.push(
+        observeResponsiveChart(rocPanel.querySelector('#an-roc-canvas'), (cv) =>
+          drawRocChart(cv, c.roc, currentThr, c.auc)
+        ),
+        observeResponsiveChart(rocPanel.querySelector('#an-far-canvas'), (cv) =>
+          drawFarFrrChart(cv, c.roc, currentThr, c.eerThreshold)
+        )
+      );
     }
 
     container.querySelector('#an-modalities').innerHTML = `
@@ -437,6 +512,8 @@ export function renderAnalytics(container, { appState }) {
     downloadFile('bioguardx_security_report.json', JSON.stringify(report, null, 2), 'application/json');
     showToast('Exported Security Report JSON.', 'success');
   });
+
+  return () => clearCharts();
 }
 
 // 6. RISK & THREAT ANALYSIS
@@ -528,21 +605,25 @@ export function renderThreatIntel(container, { appState, navigate }) {
                   </tr>
                 </thead>
                 <tbody>
-                  ${highRiskVer
-                    .slice(0, 15)
-                    .map(
-                      (v) => `
-                    <tr>
-                      <td class="mono"><strong>${escapeHtml(v.identityRef)}</strong></td>
-                      <td class="mono">${escapeHtml(v.pipeline)}</td>
-                      <td><span class="state-text ${v.outcome === 'match' ? 'state-success' : 'state-danger'}">${escapeHtml(v.outcome)}</span></td>
-                      <td><span class="state-text ${v.livenessPassed === false ? 'state-danger' : 'state-success'}">${v.livenessPassed === false ? 'Failed' : 'Passed'}</span></td>
-                      <td class="mono">${v.riskScore ?? '—'} (${escapeHtml(v.riskLevel || 'low')})</td>
-                      <td class="mono" style="font-size:12px;">${escapeHtml(v.reasonCode)}</td>
-                      <td><button type="button" class="btn btn-ghost btn-sm" data-ai-ver="${escapeHtml(v.verificationId)}">Explain in AI</button></td>
-                    </tr>`
-                    )
-                    .join('')}
+                    ${highRiskVer
+                      .slice(0, 15)
+                      .map((v) => {
+                        const lStat = v.livenessStatus || (v.livenessPassed === true ? 'LIVENESS PASSED' : v.livenessPassed === false ? 'LIVENESS FAILED' : 'INCONCLUSIVE');
+                        const lCls = lStat === 'LIVENESS PASSED' ? 'state-success' : lStat === 'LIVENESS FAILED' ? 'state-danger' : 'state-warning';
+                        const dec = v.finalDecision || (v.outcome === 'match' ? 'VERIFIED' : v.outcome === 'no_match' ? 'REJECTED' : 'INCONCLUSIVE');
+                        const decCls = dec === 'VERIFIED' ? 'state-success' : dec === 'REJECTED' ? 'state-danger' : 'state-warning';
+                        return `
+                      <tr>
+                        <td class="mono"><strong>${escapeHtml(v.identityRef)}</strong></td>
+                        <td class="mono">${escapeHtml(v.pipeline)}</td>
+                        <td><span class="state-text ${decCls}">${escapeHtml(dec)}</span></td>
+                        <td><span class="state-text ${lCls}">${escapeHtml(lStat)}</span></td>
+                        <td class="mono">${v.riskScore ?? '—'} (${escapeHtml(v.riskLevel || 'low')})</td>
+                        <td class="mono" style="font-size:12px;">${escapeHtml(v.reasonCode)}</td>
+                        <td><button type="button" class="btn btn-ghost btn-sm" data-ai-ver="${escapeHtml(v.verificationId)}">Explain in AI</button></td>
+                      </tr>`;
+                      })
+                      .join('')}
                 </tbody>
               </table>
             </div>`
@@ -677,7 +758,14 @@ export function renderThreatIntel(container, { appState, navigate }) {
 
   drawAlerts();
 
-  container.querySelector('#ti-search').addEventListener('input', (e) => { searchQ = e.target.value; drawAlerts(); });
+  let tiTimer = null;
+  container.querySelector('#ti-search').addEventListener('input', (e) => {
+    clearTimeout(tiTimer);
+    tiTimer = setTimeout(() => {
+      searchQ = e.target.value;
+      drawAlerts();
+    }, 180);
+  });
   container.querySelectorAll('#ti-sev-tabs .segmented-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       container.querySelectorAll('#ti-sev-tabs .segmented-btn').forEach((b) => b.classList.remove('active'));
@@ -1171,7 +1259,14 @@ export function renderAuditTrail(container, { appState }) {
   };
 
   drawLogs();
-  container.querySelector('#at-search').addEventListener('input', (e) => { q = e.target.value; drawLogs(); });
+  let atTimer = null;
+  container.querySelector('#at-search').addEventListener('input', (e) => {
+    clearTimeout(atTimer);
+    atTimer = setTimeout(() => {
+      q = e.target.value;
+      drawLogs();
+    }, 180);
+  });
 
   container.querySelector('#at-csv').addEventListener('click', () => {
     const header = 'eventId,actorUid,action,resourceType,resourceId,result,requestId\n';

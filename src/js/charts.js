@@ -17,13 +17,44 @@ function getThemeColors() {
   };
 }
 
+export function prepareHiDpiCanvas(canvas, baseW = 480, baseH = 240) {
+  const parentW = canvas.parentElement?.clientWidth || baseW;
+  const logicalW = Math.max(260, Math.min(900, Math.floor(parentW) || baseW));
+  const aspect = baseH / Math.max(1, baseW);
+  const logicalH = Math.max(160, Math.round(logicalW * aspect));
+  const dpr = Math.min(2, typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
+  canvas.width = Math.round(logicalW * dpr);
+  canvas.height = Math.round(logicalH * dpr);
+  canvas.style.width = '100%';
+  canvas.style.height = `${logicalH}px`;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w: logicalW, h: logicalH };
+}
+
+export function observeResponsiveChart(canvas, drawFn) {
+  if (!canvas || typeof drawFn !== 'function') return () => {};
+  drawFn(canvas);
+  if (typeof ResizeObserver === 'undefined' || !canvas.parentElement) return () => {};
+  let timer = null;
+  const obs = new ResizeObserver(() => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      if (document.body.contains(canvas)) drawFn(canvas);
+    }, 60);
+  });
+  obs.observe(canvas.parentElement);
+  return () => {
+    clearTimeout(timer);
+    obs.disconnect();
+  };
+}
+
 export function drawRocChart(canvas, rocPoints, currentThreshold, auc) {
   if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width;
-  const h = canvas.height;
+  const { ctx, w, h } = prepareHiDpiCanvas(canvas, 480, 260);
   const c = getThemeColors();
-  const pad = { l: 48, r: 20, t: 20, b: 42 };
+  const pad = { l: 44, r: 16, t: 20, b: 40 };
   const pw = w - pad.l - pad.r;
   const ph = h - pad.t - pad.b;
 
@@ -102,11 +133,9 @@ export function drawRocChart(canvas, rocPoints, currentThreshold, auc) {
 
 export function drawFarFrrChart(canvas, rocPoints, currentThreshold, eerThreshold) {
   if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width;
-  const h = canvas.height;
+  const { ctx, w, h } = prepareHiDpiCanvas(canvas, 480, 260);
   const c = getThemeColors();
-  const pad = { l: 46, r: 20, t: 20, b: 40 };
+  const pad = { l: 44, r: 16, t: 20, b: 40 };
   const pw = w - pad.l - pad.r;
   const ph = h - pad.t - pad.b;
 
@@ -165,11 +194,9 @@ export function drawFarFrrChart(canvas, rocPoints, currentThreshold, eerThreshol
 
 export function drawVerificationTrendChart(canvas, records) {
   if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width;
-  const h = canvas.height;
+  const { ctx, w, h } = prepareHiDpiCanvas(canvas, 480, 220);
   const c = getThemeColors();
-  const pad = { l: 40, r: 16, t: 28, b: 36 };
+  const pad = { l: 36, r: 14, t: 28, b: 34 };
   const pw = w - pad.l - pad.r;
   const ph = h - pad.t - pad.b;
 
@@ -238,11 +265,9 @@ export function drawVerificationTrendChart(canvas, records) {
 
 export function drawModalityComparisonChart(canvas, perModality) {
   if (!canvas || !perModality) return;
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width;
-  const h = canvas.height;
+  const { ctx, w, h } = prepareHiDpiCanvas(canvas, 480, 220);
   const c = getThemeColors();
-  const pad = { l: 42, r: 16, t: 28, b: 36 };
+  const pad = { l: 38, r: 14, t: 28, b: 34 };
   const pw = w - pad.l - pad.r;
   const ph = h - pad.t - pad.b;
 
@@ -300,9 +325,7 @@ export function drawModalityComparisonChart(canvas, perModality) {
 
 export function drawWaveform(canvas, samples) {
   if (!canvas || !samples) return;
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width;
-  const h = canvas.height;
+  const { ctx, w, h } = prepareHiDpiCanvas(canvas, 380, 86);
   const c = getThemeColors();
 
   ctx.clearRect(0, 0, w, h);

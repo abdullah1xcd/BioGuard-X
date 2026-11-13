@@ -185,17 +185,21 @@ export interface VerificationRecordLike {
   modalities?: string[];
   pipeline?: string;
   outcome?: string;
+  finalDecision?: 'VERIFIED' | 'REJECTED' | 'INCONCLUSIVE';
   reasonCode?: string;
   score?: number;
   confidence?: number;
   riskScore?: number;
   riskLevel?: string;
   livenessPassed?: boolean;
+  livenessStatus?: string;
   livenessScore?: number;
   conflictDetected?: boolean;
   processingTimeMs?: number;
   groundTruth?: 'genuine' | 'impostor' | 'unlabeled';
+  datasetCategory?: 'operational' | 'synthetic_qa' | 'benchmark_eval';
   isTestProbe?: boolean;
+  captureFailure?: boolean;
   faceScore?: number;
   voiceScore?: number;
   fingerprintScore?: number;
@@ -215,6 +219,41 @@ export function extractTimestampMs(ts: VerificationRecordLike['createdAt']): num
   return 0;
 }
 
+export interface OperationalDatasetReport {
+  totalAttempts: number;
+  verifiedCount: number;
+  rejectedCount: number;
+  inconclusiveCount: number;
+  captureFailureCount: number;
+  captureFailureRate: number | null;
+  operationalMatchRate: number | null;
+  livenessPassedCount: number;
+  livenessFailedCount: number;
+  livenessInconclusiveCount: number;
+  avgProcessingTimeMs: number | null;
+  avgRiskScore: number | null;
+}
+
+export interface SyntheticQaDatasetReport {
+  totalProbes: number;
+  genuineProbes: number;
+  impostorProbes: number;
+  verifiedCount: number;
+  rejectedCount: number;
+  inconclusiveCount: number;
+  classification: ClassificationMetricsResult;
+}
+
+export interface BenchmarkDatasetReport {
+  totalLabeledTrials: number;
+  operationalLabeledTrials: number;
+  syntheticLabeledTrials: number;
+  insufficientData: boolean;
+  insufficientDataMessage: string;
+  classification: ClassificationMetricsResult;
+  operationalOnlyClassification: ClassificationMetricsResult | null;
+}
+
 export interface ComprehensiveAnalyticsReport {
   totalIdentities: number;
   activeIdentities: number;
@@ -226,6 +265,8 @@ export interface ComprehensiveAnalyticsReport {
   successfulVerifications: number;
   rejectedVerifications: number;
   notEvaluatedVerifications: number;
+  captureFailureCount: number;
+  captureFailureRate: number;
   operationalVerificationSuccessRate: number; // Match / Evaluated operational attempts
   livenessKnownCount: number;
   livenessSuccessRate: number;
@@ -242,6 +283,11 @@ export interface ComprehensiveAnalyticsReport {
     startMs: number | null;
     endMs: number | null;
   };
+  datasets: {
+    operational: OperationalDatasetReport;
+    syntheticQa: SyntheticQaDatasetReport;
+    benchmark: BenchmarkDatasetReport;
+  };
   classification: ClassificationMetricsResult;
   perModality: Record<'face' | 'voice' | 'fingerprint' | 'multimodal', {
     totalEvaluations: number;
@@ -251,6 +297,19 @@ export interface ComprehensiveAnalyticsReport {
   }>;
   failedBreakdown: Array<{ reasonCode: string; count: number }>;
   methodologyNote: string;
+}
+
+function isCaptureFailureRecord(r: VerificationRecordLike): boolean {
+  if (r.captureFailure === true) return true;
+  if (r.outcome === 'not_evaluated' || r.finalDecision === 'INCONCLUSIVE') return true;
+  const rc = String(r.reasonCode || '').toLowerCase();
+  return (
+    rc.includes('inconclusive') ||
+    rc.includes('quality_check_failed') ||
+    rc.includes('blurry') ||
+    rc.includes('too_short') ||
+    rc.includes('insufficient')
+  );
 }
 
 export function buildBiometricAnalyticsReport(
@@ -264,10 +323,20 @@ export function buildBiometricAnalyticsReport(
   const fpThr = defaultThresholds.fingerprint ?? 0.72;
   const mThr = defaultThresholds.threeModal ?? 0.74;
 
-  const operational = records.filter((r) => !r.isTestProbe);
-  const testProbes = records.filter((r) => r.isTestProbe === true);
+  const operational = records.filter((r) => !r.isTestProbe && r.datasetCategory !== 'synthetic_qa');
+  const testProbes = records.filter((r) => r.isTestProbe === true || r.datasetCategory === 'synthetic_qa');
 
   const labeled = records.filter(
+    (r) =>
+      (r.groundTruth === 'genuine' || r.groundTruth === 'impostor') &&
+      (r.outcome === 'match' || r.outcome === 'no_match')
+  );
+  const labeledOperational = operational.filter(
+    (r) =>
+      (r.groundTruth === 'genuine' || r.groundTruth === 'impostor') &&
+      (r.outcome === 'match' || r.outcome === 'no_match')
+  );
+  const labeledQa = testProbes.filter(
     (r) =>
       (r.groundTruth === 'genuine' || r.groundTruth === 'impostor') &&
       (r.outcome === 'match' || r.outcome === 'no_match')
@@ -277,18 +346,25 @@ export function buildBiometricAnalyticsReport(
   const evaluatedAll = records.filter((r) => r.outcome === 'match' || r.outcome === 'no_match');
   const successful = records.filter((r) => r.outcome === 'match').length;
   const rejected = records.filter((r) => r.outcome === 'no_match').length;
-  const notEvaluated = records.filter((r) => r.outcome === 'not_evaluated').length;
+  const notEvaluated = records.filter((r) => r.outcome === 'not_evaluated' || r.finalDecision === 'INCONCLUSIVE').length;
+  const captureFailureCount = records.filter(isCaptureFailureRecord).length;
+  const captureFailureRate = records.length ? Number((captureFailureCount / records.length).toFixed(4)) : 0;
 
   const evalOp = operational.filter((r) => r.outcome === 'match' || r.outcome === 'no_match');
   const opMatches = evalOp.filter((r) => r.outcome === 'match').length;
+  const opRejects = evalOp.filter((r) => r.outcome === 'no_match').length;
+  const opInconclusive = operational.filter((r) => r.outcome === 'not_evaluated' || r.finalDecision === 'INCONCLUSIVE').length;
+  const opCapFail = operational.filter(isCaptureFailureRecord).length;
   const operationalVerificationSuccessRate = evalOp.length
     ? Number((opMatches / evalOp.length).toFixed(4))
     : evaluatedAll.length
     ? Number((successful / evaluatedAll.length).toFixed(4))
     : 0;
 
-  const liveKnown = records.filter((r) => typeof r.livenessPassed === 'boolean');
-  const livePass = liveKnown.filter((r) => r.livenessPassed === true).length;
+  const liveKnown = records.filter(
+    (r) => typeof r.livenessPassed === 'boolean' && r.livenessStatus !== 'INCONCLUSIVE' && r.livenessStatus !== 'NOT SUPPORTED'
+  );
+  const livePass = liveKnown.filter((r) => r.livenessPassed === true || r.livenessStatus === 'LIVENESS PASSED').length;
   const livenessSuccessRate = liveKnown.length ? Number((livePass / liveKnown.length).toFixed(4)) : 0;
 
   const riskKnown = records.filter((r) => typeof r.riskScore === 'number');
@@ -316,22 +392,66 @@ export function buildBiometricAnalyticsReport(
     endMs: times.length ? Math.max(...times) : null,
   };
 
-  // Classification metrics strictly from groundTruth === 'genuine' | 'impostor'
-  const overallTrials: GroundTruthTrial[] = labeled.map((r) => ({
-    score: Number(r.score || 0),
-    genuine: r.groundTruth === 'genuine',
-    threshold:
-      r.pipeline === 'voice_only' || r.pipeline === 'voice'
-        ? vThr
-        : r.pipeline === 'fingerprint_only' || r.pipeline === 'fingerprint'
-        ? fpThr
-        : r.pipeline === 'three_modal'
-        ? mThr
-        : fThr,
-    isTestProbe: r.isTestProbe,
-    timestampMs: extractTimestampMs(r.createdAt),
-  }));
+  const toTrials = (list: VerificationRecordLike[]): GroundTruthTrial[] =>
+    list.map((r) => ({
+      score: Number(r.score || 0),
+      genuine: r.groundTruth === 'genuine',
+      threshold:
+        r.pipeline === 'voice_only' || r.pipeline === 'voice'
+          ? vThr
+          : r.pipeline === 'fingerprint_only' || r.pipeline === 'fingerprint'
+          ? fpThr
+          : r.pipeline === 'three_modal'
+          ? mThr
+          : fThr,
+      isTestProbe: r.isTestProbe,
+      timestampMs: extractTimestampMs(r.createdAt),
+    }));
+
+  const overallTrials = toTrials(labeled);
   const classification = computeClassificationMetrics(overallTrials, fThr);
+  const opOnlyClassification = labeledOperational.length > 0 ? computeClassificationMetrics(toTrials(labeledOperational), fThr) : null;
+  const qaClassification = computeClassificationMetrics(toTrials(labeledQa), fThr);
+
+  const opLatencies = operational
+    .map((r) => r.processingTimeMs)
+    .filter((x): x is number => typeof x === 'number' && Number.isFinite(x) && x >= 0);
+  const opRisks = operational.filter((r) => typeof r.riskScore === 'number');
+
+  const operationalReport: OperationalDatasetReport = {
+    totalAttempts: operational.length,
+    verifiedCount: opMatches,
+    rejectedCount: opRejects,
+    inconclusiveCount: opInconclusive,
+    captureFailureCount: opCapFail,
+    captureFailureRate: operational.length ? Number((opCapFail / operational.length).toFixed(4)) : null,
+    operationalMatchRate: evalOp.length ? Number((opMatches / evalOp.length).toFixed(4)) : null,
+    livenessPassedCount: operational.filter((r) => r.livenessStatus === 'LIVENESS PASSED' || (!r.livenessStatus && r.livenessPassed === true)).length,
+    livenessFailedCount: operational.filter((r) => r.livenessStatus === 'LIVENESS FAILED' || (!r.livenessStatus && r.livenessPassed === false)).length,
+    livenessInconclusiveCount: operational.filter((r) => r.livenessStatus === 'INCONCLUSIVE' || r.livenessStatus === 'NOT SUPPORTED').length,
+    avgProcessingTimeMs: opLatencies.length ? Number((opLatencies.reduce((a, b) => a + b, 0) / opLatencies.length).toFixed(1)) : null,
+    avgRiskScore: opRisks.length ? Number((opRisks.reduce((s, r) => s + (r.riskScore || 0), 0) / opRisks.length).toFixed(1)) : null,
+  };
+
+  const syntheticQaReport: SyntheticQaDatasetReport = {
+    totalProbes: testProbes.length,
+    genuineProbes: testProbes.filter((r) => r.groundTruth === 'genuine').length,
+    impostorProbes: testProbes.filter((r) => r.groundTruth === 'impostor').length,
+    verifiedCount: testProbes.filter((r) => r.outcome === 'match').length,
+    rejectedCount: testProbes.filter((r) => r.outcome === 'no_match').length,
+    inconclusiveCount: testProbes.filter((r) => r.outcome === 'not_evaluated' || r.finalDecision === 'INCONCLUSIVE').length,
+    classification: qaClassification,
+  };
+
+  const benchmarkReport: BenchmarkDatasetReport = {
+    totalLabeledTrials: labeled.length,
+    operationalLabeledTrials: labeledOperational.length,
+    syntheticLabeledTrials: labeledQa.length,
+    insufficientData: classification.insufficientData,
+    insufficientDataMessage: classification.insufficientData ? 'Insufficient evaluation data.' : 'Statistically grounded evaluation sample.',
+    classification,
+    operationalOnlyClassification: opOnlyClassification,
+  };
 
   const buildModSummary = (mod: 'face' | 'voice' | 'fingerprint' | 'multimodal') => {
     const thr = mod === 'face' ? fThr : mod === 'voice' ? vThr : mod === 'fingerprint' ? fpThr : mThr;
@@ -379,7 +499,7 @@ export function buildBiometricAnalyticsReport(
 
   const failCounts = new Map<string, number>();
   for (const r of records) {
-    if (r.outcome === 'no_match' || r.outcome === 'not_evaluated') {
+    if (r.outcome === 'no_match' || r.outcome === 'not_evaluated' || r.finalDecision === 'INCONCLUSIVE') {
       const code = r.reasonCode || 'unknown';
       failCounts.set(code, (failCounts.get(code) || 0) + 1);
     }
@@ -399,6 +519,8 @@ export function buildBiometricAnalyticsReport(
     successfulVerifications: successful,
     rejectedVerifications: rejected,
     notEvaluatedVerifications: notEvaluated,
+    captureFailureCount,
+    captureFailureRate,
     operationalVerificationSuccessRate,
     livenessKnownCount: liveKnown.length,
     livenessSuccessRate,
@@ -406,6 +528,11 @@ export function buildBiometricAnalyticsReport(
     avgRiskScore,
     latency,
     dateRange,
+    datasets: {
+      operational: operationalReport,
+      syntheticQa: syntheticQaReport,
+      benchmark: benchmarkReport,
+    },
     classification,
     perModality: {
       face: buildModSummary('face'),
@@ -415,6 +542,7 @@ export function buildBiometricAnalyticsReport(
     },
     failedBreakdown,
     methodologyNote:
-      'Classification Accuracy, TAR/GAR, FAR/IAR, FRR, Precision, Recall, F1, EER, and Wilson 95% CIs are computed exclusively from ground-truth labeled trials (genuine vs impostor), never from predicted outcomes. Unlabeled operational verifications report Operational Match Rate separately.',
+      'Operational Data, Synthetic QA Data, and Labeled Benchmark Data are tracked strictly separately. Classification Accuracy, TAR/GAR, FAR/IAR, FRR, Precision, Recall, F1, EER, and Wilson 95% CIs come exclusively from ground-truth labeled trials; displays "Insufficient evaluation data." if fewer than 3 genuine or 3 impostor trials exist.',
   };
 }
+

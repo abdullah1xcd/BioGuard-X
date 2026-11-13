@@ -31,6 +31,17 @@ export function fetchServerSession() {
   return apiFetch('/api/v1/auth/me');
 }
 
+export function fetchApiDiagnostics() {
+  return apiFetch('/api/v1/diagnostics');
+}
+
+export function rotateVaultKeys(force = false) {
+  return apiFetch('/api/v1/vault/rotate', {
+    method: 'POST',
+    body: JSON.stringify({ force }),
+  });
+}
+
 export function enrollBiometricIdentity({ identityRef, consentRecorded, samples, quality }) {
   return apiFetch('/api/v1/identities/enroll', {
     method: 'POST',

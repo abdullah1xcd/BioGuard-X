@@ -7,12 +7,17 @@
 // Includes quality-weighted fusion, configurable fusion policies, and conflict detection.
 
 import {
+  classifyFingerprintDecision,
   matchFingerprintTemplates,
+  type FingerprintDecision,
   type FingerprintTemplate,
 } from './fingerprintEngine.ts';
 
 export type ModalityName = 'face' | 'voice' | 'fingerprint';
 export type FusionPolicy = 'weighted_score' | 'strict_and' | 'hierarchical_adaptive';
+export type ModalityStatus = 'MATCH' | 'NO MATCH' | 'INCONCLUSIVE' | 'NOT EVALUATED';
+export type FinalDecision = 'VERIFIED' | 'REJECTED' | 'INCONCLUSIVE';
+export type LivenessStatus = 'LIVENESS PASSED' | 'LIVENESS FAILED' | 'INCONCLUSIVE' | 'NOT SUPPORTED';
 
 export interface ThresholdConfig {
   face: number;
@@ -29,6 +34,8 @@ export interface ModalityEvaluation {
   threshold: number;
   qualityScore: number; // 0..100
   passed: boolean;
+  inconclusive?: boolean;
+  status: ModalityStatus;
   strongMismatch: boolean;
   details?: Record<string, unknown>;
 }
@@ -46,6 +53,9 @@ export interface FusionEvaluationResult {
   conflictDetails: string[];
   rejectionReasons: string[];
   outcome: 'match' | 'no_match' | 'not_evaluated';
+  finalDecision: FinalDecision;
+  livenessStatus: LivenessStatus;
+  fusionExplanation: string;
   reasonCode: string;
   stage?: string;
 }
@@ -74,7 +84,7 @@ export function calibrateSimilarity(rawCos: number, modality: 'face' | 'voice' |
     // Acoustic 96-D CMVN MFCC+Delta+F0: unrelated < 0.42, genuine > 0.65
     return Number(Math.max(0, Math.min(1, (rawCos - 0.15) / 0.72)).toFixed(4));
   }
-  // Legacy v1.1 vectors: non-negative cosine clamped cleanly without 0.50 floor inflation
+  // Legacy v1.1 vectors: non-negative cosine clamped cleanly
   return Number(Math.max(0, Math.min(1, rawCos)).toFixed(4));
 }
 
@@ -104,8 +114,9 @@ export function scoreVectorRefs(
 
 export function scoreFingerprintAgainstRefs(
   probe: FingerprintTemplate | number[],
-  refs: Array<FingerprintTemplate | number[]>
-): { score: number; details: Record<string, unknown> } {
+  refs: Array<FingerprintTemplate | number[]>,
+  threshold = 0.72
+): { score: number; decision?: FingerprintDecision; decisionReason?: string; details: Record<string, unknown> } {
   if (!refs.length) return { score: 0, details: {} };
   if (!Array.isArray(probe)) {
     const structRefs = refs.filter((r): r is FingerprintTemplate => !Array.isArray(r) && Array.isArray(r.minutiae));
@@ -118,8 +129,16 @@ export function scoreFingerprintAgainstRefs(
         if (res.score > bestRes.score) bestRes = res;
       }
       const blended = Number((0.7 * bestRes.score + 0.3 * (sum / structRefs.length)).toFixed(4));
+      const cls = classifyFingerprintDecision(
+        { ...bestRes, score: blended },
+        threshold,
+        probe.qualityScore,
+        probe.validPrint
+      );
       return {
         score: blended,
+        decision: cls.decision,
+        decisionReason: cls.reason,
         details: {
           matchedMinutiae: bestRes.matchedMinutiae,
           probeMinutiae: bestRes.probeMinutiae,
@@ -127,17 +146,30 @@ export function scoreFingerprintAgainstRefs(
           estimatedRotationDeg: bestRes.estimatedRotationDeg,
           isPartialMatch: bestRes.isPartialMatch,
           orientationScore: bestRes.orientationScore,
+          decision: cls.decision,
+          decisionReason: cls.reason,
+          qualityScore: probe.qualityScore,
+          qualityLabel: probe.qualityLabel || (probe.validPrint ? 'Good Quality' : 'Poor Quality'),
+          templateStatus: probe.templateStatus || (probe.validPrint ? 'Valid Minutiae Template' : 'Insufficient Features'),
+          meanCoherence: probe.meanCoherence,
+          ridgeDensity: probe.ridgeDensity,
+          meanWavelengthPx: probe.meanWavelengthPx,
+          validPrint: probe.validPrint,
         },
       };
     }
-    // Compare descriptor128 if vault only holds legacy 130-D? Wait: 128 != 130 -> incompatible version
     return { score: 0, details: { incompatibleTemplate: true } };
   }
 
   // Legacy 130-D fallback
   const vecRefs = refs.filter((r): r is number[] => Array.isArray(r) && r.length === probe.length);
   const scored = scoreVectorRefs(probe, vecRefs, 'legacy');
-  return { score: scored.score, details: { legacyVector: true, rawCosine: scored.rawCosine } };
+  const legacyDecision: FingerprintDecision = scored.score >= threshold ? 'MATCH' : 'NO MATCH';
+  return {
+    score: scored.score,
+    decision: legacyDecision,
+    details: { legacyVector: true, rawCosine: scored.rawCosine, decision: legacyDecision },
+  };
 }
 
 function getBaseWeight(m: ModalityName): number {
@@ -154,9 +186,12 @@ export function fuseMultimodalScores(params: {
     score: number;
     rawCosine?: number;
     qualityScore: number;
+    inconclusive?: boolean;
+    decision?: FingerprintDecision;
     details?: Record<string, unknown>;
   }>>;
   livenessPassed?: boolean;
+  livenessStatus?: LivenessStatus;
   livenessScore?: number;
 }): FusionEvaluationResult {
   const {
@@ -165,8 +200,11 @@ export function fuseMultimodalScores(params: {
     thresholds,
     available,
     livenessPassed = true,
+    livenessStatus: rawLivenessStatus,
     livenessScore = 0.88,
   } = params;
+
+  const livenessStatus: LivenessStatus = rawLivenessStatus || (livenessPassed ? 'LIVENESS PASSED' : 'LIVENESS FAILED');
 
   const thrMap: Record<ModalityName, number> = {
     face: thresholds.face ?? 0.72,
@@ -178,14 +216,25 @@ export function fuseMultimodalScores(params: {
     const item = available[m];
     if (!item) return null;
     const thr = thrMap[m];
-    const strongMismatch = item.score <= Math.max(0.20, thr - 0.16) || item.score < 0.36;
+    const q = Math.max(0, Math.min(100, Math.round(item.qualityScore)));
+    const score = Number(item.score.toFixed(4));
+    const strongMismatch = score <= Math.max(0.20, thr - 0.16) || score < 0.36;
+    const isInconclusive =
+      item.inconclusive === true ||
+      item.decision === 'INCONCLUSIVE' ||
+      q < 40 ||
+      (q < 55 && Math.abs(score - thr) <= 0.035);
+    const passed = !isInconclusive && score >= thr;
+    const status: ModalityStatus = isInconclusive ? 'INCONCLUSIVE' : passed ? 'MATCH' : 'NO MATCH';
     return {
       modality: m,
-      score: Number(item.score.toFixed(4)),
+      score,
       rawCosine: item.rawCosine,
       threshold: thr,
-      qualityScore: Math.max(0, Math.min(100, Math.round(item.qualityScore))),
-      passed: item.score >= thr,
+      qualityScore: q,
+      passed,
+      inconclusive: isInconclusive,
+      status,
       strongMismatch,
       details: item.details,
     };
@@ -220,6 +269,7 @@ export function fuseMultimodalScores(params: {
     // hierarchical
     const fEval = evaluateModality('face');
     if (!fEval) {
+      const msg = 'Hierarchical verification requires a face probe and enrolled face template.';
       return {
         pipeline,
         fusionPolicy,
@@ -231,8 +281,11 @@ export function fuseMultimodalScores(params: {
         confidenceBand: 'low',
         conflictDetected: false,
         conflictDetails: [],
-        rejectionReasons: ['Hierarchical verification requires a face probe and enrolled face template.'],
+        rejectionReasons: [msg],
         outcome: 'not_evaluated',
+        finalDecision: 'INCONCLUSIVE',
+        livenessStatus,
+        fusionExplanation: msg,
         reasonCode: 'missing_face_modality',
       };
     }
@@ -251,7 +304,7 @@ export function fuseMultimodalScores(params: {
       if (available.voice) requested.push('voice');
       if (available.fingerprint) requested.push('fingerprint');
       if (requested.length === 1) {
-        // Uncertain band with no secondary modality available
+        const msg = `Face similarity (${(fEval.score * 100).toFixed(1)}%) landed in the uncertain band (${(lowGate * 100).toFixed(0)}%–${(highGate * 100).toFixed(0)}%); secondary Voice or Fingerprint probe required.`;
         return {
           pipeline: 'hierarchical',
           fusionPolicy,
@@ -263,15 +316,19 @@ export function fuseMultimodalScores(params: {
           confidenceBand: 'low',
           conflictDetected: false,
           conflictDetails: [],
-          rejectionReasons: [
-            `Face similarity (${(fEval.score * 100).toFixed(1)}%) landed in the uncertain band (${(lowGate * 100).toFixed(0)}%–${(highGate * 100).toFixed(0)}%); secondary Voice or Fingerprint probe required.`,
-          ],
+          rejectionReasons: [msg],
           outcome: 'not_evaluated',
+          finalDecision: 'INCONCLUSIVE',
+          livenessStatus,
+          fusionExplanation: msg,
           reasonCode: 'hierarchical_uncertain_secondary_required',
           stage: 'Uncertain band — secondary factor required',
         };
       }
-      baseThreshold = requested.length === 3 ? (thresholds.threeModal ?? 0.74) : Number(((thrMap.face + (available.voice ? thrMap.voice : thrMap.fingerprint)) / 2).toFixed(4));
+      baseThreshold =
+        requested.length === 3
+          ? thresholds.threeModal ?? 0.74
+          : Number(((thrMap.face + (available.voice ? thrMap.voice : thrMap.fingerprint)) / 2).toFixed(4));
       stage = `Stage 2 Escalated Multimodal Fusion (${requested.join(' + ')})`;
     }
   }
@@ -290,6 +347,7 @@ export function fuseMultimodalScores(params: {
   }
 
   if (missing.length > 0 || evals.length === 0) {
+    const msg = `Missing required modality sample or enrolled template: ${missing.join(', ')}`;
     return {
       pipeline,
       fusionPolicy,
@@ -301,14 +359,17 @@ export function fuseMultimodalScores(params: {
       confidenceBand: 'low',
       conflictDetected: false,
       conflictDetails: [],
-      rejectionReasons: [`Missing required modality sample or enrolled template: ${missing.join(', ')}`],
+      rejectionReasons: [msg],
       outcome: 'not_evaluated',
+      finalDecision: 'INCONCLUSIVE',
+      livenessStatus,
+      fusionExplanation: msg,
       reasonCode: 'missing_template_or_sample',
       stage,
     };
   }
 
-  // Quality-weighted fusion (only justified by modality reliability & signal quality)
+  // Quality-weighted fusion (inconclusive modalities receive zero approval boost)
   let weightSum = 0;
   let weightedScoreSum = 0;
   for (const ev of evals) {
@@ -319,12 +380,12 @@ export function fuseMultimodalScores(params: {
   }
   const finalScore = Number((weightSum > 0 ? weightedScoreSum / weightSum : 0).toFixed(4));
 
-  // Conflict Detection:
-  // Prevent a weak/passing modality from overriding strong mismatch evidence on another modality
+  // Conflict Detection: strong mismatch on one modality blocks override by another
   const conflictDetails: string[] = [];
   const rejectionReasons: string[] = [];
   const passing = evals.filter((e) => e.passed);
   const failing = evals.filter((e) => !e.passed);
+  const inconclusiveMods = evals.filter((e) => e.inconclusive);
   const strongMismatches = evals.filter((e) => e.strongMismatch);
   const scores = evals.map((e) => e.score);
   const spread = scores.length >= 2 ? Math.max(...scores) - Math.min(...scores) : 0;
@@ -344,24 +405,45 @@ export function fuseMultimodalScores(params: {
     );
   }
 
-  // Determine outcome according to fusionPolicy + conflict guard + liveness
-  let outcome: 'match' | 'no_match' = 'no_match';
+  // Determine 3-state Final Decision: VERIFIED | REJECTED | INCONCLUSIVE
+  let outcome: 'match' | 'no_match' | 'not_evaluated' = 'no_match';
+  let finalDecision: FinalDecision = 'REJECTED';
   let reasonCode = `${pipeline}_match`;
 
-  if (!livenessPassed) {
+  if (livenessStatus === 'LIVENESS FAILED' || !livenessPassed) {
     outcome = 'no_match';
+    finalDecision = 'REJECTED';
     reasonCode = 'spoof_or_liveness_failed';
     rejectionReasons.push('Liveness / anti-spoofing check failed.');
   } else if (conflictDetected) {
     outcome = 'no_match';
+    finalDecision = 'REJECTED';
     reasonCode = 'conflicting_biometric_evidence';
     rejectionReasons.push(...conflictDetails);
+  } else if (strongMismatches.length > 0) {
+    outcome = 'no_match';
+    finalDecision = 'REJECTED';
+    reasonCode = `${strongMismatches[0].modality}_strong_mismatch`;
+    for (const sm of strongMismatches) {
+      rejectionReasons.push(`${sm.modality} showed strong mismatch (${(sm.score * 100).toFixed(1)}%).`);
+    }
+  } else if (inconclusiveMods.length > 0 && (evals.length === 1 || fusionPolicy === 'strict_and')) {
+    outcome = 'not_evaluated';
+    finalDecision = 'INCONCLUSIVE';
+    reasonCode = `${inconclusiveMods[0].modality}_inconclusive`;
+    for (const inc of inconclusiveMods) {
+      rejectionReasons.push(
+        `${inc.modality} probe returned INCONCLUSIVE (quality ${inc.qualityScore}/100, similarity ${(inc.score * 100).toFixed(1)}%). Recapture required.`
+      );
+    }
   } else if (fusionPolicy === 'strict_and') {
     if (failing.length === 0 && finalScore >= baseThreshold) {
       outcome = 'match';
+      finalDecision = 'VERIFIED';
       reasonCode = `${pipeline}_strict_match`;
     } else {
       outcome = 'no_match';
+      finalDecision = 'REJECTED';
       reasonCode = 'strict_policy_modality_failed';
       for (const f of failing) {
         rejectionReasons.push(`${f.modality} similarity (${(f.score * 100).toFixed(1)}%) fell below ${(f.threshold * 100).toFixed(0)}% threshold.`);
@@ -371,18 +453,26 @@ export function fuseMultimodalScores(params: {
       }
     }
   } else {
-    // weighted_score or hierarchical_adaptive: still disallow match if strong mismatch exists even without passing peers
-    if (strongMismatches.length > 0) {
-      outcome = 'no_match';
-      reasonCode = `${strongMismatches[0].modality}_strong_mismatch`;
-      for (const sm of strongMismatches) {
-        rejectionReasons.push(`${sm.modality} showed strong mismatch (${(sm.score * 100).toFixed(1)}%).`);
-      }
-    } else if (finalScore >= baseThreshold) {
+    // weighted_score or hierarchical_adaptive: inconclusive modality cannot approve on its own
+    if (inconclusiveMods.length === evals.length) {
+      outcome = 'not_evaluated';
+      finalDecision = 'INCONCLUSIVE';
+      reasonCode = 'all_modalities_inconclusive';
+      rejectionReasons.push('All submitted modalities returned INCONCLUSIVE quality or borderline evidence.');
+    } else if (finalScore >= baseThreshold && inconclusiveMods.length === 0) {
       outcome = 'match';
+      finalDecision = 'VERIFIED';
       reasonCode = stage?.includes('Stage 1') ? 'hierarchical_stage1_face_match' : `${pipeline}_match`;
+    } else if (finalScore >= baseThreshold && inconclusiveMods.length > 0) {
+      outcome = 'not_evaluated';
+      finalDecision = 'INCONCLUSIVE';
+      reasonCode = 'partial_inconclusive_escalation';
+      rejectionReasons.push(
+        `Weighted similarity reached ${(finalScore * 100).toFixed(1)}%, but ${inconclusiveMods.map((i) => i.modality).join(', ')} returned INCONCLUSIVE.`
+      );
     } else {
       outcome = 'no_match';
+      finalDecision = 'REJECTED';
       reasonCode = `${pipeline}_below_threshold`;
       rejectionReasons.push(`Fused similarity (${(finalScore * 100).toFixed(1)}%) fell below ${(baseThreshold * 100).toFixed(0)}% threshold.`);
       for (const f of failing) {
@@ -391,15 +481,25 @@ export function fuseMultimodalScores(params: {
     }
   }
 
-  // Calibrated Verification Confidence (NOT raw cosine similarity!)
+  // Calibrated Verification Confidence (distinct from similarity score)
   const margin = Math.abs(finalScore - baseThreshold);
-  const marginFactor = Math.min(1, margin / 0.22); // 0 at exact boundary, 1 at >=22pp margin
+  const marginFactor = Math.min(1, margin / 0.22);
   const meanQuality = evals.reduce((s, e) => s + e.qualityScore, 0) / evals.length / 100;
   const agreementFactor = conflictDetected ? 0.25 : evals.length >= 2 && failing.length === 0 ? 1.0 : 0.78;
-  const rawConf = (0.45 * marginFactor + 0.30 * meanQuality + 0.15 * livenessScore + 0.10 * agreementFactor);
-  const confidence = Number(Math.max(0.05, Math.min(0.99, conflictDetected ? rawConf * 0.65 : rawConf)).toFixed(3));
+  const rawConf = 0.45 * marginFactor + 0.30 * meanQuality + 0.15 * livenessScore + 0.10 * agreementFactor;
+  const confidence = Number(
+    Math.max(0.05, Math.min(0.99, conflictDetected || finalDecision === 'INCONCLUSIVE' ? rawConf * 0.65 : rawConf)).toFixed(3)
+  );
   const confidenceBand: 'high' | 'moderate' | 'low' =
     confidence >= 0.75 ? 'high' : confidence >= 0.48 ? 'moderate' : 'low';
+
+  const modSummary = evals.map((e) => `${e.modality}: ${e.status} (${(e.score * 100).toFixed(1)}%)`).join(', ');
+  const fusionExplanation =
+    finalDecision === 'VERIFIED'
+      ? `VERIFIED under ${fusionPolicy} policy. Fused score ${(finalScore * 100).toFixed(1)}% met threshold ${(baseThreshold * 100).toFixed(0)}% across [${modSummary}]. Liveness status: ${livenessStatus}.`
+      : finalDecision === 'INCONCLUSIVE'
+      ? `INCONCLUSIVE outcome (${reasonCode}). ${rejectionReasons[0] || `Evaluated [${modSummary}].`} Re-capture with higher quality or an additional modality is advised.`
+      : `REJECTED under ${fusionPolicy} policy (${reasonCode}). ${rejectionReasons[0] || `Fused score ${(finalScore * 100).toFixed(1)}% vs ${(baseThreshold * 100).toFixed(0)}% threshold.`} [${modSummary}].`;
 
   return {
     pipeline,
@@ -414,7 +514,11 @@ export function fuseMultimodalScores(params: {
     conflictDetails,
     rejectionReasons,
     outcome,
+    finalDecision,
+    livenessStatus,
+    fusionExplanation,
     reasonCode,
     stage,
   };
 }
+

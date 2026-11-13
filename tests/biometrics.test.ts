@@ -8,6 +8,7 @@ process.env.BIOGUARD_SKIP_LISTEN = '1';
 import { extractVoiceFeaturesV2 } from '../src/shared/voiceDsp.ts';
 import {
   FP_SIZE,
+  classifyFingerprintDecision,
   extractFingerprintTemplateFromGray128,
   matchFingerprintTemplates,
 } from '../src/shared/fingerprintEngine.ts';
@@ -261,6 +262,24 @@ test('Fingerprint Engine: rejects blank images, supports rotation/translation/pa
     rotRes.score > impRes.score + 0.12 && shiftRes.score > impRes.score + 0.15,
     `Expected rotated/shifted genuine scores (${rotRes.score}, ${shiftRes.score}) well above impostor (${impRes.score})`
   );
+
+  // Quality labels, templateStatus, and explicit 3-state classifyFingerprintDecision (MATCH | NO MATCH | INCONCLUSIVE)
+  assert.equal(refA.qualityLabel, 'Good Quality');
+  assert.equal(refA.templateStatus, 'Valid Minutiae Template');
+  assert.equal(blankTpl.qualityLabel, 'Insufficient Ridge Details');
+  assert.equal(blankTpl.templateStatus, 'Insufficient Features');
+
+  assert.equal(classifyFingerprintDecision(selfRes, 0.72, refA.qualityScore, true).decision, 'MATCH');
+  assert.equal(classifyFingerprintDecision(impRes, 0.72, impB.qualityScore, true).decision, 'NO MATCH');
+  assert.equal(
+    classifyFingerprintDecision({ ...selfRes, score: 0.73, matchedMinutiae: 2 }, 0.72, 70, true).decision,
+    'INCONCLUSIVE'
+  );
+  assert.equal(
+    classifyFingerprintDecision({ ...selfRes, score: 0.73 }, 0.72, 52, true).decision,
+    'INCONCLUSIVE'
+  );
+  assert.equal(classifyFingerprintDecision(selfRes, 0.72, 30, false).decision, 'INCONCLUSIVE');
 });
 
 test('Multimodal Fusion Engine: enforces all 7 pipelines, conflict guard, strict_and policy, hierarchical escalation & calibrated confidence', () => {
@@ -354,6 +373,50 @@ test('Multimodal Fusion Engine: enforces all 7 pipelines, conflict guard, strict
   });
   assert.notEqual(boundaryMatch.confidence, boundaryMatch.finalScore);
   assert.ok(strongMatch.confidence > boundaryMatch.confidence + 0.25);
+
+  // 6. Explicit 3-outcome finalDecision (VERIFIED | REJECTED | INCONCLUSIVE) & 4-state liveness gating
+  assert.equal(strongMatch.finalDecision, 'VERIFIED');
+  assert.equal(strongMatch.livenessStatus, 'LIVENESS PASSED');
+  assert.equal(strictRes.finalDecision, 'REJECTED');
+
+  const livenessFailRes = fuseMultimodalScores({
+    pipeline: 'face_only',
+    thresholds,
+    available: { face: { score: 0.94, qualityScore: 95 } },
+    livenessPassed: false,
+    livenessStatus: 'LIVENESS FAILED',
+    livenessScore: 0.18,
+  });
+  assert.equal(livenessFailRes.finalDecision, 'REJECTED');
+  assert.equal(livenessFailRes.livenessStatus, 'LIVENESS FAILED');
+  assert.equal(livenessFailRes.reasonCode, 'spoof_or_liveness_failed');
+
+  // Static upload yields INCONCLUSIVE livenessStatus yet allows VERIFIED if identity evidence passes without spoof trigger
+  const staticFaceRes = fuseMultimodalScores({
+    pipeline: 'face_only',
+    thresholds,
+    available: { face: { score: 0.91, qualityScore: 90 } },
+    livenessPassed: true,
+    livenessStatus: 'INCONCLUSIVE',
+    livenessScore: 0.5,
+  });
+  assert.equal(staticFaceRes.livenessStatus, 'INCONCLUSIVE');
+  assert.equal(staticFaceRes.finalDecision, 'VERIFIED');
+
+  // Fingerprint INCONCLUSIVE must prevent false VERIFIED approval
+  const fpIncRes = fuseMultimodalScores({
+    pipeline: 'face_fingerprint',
+    fusionPolicy: 'weighted_score',
+    thresholds,
+    available: {
+      face: { score: 0.93, qualityScore: 92 },
+      fingerprint: { score: 0.73, qualityScore: 50, inconclusive: true, decision: 'INCONCLUSIVE' },
+    },
+    livenessPassed: true,
+    livenessStatus: 'LIVENESS PASSED',
+  });
+  assert.equal(fpIncRes.finalDecision, 'INCONCLUSIVE');
+  assert.equal(fpIncRes.modalityEvaluations.fingerprint.status, 'INCONCLUSIVE');
 });
 
 test('Metrics & Subject-Disjoint Evaluation: exact confusion formulas, Wilson CI, EER/AUC, unlabeled exclusion & zero identity leakage', () => {
@@ -446,12 +509,42 @@ test('Metrics & Subject-Disjoint Evaluation: exact confusion formulas, Wilson CI
   const disjointMetrics = computeClassificationMetrics(disjointTrials, 0.70);
   assert.equal(disjointMetrics.insufficientData, false);
   assert.ok(disjointMetrics.accuracy >= 0.83, `Expected subject-disjoint voice accuracy >= 0.83, got ${disjointMetrics.accuracy}`);
+
+  // Strict 3-dataset isolation + capture failure tracking
+  const mixedReport = buildBiometricAnalyticsReport(
+    [
+      { outcome: 'match', finalDecision: 'VERIFIED', score: 0.91, groundTruth: 'unlabeled', datasetCategory: 'operational', livenessStatus: 'LIVENESS PASSED', processingTimeMs: 44 },
+      { outcome: 'not_evaluated', finalDecision: 'INCONCLUSIVE', reasonCode: 'fingerprint_inconclusive', captureFailure: true, groundTruth: 'unlabeled', datasetCategory: 'operational', livenessStatus: 'NOT SUPPORTED', processingTimeMs: 21 },
+      { outcome: 'match', finalDecision: 'VERIFIED', score: 0.93, groundTruth: 'genuine', datasetCategory: 'synthetic_qa', isTestProbe: true, livenessStatus: 'LIVENESS PASSED', processingTimeMs: 31 },
+      { outcome: 'no_match', finalDecision: 'REJECTED', score: 0.29, groundTruth: 'impostor', datasetCategory: 'synthetic_qa', isTestProbe: true, livenessStatus: 'LIVENESS FAILED', processingTimeMs: 28 },
+    ],
+    2,
+    2
+  );
+  assert.equal(mixedReport.datasets.operational.totalAttempts, 2);
+  assert.equal(mixedReport.datasets.operational.verifiedCount, 1);
+  assert.equal(mixedReport.datasets.operational.inconclusiveCount, 1);
+  assert.equal(mixedReport.datasets.operational.captureFailureCount, 1);
+  assert.equal(mixedReport.datasets.operational.captureFailureRate, 0.5);
+  assert.equal(mixedReport.datasets.syntheticQa.totalProbes, 2);
+  assert.equal(mixedReport.datasets.benchmark.totalLabeledTrials, 2);
+  assert.equal(mixedReport.datasets.benchmark.operationalLabeledTrials, 0);
+  assert.equal(mixedReport.datasets.benchmark.insufficientData, true);
+  assert.equal(mixedReport.datasets.benchmark.insufficientDataMessage, 'Insufficient evaluation data.');
 });
 
-test('Server Vault AES-256-GCM encryption round-trip and HTTP auth / health checks', async () => {
+test('Server Vault AES-256-GCM v2 secret enforcement, key rotation, health diagnostics & HTTP auth checks', async () => {
   process.env.BIOGUARD_SKIP_LISTEN = '1';
+  const prevSecret = process.env.BIOGUARD_VAULT_SECRET;
+  const prevPrevSecret = process.env.BIOGUARD_VAULT_SECRET_PREVIOUS;
   const serverMod = await import('../server.ts');
-  const { decryptVaultMap, encryptVaultMap, default: app } = serverMod;
+  const {
+    VaultSecretError,
+    decryptVaultMap,
+    decryptVaultMapWithMeta,
+    encryptVaultMap,
+    default: app,
+  } = serverMod;
   assert.equal(serverMod.FEATURE_VERSION, FEATURE_VERSION);
 
   const sampleVault = {
@@ -463,46 +556,109 @@ test('Server Vault AES-256-GCM encryption round-trip and HTTP auth / health chec
       modalities: { face: [[0.1, 0.2, 0.3]] },
     },
   };
-  const encrypted = encryptVaultMap(sampleVault);
-  const parsed = JSON.parse(encrypted) as { alg: string };
-  assert.equal(parsed.alg, 'aes-256-gcm');
-  const decrypted = decryptVaultMap(encrypted);
-  assert.deepEqual(decrypted, sampleVault);
-
-  const server = http.createServer(app);
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const addr = server.address() as AddressInfo;
-  const baseUrl = `http://127.0.0.1:${addr.port}`;
 
   try {
-    const healthRes = await fetch(`${baseUrl}/api/v1/health`);
-    assert.equal(healthRes.status, 200);
-    const health = (await healthRes.json()) as { status: string; feature_version: string };
-    assert.equal(health.status, 'ok');
-    assert.equal(health.feature_version, FEATURE_VERSION);
+    // 1. Fail-closed when BIOGUARD_VAULT_SECRET is unset or too short
+    delete process.env.BIOGUARD_VAULT_SECRET;
+    delete process.env.BIOGUARD_VAULT_SECRET_PREVIOUS;
+    assert.throws(() => encryptVaultMap(sampleVault), VaultSecretError);
+    process.env.BIOGUARD_VAULT_SECRET = 'too-short-secret';
+    assert.throws(() => encryptVaultMap(sampleVault), VaultSecretError);
 
-    const protectedGets = ['/api/v1/auth/me'];
-    for (const ep of protectedGets) {
-      const r = await fetch(`${baseUrl}${ep}`);
-      assert.equal(r.status, 401, `Expected 401 on unauthenticated GET ${ep}, got ${r.status}`);
+    // 2. HTTP /api/v1/health stays HTTP 200 with vault_ready=false when secret is unconfigured
+    const unconfServer = http.createServer(app);
+    await new Promise<void>((resolve) => unconfServer.listen(0, '127.0.0.1', resolve));
+    const unconfAddr = unconfServer.address() as AddressInfo;
+    try {
+      const hRes = await fetch(`http://127.0.0.1:${unconfAddr.port}/api/v1/health`);
+      assert.equal(hRes.status, 200);
+      const hJson = (await hRes.json()) as { vault_ready: boolean; vault_mode: string };
+      assert.equal(hJson.vault_ready, false);
+      assert.equal(hJson.vault_mode, 'not_configured');
+    } finally {
+      await new Promise<void>((resolve, reject) => unconfServer.close((err) => (err ? reject(err) : resolve())));
     }
 
-    const protectedPosts = [
-      '/api/v1/identities/enroll',
-      '/api/v1/verification/multimodal',
-      '/api/v1/identities/compare',
-      '/api/v1/identities/identify',
-    ];
-    for (const ep of protectedPosts) {
-      const r = await fetch(`${baseUrl}${ep}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
-      });
-      assert.equal(r.status, 401, `Expected 401 on unauthenticated POST ${ep}, got ${r.status}`);
+    // 3. Configure strong 32+ char vault secret -> v2 per-record random salt + scrypt AES-256-GCM
+    const oldSecret = 'old-test-vault-secret-minimum-32-characters-0001';
+    const newSecret = 'new-rotated-vault-secret-minimum-32-chars-0002';
+    process.env.BIOGUARD_VAULT_SECRET = oldSecret;
+
+    const enc1 = encryptVaultMap(sampleVault);
+    const enc2 = encryptVaultMap(sampleVault);
+    const parsed1 = JSON.parse(enc1) as { v: number; kdf: string; alg: string; salt: string; ciphertext: string };
+    const parsed2 = JSON.parse(enc2) as { salt: string; ciphertext: string };
+    assert.equal(parsed1.v, 2);
+    assert.equal(parsed1.kdf, 'scrypt');
+    assert.equal(parsed1.alg, 'aes-256-gcm');
+    assert.notEqual(parsed1.salt, parsed2.salt);
+    assert.notEqual(parsed1.ciphertext, parsed2.ciphertext);
+    assert.deepEqual(decryptVaultMap(enc1), sampleVault);
+
+    // 4. Key rotation: previous secret -> primary secret re-encryption
+    process.env.BIOGUARD_VAULT_SECRET = newSecret;
+    process.env.BIOGUARD_VAULT_SECRET_PREVIOUS = oldSecret;
+    const meta = decryptVaultMapWithMeta(enc1);
+    assert.equal(meta.rotatedFromPrevious, true);
+    assert.equal(meta.needsRotation, true);
+    assert.deepEqual(meta.map, sampleVault);
+
+    const rotatedPayload = encryptVaultMap(meta.map);
+    delete process.env.BIOGUARD_VAULT_SECRET_PREVIOUS;
+    const rotatedMeta = decryptVaultMapWithMeta(rotatedPayload);
+    assert.equal(rotatedMeta.rotatedFromPrevious, false);
+    assert.equal(rotatedMeta.needsRotation, false);
+    assert.deepEqual(rotatedMeta.map, sampleVault);
+
+    // 5. HTTP health (configured) + strict 401 auth enforcement on protected endpoints
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address() as AddressInfo;
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const healthRes = await fetch(`${baseUrl}/api/v1/health`);
+      assert.equal(healthRes.status, 200);
+      const health = (await healthRes.json()) as {
+        status: string;
+        feature_version: string;
+        vault_ready: boolean;
+        vault_mode: string;
+      };
+      assert.equal(health.status, 'ok');
+      assert.equal(health.feature_version, FEATURE_VERSION);
+      assert.equal(health.vault_ready, true);
+      assert.equal(health.vault_mode, 'env_secret_v2');
+
+      const protectedGets = ['/api/v1/auth/me', '/api/v1/diagnostics'];
+      for (const ep of protectedGets) {
+        const r = await fetch(`${baseUrl}${ep}`);
+        assert.equal(r.status, 401, `Expected 401 on unauthenticated GET ${ep}, got ${r.status}`);
+      }
+
+      const protectedPosts = [
+        '/api/v1/identities/enroll',
+        '/api/v1/verification/multimodal',
+        '/api/v1/identities/compare',
+        '/api/v1/identities/identify',
+        '/api/v1/vault/rotate',
+      ];
+      for (const ep of protectedPosts) {
+        const r = await fetch(`${baseUrl}${ep}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        assert.equal(r.status, 401, `Expected 401 on unauthenticated POST ${ep}, got ${r.status}`);
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
     }
   } finally {
-    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    if (prevSecret === undefined) delete process.env.BIOGUARD_VAULT_SECRET;
+    else process.env.BIOGUARD_VAULT_SECRET = prevSecret;
+    if (prevPrevSecret === undefined) delete process.env.BIOGUARD_VAULT_SECRET_PREVIOUS;
+    else process.env.BIOGUARD_VAULT_SECRET_PREVIOUS = prevPrevSecret;
   }
 });
 

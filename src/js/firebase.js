@@ -202,10 +202,6 @@ export async function provisionUserProfile(fbUser) {
         photoURL: (fbUser.photoURL || existingData.photoURL || '').slice(0, 500),
         lastLoginAt: serverTimestamp(),
       };
-      // Automatically activate legacy read-only viewer profiles into their own isolated operator workspace
-      if (existingData.status === 'active' && existingData.role === 'viewer') {
-        updates.role = 'operator';
-      }
       await updateDoc(ref, updates);
       const updated = await getDoc(ref);
       return updated.data();
@@ -316,6 +312,10 @@ export async function recordVerificationMetadata({
   modalities,
   pipeline,
   outcome,
+  finalDecision,
+  livenessStatus,
+  datasetCategory,
+  captureFailure = false,
   reasonCode,
   score,
   confidence,
@@ -338,6 +338,8 @@ export async function recordVerificationMetadata({
   const path = `users/${uid}/verification_records/${verificationId}`;
   const t0 = performance.now();
   try {
+    const derivedDatasetCategory = datasetCategory
+      || (isTestProbe ? 'synthetic_qa' : groundTruth !== 'unlabeled' ? 'benchmark_eval' : 'operational');
     const docData = {
       verificationId,
       identityRef,
@@ -348,8 +350,16 @@ export async function recordVerificationMetadata({
       reasonCode: String(reasonCode || 'evaluated').slice(0, 80),
       score: typeof score === 'number' ? Number(score.toFixed(4)) : 0,
       operatorUid: uid,
+      datasetCategory: derivedDatasetCategory,
+      captureFailure: Boolean(captureFailure),
       createdAt: serverTimestamp(),
     };
+    if (['VERIFIED', 'REJECTED', 'INCONCLUSIVE'].includes(finalDecision)) {
+      docData.finalDecision = finalDecision;
+    }
+    if (['LIVENESS PASSED', 'LIVENESS FAILED', 'INCONCLUSIVE', 'NOT SUPPORTED'].includes(livenessStatus)) {
+      docData.livenessStatus = livenessStatus;
+    }
     if (typeof riskScore === 'number') docData.riskScore = Math.min(100, Math.max(0, Math.round(riskScore)));
     if (['low', 'medium', 'high', 'critical'].includes(riskLevel)) docData.riskLevel = riskLevel;
     if (typeof livenessPassed === 'boolean') docData.livenessPassed = livenessPassed;
@@ -372,14 +382,30 @@ export async function recordVerificationMetadata({
     if (modalityEvaluations?.face) {
       docData.faceScore = Number(Math.min(1, Math.max(0, modalityEvaluations.face.score)).toFixed(4));
       docData.faceQuality = Math.min(100, Math.max(0, Math.round(modalityEvaluations.face.qualityScore)));
+      if (['MATCH', 'NO MATCH', 'INCONCLUSIVE'].includes(modalityEvaluations.face.status)) {
+        docData.faceStatus = modalityEvaluations.face.status;
+      }
     }
     if (modalityEvaluations?.voice) {
       docData.voiceScore = Number(Math.min(1, Math.max(0, modalityEvaluations.voice.score)).toFixed(4));
       docData.voiceQuality = Math.min(100, Math.max(0, Math.round(modalityEvaluations.voice.qualityScore)));
+      if (['MATCH', 'NO MATCH', 'INCONCLUSIVE'].includes(modalityEvaluations.voice.status)) {
+        docData.voiceStatus = modalityEvaluations.voice.status;
+      }
     }
     if (modalityEvaluations?.fingerprint) {
       docData.fingerprintScore = Number(Math.min(1, Math.max(0, modalityEvaluations.fingerprint.score)).toFixed(4));
       docData.fingerprintQuality = Math.min(100, Math.max(0, Math.round(modalityEvaluations.fingerprint.qualityScore)));
+      if (['MATCH', 'NO MATCH', 'INCONCLUSIVE'].includes(modalityEvaluations.fingerprint.status)) {
+        docData.fingerprintStatus = modalityEvaluations.fingerprint.status;
+      }
+      const fpDet = modalityEvaluations.fingerprint.details || {};
+      if (typeof fpDet.matchedMinutiae === 'number') {
+        docData.matchedMinutiae = Math.max(0, Math.min(500, Math.round(fpDet.matchedMinutiae)));
+      }
+      if (typeof fpDet.probeMinutiae === 'number') {
+        docData.probeMinutiae = Math.max(0, Math.min(500, Math.round(fpDet.probeMinutiae)));
+      }
     }
 
     await setDoc(doc(db, 'users', uid, 'verification_records', verificationId), docData);
