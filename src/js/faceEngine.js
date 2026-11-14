@@ -66,7 +66,7 @@ export async function ensureFaceEngineReady(onProgress) {
       const h = new Human(HUMAN_CONFIG);
       try {
         await h.load();
-      } catch (webglErr) {
+      } catch {
         // Fallback to CPU backend if WebGL is unavailable in headless/restricted contexts
         h.config.backend = 'cpu';
         await h.load();
@@ -79,7 +79,7 @@ export async function ensureFaceEngineReady(onProgress) {
       modelLoadStatus = 'error';
       modelLoadError = err instanceof Error ? err.message : 'Failed to load face ML models.';
       initPromise = null;
-      throw new Error(`Face model initialization failed: ${modelLoadError}`);
+      throw new Error(`Face model initialization failed: ${modelLoadError}`, { cause: err });
     }
   })();
 
@@ -132,6 +132,42 @@ function measureRoiImageQuality(source, box) {
     faceWidthPx: bw,
     faceHeightPx: bh,
   };
+}
+
+function ptDist(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return 0;
+  return Math.hypot((a[0] || 0) - (b[0] || 0), (a[1] || 0) - (b[1] || 0));
+}
+
+function eyeRatioFromAnnotations(upper, lower) {
+  if (!Array.isArray(upper) || !Array.isArray(lower) || upper.length < 5 || lower.length < 5) return null;
+  const hDist = ptDist(upper[0], upper[upper.length - 1]);
+  if (hDist <= 1) return null;
+  const v1 = ptDist(upper[Math.floor(upper.length * 0.35)], lower[Math.floor(lower.length * 0.35)]);
+  const v2 = ptDist(upper[Math.floor(upper.length * 0.65)], lower[Math.floor(lower.length * 0.65)]);
+  return (v1 + v2) / (2 * hDist);
+}
+
+function measureEyeAspectRatio(face) {
+  const ann = face?.annotations;
+  if (ann) {
+    const lEar = eyeRatioFromAnnotations(ann.leftEyeUpper0, ann.leftEyeLower0);
+    const rEar = eyeRatioFromAnnotations(ann.rightEyeUpper0, ann.rightEyeLower0);
+    if (lEar !== null && rEar !== null) return Number(((lEar + rEar) / 2).toFixed(4));
+    if (lEar !== null) return Number(lEar.toFixed(4));
+    if (rEar !== null) return Number(rEar.toFixed(4));
+  }
+  const mesh = face?.mesh;
+  if (Array.isArray(mesh) && mesh.length >= 388) {
+    const lh = ptDist(mesh[33], mesh[133]);
+    const lv = ptDist(mesh[159], mesh[145]);
+    const rh = ptDist(mesh[362], mesh[263]);
+    const rv = ptDist(mesh[386], mesh[374]);
+    if (lh > 1 && rh > 1) {
+      return Number((((lv / lh) + (rv / rh)) / 2).toFixed(4));
+    }
+  }
+  return null;
 }
 
 // Fast live-preview check for webcam guidance overlay
@@ -248,6 +284,7 @@ export async function extractPretrainedFaceFeatures(source, extraMeta = {}) {
 
   const antispoofScore = typeof face.real === 'number' ? Number(face.real.toFixed(3)) : null;
   const livenessNetScore = typeof face.live === 'number' ? Number(face.live.toFixed(3)) : null;
+  const eyeAspectRatio = measureEyeAspectRatio(face);
   const detConf = Number((face.faceScore || face.boxScore || face.score || 0).toFixed(3));
   const posePenalty = (Math.abs(yawDeg) + Math.abs(pitchDeg) + Math.abs(rollDeg)) * 0.45;
   const faceQualityScore = Math.max(
@@ -287,6 +324,7 @@ export async function extractPretrainedFaceFeatures(source, extraMeta = {}) {
       poseYawDeg: yawDeg,
       posePitchDeg: pitchDeg,
       poseRollDeg: rollDeg,
+      eyeAspectRatio,
       antispoofScore,
       livenessNetScore,
       faceQualityScore,
@@ -335,24 +373,30 @@ function dotCosine(a, b) {
   return Number(s.toFixed(4));
 }
 
-// Multi-frame live webcam capture: extracts 3 frames ~220ms apart, checks motion & inter-frame embedding consistency
-export async function captureMultiFrameFaceFeatures(videoEl, delayMs = 220) {
+// Multi-frame live webcam capture: extracts 3–4 frames apart, checks motion, blink/head-turn challenge & inter-frame consistency
+export async function captureMultiFrameFaceFeatures(videoEl, opts = 220) {
   if (!videoEl || videoEl.readyState < 2) {
     const err = new Error('Camera feed not ready for capture.');
     err.code = 'camera_not_ready';
     throw err;
   }
+  const challenge = typeof opts === 'object' && opts ? opts.challenge : undefined;
+  const delayMs = typeof opts === 'number' ? opts : (opts?.delayMs ?? (challenge ? 260 : 220));
+  const targetFrames = challenge ? 4 : 3;
+
   const frames = [];
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < targetFrames; i++) {
     frames.push(snapshotVideoToCanvas(videoEl));
-    if (i < 2) {
+    if (i < targetFrames - 1) {
       await new Promise((r) => setTimeout(r, delayMs));
     }
   }
 
-  const motionAB = computeCanvasMotion(frames[0], frames[1]);
-  const motionBC = computeCanvasMotion(frames[1], frames[2]);
-  const frameMotionScore = Number(Math.max(motionAB, motionBC).toFixed(4));
+  let frameMotionScore = 0;
+  for (let i = 0; i < frames.length - 1; i++) {
+    frameMotionScore = Math.max(frameMotionScore, computeCanvasMotion(frames[i], frames[i + 1]));
+  }
+  frameMotionScore = Number(frameMotionScore.toFixed(4));
 
   const extracted = [];
   for (let i = 0; i < frames.length; i++) {
@@ -364,27 +408,65 @@ export async function captureMultiFrameFaceFeatures(videoEl, delayMs = 220) {
     extracted.push({ feat, canvas: frames[i] });
   }
 
-  const cos01 = dotCosine(extracted[0].feat.vector, extracted[1].feat.vector);
-  const cos12 = dotCosine(extracted[1].feat.vector, extracted[2].feat.vector);
-  const frameConsistencyCosine = Number(Math.min(cos01, cos12).toFixed(4));
+  let frameConsistencyCosine = 1;
+  for (let i = 0; i < extracted.length - 1; i++) {
+    const cos = dotCosine(extracted[i].feat.vector, extracted[i + 1].feat.vector);
+    frameConsistencyCosine = Math.min(frameConsistencyCosine, cos);
+  }
+  frameConsistencyCosine = Number(frameConsistencyCosine.toFixed(4));
 
-  if (frameConsistencyCosine < 0.78) {
+  const minConsistency = challenge === 'turn_left' || challenge === 'turn_right' ? 0.72 : 0.78;
+  if (frameConsistencyCosine < minConsistency) {
     const err = new Error(
-      `Multi-frame consistency check failed (cosine=${frameConsistencyCosine} < 0.78). Hold steady in front of camera.`
+      `Multi-frame consistency check failed (cosine=${frameConsistencyCosine} < ${minConsistency}). Hold steady in front of camera.`
     );
     err.code = 'multi_frame_inconsistent';
     err.feedbackLabel = 'Blurry Capture';
     throw err;
   }
 
-  extracted.sort((a, b) => (b.feat.quality?.faceQualityScore || 0) - (a.feat.quality?.faceQualityScore || 0));
+  const earValues = extracted
+    .map((x) => x.feat.quality?.eyeAspectRatio)
+    .filter((v) => typeof v === 'number' && Number.isFinite(v));
+  const eyeAspectRatioMin = earValues.length ? Number(Math.min(...earValues).toFixed(4)) : null;
+  const eyeAspectRatioDelta =
+    earValues.length >= 2 ? Number((Math.max(...earValues) - Math.min(...earValues)).toFixed(4)) : 0;
+  const blinkDetected = earValues.length >= 2 && (eyeAspectRatioMin < 0.23 || eyeAspectRatioDelta >= 0.045);
+
+  const yawValues = extracted
+    .map((x) => x.feat.quality?.poseYawDeg)
+    .filter((v) => typeof v === 'number' && Number.isFinite(v));
+  const headYawDeltaDeg =
+    yawValues.length >= 2 ? Number((Math.max(...yawValues) - Math.min(...yawValues)).toFixed(1)) : 0;
+
+  let challengeCompleted;
+  if (challenge === 'blink') {
+    challengeCompleted = blinkDetected;
+  } else if (challenge === 'turn_left' || challenge === 'turn_right') {
+    challengeCompleted = headYawDeltaDeg >= 5;
+  }
+
+  // Prefer the most frontal frame as biometric embedding, retaining dynamic challenge telemetry
+  extracted.sort((a, b) => {
+    const scoreA = (a.feat.quality?.faceQualityScore || 0) - Math.abs(a.feat.quality?.poseYawDeg || 0) * 0.5;
+    const scoreB = (b.feat.quality?.faceQualityScore || 0) - Math.abs(b.feat.quality?.poseYawDeg || 0) * 0.5;
+    return scoreB - scoreA;
+  });
   const best = extracted[0];
   best.feat.quality.multiFrameVerified = true;
-  best.feat.quality.frameCount = 3;
+  best.feat.quality.frameCount = frames.length;
   best.feat.quality.frameConsistencyCosine = frameConsistencyCosine;
   best.feat.quality.frameMotionScore = frameMotionScore;
   best.feat.quality.isLiveCapture = true;
   best.feat.quality.captureSource = 'webcam';
+  if (eyeAspectRatioMin !== null) best.feat.quality.eyeAspectRatioMin = eyeAspectRatioMin;
+  best.feat.quality.eyeAspectRatioDelta = eyeAspectRatioDelta;
+  best.feat.quality.blinkDetected = blinkDetected;
+  best.feat.quality.headYawDeltaDeg = headYawDeltaDeg;
+  if (challenge) {
+    best.feat.quality.challengeType = challenge;
+    best.feat.quality.challengeCompleted = Boolean(challengeCompleted);
+  }
 
   return {
     ...best.feat,

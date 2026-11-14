@@ -9,8 +9,11 @@ import {
   scoreVectorRefs,
   scoreFingerprintAgainstRefs,
   type FusionPolicy,
+  type LivenessDecision,
+  type LivenessPolicy,
   type LivenessStatus,
   type ModalityName,
+  type ModalityWeightConfig,
   type ThresholdConfig,
 } from './src/shared/fusionEngine.ts';
 import type { FingerprintQualityLabel, FingerprintTemplate } from './src/shared/fingerprintEngine.ts';
@@ -87,6 +90,12 @@ interface ModalityQualityInput {
     faceHeightPx?: number;
     faceQualityScore?: number;
     captureSource?: string;
+    blinkDetected?: boolean;
+    eyeAspectRatioMin?: number;
+    eyeAspectRatioDelta?: number;
+    headYawDeltaDeg?: number;
+    challengeType?: string;
+    challengeCompleted?: boolean;
   };
   voice?: {
     durationSec?: number;
@@ -103,6 +112,7 @@ interface ModalityQualityInput {
     feedbackLabel?: string;
     spoofSignals?: string[];
     captureSource?: string;
+    challengePassphraseMatch?: boolean;
   };
   fingerprint?: {
     ridgeDensity?: number;
@@ -513,15 +523,196 @@ function evaluateModalityQuality(
   return { ok: errors.length === 0, errors, warnings, checks, qualityScores };
 }
 
+// Ephemeral per-process CSPRNG key used for challenge HMAC signing only when BIOGUARD_VAULT_SECRET is not set in local dev
+const EPHEMERAL_CHALLENGE_KEY = crypto.randomBytes(32);
+const CHALLENGE_WORDS = [
+  'amber', 'beacon', 'cobalt', 'delta', 'ember', 'falcon', 'granite', 'harbor',
+  'indigo', 'jasper', 'kestrel', 'lumen', 'meadow', 'nimbus', 'onyx', 'prism',
+  'quartz', 'ripple', 'sierra', 'timber', 'umbra', 'vertex', 'willow', 'zenith',
+];
+const FACE_CHALLENGES = ['blink', 'turn_left', 'turn_right'] as const;
+const replayNonceStore = new Map<string, number>();
+
+function pruneExpiredNonces(now = Date.now()): void {
+  if (replayNonceStore.size < 200) return;
+  for (const [k, exp] of replayNonceStore.entries()) {
+    if (exp <= now) replayNonceStore.delete(k);
+  }
+}
+
+export function consumeReplayNonceLocal(namespace: string, key: string, ttlMs = 300_000): boolean {
+  const cleanKey = String(key || '').trim();
+  if (!cleanKey) return false;
+  const now = Date.now();
+  pruneExpiredNonces(now);
+  const fullKey = `${namespace}:${cleanKey}`;
+  const existingExp = replayNonceStore.get(fullKey);
+  if (existingExp && existingExp > now) {
+    return false;
+  }
+  replayNonceStore.set(fullKey, now + Math.max(1000, ttlMs));
+  return true;
+}
+
+export async function consumeReplayNonce(namespace: string, key: string, ttlMs = 300_000): Promise<boolean> {
+  const cleanKey = String(key || '').trim();
+  if (!cleanKey) return false;
+  const upstashUrl = process.env.UPSTASH_REDIS_REST_URL?.trim();
+  const upstashToken = process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
+  if (upstashUrl && upstashToken) {
+    try {
+      const redisKey = `bgx:nonce:${namespace}:${cleanKey}`;
+      const r = await fetch(`${upstashUrl.replace(/\/$/, '')}/set/${encodeURIComponent(redisKey)}/1/PX/${Math.max(1000, ttlMs)}/NX`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${upstashToken}` },
+        signal: AbortSignal.timeout(2500),
+      });
+      if (r.ok) {
+        const payload = (await r.json()) as { result?: string | null };
+        if (payload.result !== 'OK') return false;
+        // Also record locally as belt-and-suspenders within same instance
+        consumeReplayNonceLocal(namespace, cleanKey, ttlMs);
+        return true;
+      }
+    } catch {
+      // Fall back to process-local replay store
+    }
+  }
+  return consumeReplayNonceLocal(namespace, cleanKey, ttlMs);
+}
+
+function getChallengeSigningKey(secretOverride?: string): Buffer {
+  const raw = secretOverride !== undefined ? secretOverride.trim() : process.env.BIOGUARD_VAULT_SECRET?.trim() || '';
+  if (raw.length >= 32) {
+    return crypto.createHmac('sha256', raw).update('bioguard-liveness-challenge-v1').digest();
+  }
+  return EPHEMERAL_CHALLENGE_KEY;
+}
+
+export interface LivenessChallengePayload {
+  v: 1;
+  uid: string;
+  nonce: string;
+  faceChallenge: 'blink' | 'turn_left' | 'turn_right';
+  voicePassphrase: string;
+  issuedAt: number;
+  expiresAt: number;
+}
+
+export function createChallengeToken(params: {
+  uid: string;
+  ttlMs?: number;
+  secretOverride?: string;
+}): {
+  challengeToken: string;
+  nonce: string;
+  faceChallenge: 'blink' | 'turn_left' | 'turn_right';
+  voicePassphrase: string;
+  issuedAt: number;
+  expiresAt: number;
+} {
+  const ttlMs = Math.max(5_000, Math.min(300_000, params.ttlMs ?? 120_000));
+  const issuedAt = Date.now();
+  const expiresAt = issuedAt + ttlMs;
+  const nonce = crypto.randomUUID();
+  const faceChallenge = FACE_CHALLENGES[crypto.randomInt(FACE_CHALLENGES.length)];
+
+  // Pick 3 distinct words using CSPRNG
+  const picked: string[] = [];
+  const pool = [...CHALLENGE_WORDS];
+  for (let i = 0; i < 3; i++) {
+    const idx = crypto.randomInt(pool.length);
+    picked.push(pool.splice(idx, 1)[0]);
+  }
+  const voicePassphrase = picked.join(' ');
+
+  const payload: LivenessChallengePayload = {
+    v: 1,
+    uid: params.uid,
+    nonce,
+    faceChallenge,
+    voicePassphrase,
+    issuedAt,
+    expiresAt,
+  };
+  const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const sigB64 = crypto
+    .createHmac('sha256', getChallengeSigningKey(params.secretOverride))
+    .update(payloadB64)
+    .digest('base64url');
+
+  return {
+    challengeToken: `${payloadB64}.${sigB64}`,
+    nonce,
+    faceChallenge,
+    voicePassphrase,
+    issuedAt,
+    expiresAt,
+  };
+}
+
+export async function verifyChallengeToken(params: {
+  token: string;
+  uid: string;
+  consume?: boolean;
+  secretOverride?: string;
+}): Promise<{ valid: boolean; reason?: string; payload?: LivenessChallengePayload }> {
+  const raw = String(params.token || '').trim();
+  const parts = raw.split('.');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    return { valid: false, reason: 'malformed_challenge_token' };
+  }
+  const [payloadB64, sigB64] = parts;
+  const expectedSig = crypto
+    .createHmac('sha256', getChallengeSigningKey(params.secretOverride))
+    .update(payloadB64)
+    .digest();
+  let actualSig: Buffer;
+  try {
+    actualSig = Buffer.from(sigB64, 'base64url');
+  } catch {
+    return { valid: false, reason: 'invalid_signature_encoding' };
+  }
+  if (actualSig.length !== expectedSig.length || !crypto.timingSafeEqual(actualSig, expectedSig)) {
+    return { valid: false, reason: 'invalid_challenge_signature' };
+  }
+
+  let parsed: LivenessChallengePayload;
+  try {
+    parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as LivenessChallengePayload;
+  } catch {
+    return { valid: false, reason: 'invalid_challenge_payload' };
+  }
+  if (!parsed || parsed.v !== 1 || parsed.uid !== params.uid || !parsed.nonce) {
+    return { valid: false, reason: 'challenge_subject_mismatch' };
+  }
+  const now = Date.now();
+  if (typeof parsed.expiresAt !== 'number' || now > parsed.expiresAt) {
+    return { valid: false, reason: 'challenge_expired' };
+  }
+
+  if (params.consume !== false) {
+    const fresh = await consumeReplayNonce(`challenge:${params.uid}`, parsed.nonce, parsed.expiresAt - now + 10_000);
+    if (!fresh) {
+      return { valid: false, reason: 'challenge_replay_detected' };
+    }
+  }
+  return { valid: true, payload: parsed };
+}
+
 // Honest 4-state Liveness & Anti-Spoofing Evaluator
 // Never falsely reports LIVENESS PASSED on static uploads or browser fingerprint images without hardware PAD sensors.
 function evaluateLiveness(
   modalities: { face: boolean; voice: boolean; fingerprint: boolean },
-  quality: ModalityQualityInput | undefined
+  quality: ModalityQualityInput | undefined,
+  challengeCtx?: { valid: boolean; reason?: string; payload?: LivenessChallengePayload }
 ): {
   passed: boolean;
   status: LivenessStatus;
+  decision: LivenessDecision;
   score: number;
+  challengeVerified: boolean;
+  trustedSensorAttestation: false;
   perModality: Record<string, LivenessStatus>;
   spoofSignals: string[];
   checks: string[];
@@ -530,6 +721,11 @@ function evaluateLiveness(
   const spoofSignals: string[] = [];
   const checks: string[] = [];
   const perModality: Record<string, LivenessStatus> = {};
+  let challengeVerified = false;
+
+  if (challengeCtx && !challengeCtx.valid && challengeCtx.reason) {
+    checks.push(`Liveness challenge token invalid (${challengeCtx.reason}); treating active challenge as unverified.`);
+  }
 
   if (modalities.face) {
     const fq = quality?.face;
@@ -565,12 +761,32 @@ function evaluateLiveness(
           faceFailed = true;
           spoofSignals.push(`Static webcam feed detected (motion=${fq.frameMotionScore ?? 0}; possible photo/screen spoof)`);
         }
+        const expectedChallenge = challengeCtx?.valid ? challengeCtx.payload?.faceChallenge : undefined;
+        const challengePassed = Boolean(
+          challengeCtx?.valid &&
+            fq.challengeCompleted === true &&
+            (!expectedChallenge || !fq.challengeType || fq.challengeType === expectedChallenge)
+        );
+        if (challengePassed) {
+          challengeVerified = true;
+        }
+
         if (faceFailed) {
           perModality.face = 'LIVENESS FAILED';
+        } else if (challengeCtx && !challengeCtx.valid) {
+          perModality.face = 'INCONCLUSIVE';
+          score = Math.min(score, 0.62);
+          checks.push(`Live motion observed, but cryptographic challenge verification failed (${challengeCtx.reason}).`);
+        } else if (fq.challengeCompleted === false) {
+          perModality.face = 'INCONCLUSIVE';
+          score = Math.min(score, 0.58);
+          checks.push(`Active face challenge (${fq.challengeType || expectedChallenge || 'liveness'}) was not completed during capture.`);
         } else {
-          score = Math.min(0.98, Math.max(score, 0.86) + 0.08);
+          score = Math.min(0.98, Math.max(score, 0.86) + (challengePassed ? 0.10 : 0.06));
           perModality.face = 'LIVENESS PASSED';
-          checks.push(`Live multi-frame motion verified (delta=${fq.frameMotionScore}${typeof fq.antispoofScore === 'number' ? `, neural=${Math.round(fq.antispoofScore * 100)}%` : ''})`);
+          checks.push(
+            `Live multi-frame motion verified (delta=${fq.frameMotionScore}${challengePassed ? `, challenge=${expectedChallenge}` : ''}${typeof fq.antispoofScore === 'number' ? `, neural=${Math.round(fq.antispoofScore * 100)}%` : ''})`
+          );
         }
       } else {
         perModality.face = faceFailed ? 'LIVENESS FAILED' : 'INCONCLUSIVE';
@@ -602,9 +818,14 @@ function evaluateLiveness(
       score -= 0.28;
       perModality.voice = 'LIVENESS FAILED';
       spoofSignals.push(...vq.spoofSignals);
+    } else if (challengeCtx?.valid && vq.challengePassphraseMatch === true) {
+      perModality.voice = 'LIVENESS PASSED';
+      challengeVerified = true;
+      score = Math.min(0.96, Math.max(score, 0.85));
+      checks.push(`Voice acoustic & passphrase challenge verified (DR=${vq.dynamicRangeDb ?? '—'}dB, SNR=${vq.snrEstimateDb ?? '—'}dB)`);
     } else {
       perModality.voice = 'INCONCLUSIVE';
-      checks.push(`Voice spectral replay check clean (DR=${vq.dynamicRangeDb ?? '—'}dB, SNR=${vq.snrEstimateDb ?? '—'}dB); randomized passphrase challenge not enforced (INCONCLUSIVE)`);
+      checks.push(`Voice spectral replay check clean (DR=${vq.dynamicRangeDb ?? '—'}dB, SNR=${vq.snrEstimateDb ?? '—'}dB); spoken passphrase verification INCONCLUSIVE in browser mic mode`);
     }
   }
 
@@ -624,7 +845,11 @@ function evaluateLiveness(
   let status: LivenessStatus = 'INCONCLUSIVE';
   if (vals.includes('LIVENESS FAILED') || spoofSignals.length > 0) {
     status = 'LIVENESS FAILED';
-  } else if (perModality.face === 'LIVENESS PASSED') {
+  } else if (vals.length > 0 && vals.every((v) => v === 'LIVENESS PASSED')) {
+    status = 'LIVENESS PASSED';
+  } else if (perModality.face === 'LIVENESS PASSED' && !modalities.voice && !modalities.fingerprint) {
+    status = 'LIVENESS PASSED';
+  } else if (perModality.face === 'LIVENESS PASSED' && perModality.voice !== 'INCONCLUSIVE') {
     status = 'LIVENESS PASSED';
   } else if (vals.length > 0 && vals.every((v) => v === 'NOT SUPPORTED')) {
     status = 'NOT SUPPORTED';
@@ -632,11 +857,16 @@ function evaluateLiveness(
     status = 'INCONCLUSIVE';
   }
 
+  const decision: LivenessDecision =
+    status === 'LIVENESS FAILED' ? 'FAILED' : status === 'LIVENESS PASSED' ? 'PASSED' : 'INCONCLUSIVE';
   const clamped = Number(Math.max(0.05, Math.min(0.99, score)).toFixed(2));
   return {
     passed: status !== 'LIVENESS FAILED' && clamped >= 0.45,
     status,
+    decision,
     score: clamped,
+    challengeVerified,
+    trustedSensorAttestation: false,
     perModality,
     spoofSignals,
     checks,
@@ -1013,7 +1243,7 @@ function sanitizeFusionPolicy(raw: unknown): FusionPolicy {
   return 'hierarchical_adaptive';
 }
 
-function parseThresholds(raw: Record<string, number> | undefined): ThresholdConfig {
+function parseThresholds(raw: Record<string, number | undefined> | undefined): ThresholdConfig {
   const clamp = (v: unknown, def: number) =>
     typeof v === 'number' && Number.isFinite(v) ? Math.min(0.98, Math.max(0.3, v)) : def;
   return {
@@ -1025,8 +1255,204 @@ function parseThresholds(raw: Record<string, number> | undefined): ThresholdConf
   };
 }
 
+function parseModalityWeights(raw: unknown): ModalityWeightConfig | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const obj = raw as Record<string, unknown>;
+  const out: ModalityWeightConfig = {};
+  for (const k of ['face', 'voice', 'fingerprint'] as const) {
+    if (typeof obj[k] === 'number' && Number.isFinite(obj[k]) && (obj[k] as number) >= 0.05 && (obj[k] as number) <= 1.0) {
+      out[k] = Number((obj[k] as number).toFixed(3));
+    }
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+interface WorkspacePolicySnapshot {
+  loaded: boolean;
+  thresholds: ThresholdConfig;
+  fusionPolicy?: FusionPolicy;
+  strictLiveness: boolean;
+  modalityWeights?: ModalityWeightConfig;
+}
+
+function parseFirestoreNumberField(field: { doubleValue?: number; integerValue?: string } | undefined): number | undefined {
+  if (!field) return undefined;
+  if (typeof field.doubleValue === 'number' && Number.isFinite(field.doubleValue)) return field.doubleValue;
+  if (typeof field.integerValue === 'string') {
+    const n = Number(field.integerValue);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+async function loadWorkspacePolicy(uid: string, idToken: string): Promise<WorkspacePolicySnapshot | null> {
+  try {
+    const url = firestoreDocUrl(`users/${encodeURIComponent(uid)}/system_settings/default`);
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${idToken}` },
+      signal: AbortSignal.timeout(4000),
+    });
+    if (res.status === 404 || !res.ok) return null;
+    const payload = (await res.json()) as {
+      fields?: {
+        faceThreshold?: { doubleValue?: number; integerValue?: string };
+        voiceThreshold?: { doubleValue?: number; integerValue?: string };
+        fingerprintThreshold?: { doubleValue?: number; integerValue?: string };
+        threeModalThreshold?: { doubleValue?: number; integerValue?: string };
+        fusionPolicy?: { stringValue?: string };
+        strictLiveness?: { booleanValue?: boolean };
+        modalityWeights?: {
+          mapValue?: {
+            fields?: Record<string, { doubleValue?: number; integerValue?: string }>;
+          };
+        };
+      };
+    };
+    const f = payload.fields;
+    if (!f) return null;
+    const thresholds = parseThresholds({
+      face: parseFirestoreNumberField(f.faceThreshold),
+      voice: parseFirestoreNumberField(f.voiceThreshold),
+      fingerprint: parseFirestoreNumberField(f.fingerprintThreshold),
+      threeModal: parseFirestoreNumberField(f.threeModalThreshold),
+    });
+    const weightsFields = f.modalityWeights?.mapValue?.fields;
+    const modalityWeights = weightsFields
+      ? parseModalityWeights({
+          face: parseFirestoreNumberField(weightsFields.face),
+          voice: parseFirestoreNumberField(weightsFields.voice),
+          fingerprint: parseFirestoreNumberField(weightsFields.fingerprint),
+        })
+      : undefined;
+    const rawPolicy = f.fusionPolicy?.stringValue;
+    const fusionPolicy =
+      rawPolicy === 'weighted_score' || rawPolicy === 'strict_and' || rawPolicy === 'hierarchical_adaptive'
+        ? rawPolicy
+        : undefined;
+    return {
+      loaded: true,
+      thresholds,
+      fusionPolicy,
+      strictLiveness: f.strictLiveness?.booleanValue === true,
+      modalityWeights,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function mergeAuthoritativePolicy(
+  workspace: WorkspacePolicySnapshot | null,
+  clientBody: {
+    thresholds?: Record<string, number | undefined>;
+    fusionPolicy?: unknown;
+    strictLiveness?: boolean;
+    modalityWeights?: unknown;
+  }
+): {
+  thresholds: ThresholdConfig;
+  fusionPolicy: FusionPolicy;
+  livenessPolicy: LivenessPolicy;
+  modalityWeights?: ModalityWeightConfig;
+} {
+  const clientThr = parseThresholds(clientBody.thresholds);
+  const clientPolicy = sanitizeFusionPolicy(clientBody.fusionPolicy);
+  const clientWeights = parseModalityWeights(clientBody.modalityWeights);
+
+  if (!workspace) {
+    return {
+      thresholds: clientThr,
+      fusionPolicy: clientPolicy,
+      livenessPolicy: { strictLiveness: clientBody.strictLiveness === true },
+      modalityWeights: clientWeights,
+    };
+  }
+
+  // Authoritative workspace policy acts as a floor so client cannot loosen thresholds or disable strict liveness
+  const thresholds: ThresholdConfig = {
+    face: Math.max(workspace.thresholds.face, clientThr.face),
+    voice: Math.max(workspace.thresholds.voice, clientThr.voice),
+    fingerprint: Math.max(workspace.thresholds.fingerprint, clientThr.fingerprint),
+    early: Math.max(workspace.thresholds.early, clientThr.early),
+    threeModal: Math.max(workspace.thresholds.threeModal, clientThr.threeModal),
+  };
+  const fusionPolicy: FusionPolicy =
+    workspace.fusionPolicy === 'strict_and' ? 'strict_and' : workspace.fusionPolicy || clientPolicy;
+  const livenessPolicy: LivenessPolicy = {
+    strictLiveness: workspace.strictLiveness || clientBody.strictLiveness === true,
+  };
+  const modalityWeights = workspace.modalityWeights || clientWeights;
+  return { thresholds, fusionPolicy, livenessPolicy, modalityWeights };
+}
+
+export function isOriginAllowed(origin: string, hostHeader?: string): boolean {
+  const cleanOrigin = origin.trim();
+  if (!cleanOrigin) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(cleanOrigin);
+  } catch {
+    return false;
+  }
+  const allowedList = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (allowedList.includes(cleanOrigin)) return true;
+
+  const cleanHost = (hostHeader || '').trim().toLowerCase();
+  if (cleanHost && parsed.host.toLowerCase() === cleanHost) return true;
+
+  if (
+    process.env.NODE_ENV !== 'production' &&
+    (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export const app = express();
 app.set('trust proxy', 1);
+
+// Security response headers (preserves AI Studio iframe embedding & Google Sign-In popup compatibility)
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=()');
+  res.setHeader('X-DNS-Prefetch-Control', 'off');
+  if (process.env.NODE_ENV === 'production' || req.secure || req.headers['x-forwarded-proto'] === 'https') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+
+// Strict Origin/CORS guard for explicit cross-origin requests
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const origin = req.headers.origin;
+  if (typeof origin === 'string' && origin.trim()) {
+    const hostHeader = req.get('host');
+    if (!isOriginAllowed(origin, hostHeader)) {
+      res.status(403).json({
+        error: 'cors_origin_denied',
+        message: 'Cross-origin request denied by server CORS policy.',
+      });
+      return;
+    }
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Idempotency-Key');
+    res.setHeader('Access-Control-Max-Age', '600');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+  }
+  next();
+});
+
 app.use(express.json({ limit: '2mb' }));
 
 const asyncHandler = (
@@ -1180,6 +1606,26 @@ app.get('/api/v1/auth/me', requireAuth, (req: AuthedRequest, res: Response) => {
   });
 });
 
+// 2b. Single-Use Signed Liveness Challenge Endpoint
+app.post(
+  '/api/v1/liveness/challenge',
+  requireAuth,
+  requireCapability('perform_verification'),
+  rateLimit(30, 60_000, 'liveness_challenge'),
+  (req: AuthedRequest, res: Response) => {
+    const ch = createChallengeToken({ uid: req.auth!.uid, ttlMs: 120_000 });
+    res.status(201).json({
+      status: 'ok',
+      challengeToken: ch.challengeToken,
+      nonce: ch.nonce,
+      faceChallenge: ch.faceChallenge,
+      voicePassphrase: ch.voicePassphrase,
+      expiresAt: ch.expiresAt,
+      singleUse: true,
+    });
+  }
+);
+
 // 3. Biometric Enrollment (Quality gate + AES-256-GCM encrypted server-side storage)
 app.post(
   '/api/v1/identities/enroll',
@@ -1194,7 +1640,25 @@ app.post(
       consentRecorded?: boolean;
       samples?: { face?: unknown; voice?: unknown; fingerprint?: unknown };
       quality?: ModalityQualityInput;
+      requestNonce?: string;
     };
+
+    const idemKey = String(req.headers['idempotency-key'] || body.requestNonce || '').trim();
+    if (idemKey) {
+      if (!/^[a-zA-Z0-9_.:-]{8,128}$/.test(idemKey)) {
+        res.status(400).json({ error: 'invalid_idempotency_key', message: 'Idempotency-Key format is invalid.', requestId });
+        return;
+      }
+      const fresh = await consumeReplayNonce(`idem_enroll:${req.auth!.uid}`, idemKey, 10 * 60_000);
+      if (!fresh) {
+        res.status(409).json({
+          error: 'duplicate_request_replay',
+          message: 'Duplicate enrollment Idempotency-Key detected and rejected.',
+          requestId,
+        });
+        return;
+      }
+    }
 
     const identityRef = String(body.identityRef || '').trim();
     if (!/^[a-zA-Z0-9_-]{2,64}$/.test(identityRef)) {
@@ -1313,16 +1777,36 @@ app.post(
       pipeline?: string;
       fusionPolicy?: FusionPolicy;
       adaptiveEnabled?: boolean;
+      strictLiveness?: boolean;
+      modalityWeights?: ModalityWeightConfig;
       thresholds?: Record<string, number>;
+      challengeToken?: string;
+      requestNonce?: string;
       samples?: { face?: unknown; voice?: unknown; fingerprint?: unknown };
       quality?: ModalityQualityInput;
       groundTruth?: 'genuine' | 'impostor' | 'unlabeled';
       isTestProbe?: boolean;
     };
 
+    const idemKey = String(req.headers['idempotency-key'] || body.requestNonce || '').trim();
+    if (idemKey) {
+      if (!/^[a-zA-Z0-9_.:-]{8,128}$/.test(idemKey)) {
+        res.status(400).json({ error: 'invalid_idempotency_key', message: 'Idempotency-Key format is invalid.', requestId });
+        return;
+      }
+      const fresh = await consumeReplayNonce(`idem_verify:${req.auth!.uid}`, idemKey, 10 * 60_000);
+      if (!fresh) {
+        res.status(409).json({
+          error: 'duplicate_request_replay',
+          message: 'Duplicate verification Idempotency-Key detected and rejected.',
+          requestId,
+        });
+        return;
+      }
+    }
+
     const identityRef = String(body.identityRef || '').trim();
     const pipeline = String(body.pipeline || 'hierarchical').trim();
-    const fusionPolicy = sanitizeFusionPolicy(body.fusionPolicy);
     const adaptiveEnabled = body.adaptiveEnabled !== false;
 
     if (!/^[a-zA-Z0-9_-]{2,64}$/.test(identityRef)) {
@@ -1330,7 +1814,12 @@ app.post(
       return;
     }
 
-    const entry = await loadVaultEntry(req.auth!.uid, identityRef, req.auth!.idToken);
+    const [entry, workspacePolicy] = await Promise.all([
+      loadVaultEntry(req.auth!.uid, identityRef, req.auth!.idToken),
+      loadWorkspacePolicy(req.auth!.uid, req.auth!.idToken),
+    ]);
+    const policy = mergeAuthoritativePolicy(workspacePolicy, body);
+    const fusionPolicy = policy.fusionPolicy;
     if (!entry) {
       res.status(404).json({
         error: 'missing_identity',
@@ -1431,7 +1920,7 @@ app.post(
       }
     }
 
-    const thr = parseThresholds(body.thresholds);
+    const thr = policy.thresholds;
 
     if (fpParsed && refsFp.length > 0) {
       const scored = scoreFingerprintAgainstRefs(fpParsed.template, refsFp, thr.fingerprint);
@@ -1460,15 +1949,22 @@ app.post(
       return;
     }
 
+    const challengeCtx = body.challengeToken
+      ? await verifyChallengeToken({ token: body.challengeToken, uid: req.auth!.uid, consume: true })
+      : undefined;
+
     const liveness = evaluateLiveness(
       { face: Boolean(faceParsed), voice: Boolean(voiceParsed), fingerprint: Boolean(fpParsed) },
-      body.quality
+      body.quality,
+      challengeCtx
     );
 
     const fusion = fuseMultimodalScores({
       pipeline,
       fusionPolicy,
       thresholds: thr,
+      modalityWeights: policy.modalityWeights,
+      livenessPolicy: policy.livenessPolicy,
       available,
       livenessPassed: liveness.passed,
       livenessStatus: liveness.status,
@@ -1568,11 +2064,17 @@ app.post(
       outcome,
       finalDecision,
       livenessStatus: liveness.status,
+      livenessDecision: liveness.decision,
+      challengeVerified: liveness.challengeVerified,
+      trustedSensorAttestation: liveness.trustedSensorAttestation,
       fusionExplanation: adaptiveReason ? `${fusion.fusionExplanation} ${adaptiveReason}` : fusion.fusionExplanation,
       policy_decision: 'pending',
       reasonCode,
       score: fusion.finalScore,
       confidence: fusion.confidence,
+      identityConfidence: fusion.identityConfidence,
+      sampleQualityScore: fusion.sampleQualityScore,
+      livenessConfidence: fusion.livenessConfidence,
       confidenceBand: fusion.confidenceBand,
       threshold: effectiveThreshold,
       baseThreshold: fusion.baseThreshold,
@@ -1601,7 +2103,8 @@ function compareEntriesServer(
   entryA: VaultEntry,
   entryB: VaultEntry,
   thresholds: ThresholdConfig,
-  fusionPolicy: FusionPolicy
+  fusionPolicy: FusionPolicy,
+  modalityWeights?: ModalityWeightConfig
 ) {
   const available: Parameters<typeof fuseMultimodalScores>[0]['available'] = {};
   const incompatibleModalities: string[] = [];
@@ -1677,7 +2180,16 @@ function compareEntriesServer(
   }
 
   const fusion = mods.length
-    ? fuseMultimodalScores({ pipeline, fusionPolicy, thresholds, available, livenessPassed: true, livenessScore: 0.9 })
+    ? fuseMultimodalScores({
+        pipeline,
+        fusionPolicy,
+        thresholds,
+        modalityWeights,
+        available,
+        livenessPassed: true,
+        livenessStatus: 'NOT SUPPORTED',
+        livenessScore: 0.5,
+      })
     : null;
 
   return {
@@ -1701,6 +2213,7 @@ app.post(
       identityRefA?: string;
       identityRefB?: string;
       fusionPolicy?: FusionPolicy;
+      modalityWeights?: ModalityWeightConfig;
       thresholds?: Record<string, number>;
     };
 
@@ -1711,9 +2224,10 @@ app.post(
       return;
     }
 
-    const [entryA, entryB] = await Promise.all([
+    const [entryA, entryB, workspacePolicy] = await Promise.all([
       loadVaultEntry(req.auth!.uid, refA, req.auth!.idToken),
       loadVaultEntry(req.auth!.uid, refB, req.auth!.idToken),
+      loadWorkspacePolicy(req.auth!.uid, req.auth!.idToken),
     ]);
     if (!entryA || !entryB) {
       res.status(404).json({
@@ -1724,9 +2238,10 @@ app.post(
       return;
     }
 
-    const thresholds = parseThresholds(body.thresholds);
-    const fusionPolicy = sanitizeFusionPolicy(body.fusionPolicy);
-    const cmp = compareEntriesServer(entryA, entryB, thresholds, fusionPolicy);
+    const policy = mergeAuthoritativePolicy(workspacePolicy, body);
+    const thresholds = policy.thresholds;
+    const fusionPolicy = policy.fusionPolicy;
+    const cmp = compareEntriesServer(entryA, entryB, thresholds, fusionPolicy, policy.modalityWeights);
     const processingTimeMs = Number((performance.now() - t0).toFixed(1));
 
     if (!cmp.fusion) {
@@ -1788,9 +2303,13 @@ app.post(
     };
 
     const topK = Math.min(25, Math.max(1, Number(body.topK || 5)));
-    const thresholds = parseThresholds(body.thresholds);
-    const fusionPolicy = sanitizeFusionPolicy(body.fusionPolicy);
-    const allVaultEntries = await listVaultEntries(req.auth!.uid, req.auth!.idToken, 500);
+    const [allVaultEntries, workspacePolicy] = await Promise.all([
+      listVaultEntries(req.auth!.uid, req.auth!.idToken, 500),
+      loadWorkspacePolicy(req.auth!.uid, req.auth!.idToken),
+    ]);
+    const policy = mergeAuthoritativePolicy(workspacePolicy, body);
+    const thresholds = policy.thresholds;
+    const fusionPolicy = policy.fusionPolicy;
 
     let probeEntry: VaultEntry | null = null;
     if (body.sourceIdentityRef) {
@@ -1857,7 +2376,7 @@ app.post(
     let incompatibleCandidates = 0;
 
     for (const candidate of candidates) {
-      const cmp = compareEntriesServer(probeEntry, candidate, thresholds, fusionPolicy);
+      const cmp = compareEntriesServer(probeEntry, candidate, thresholds, fusionPolicy, policy.modalityWeights);
       if (!cmp.fusion) {
         if (cmp.incompatibleModalities.length > 0) incompatibleCandidates++;
         continue;

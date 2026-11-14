@@ -203,6 +203,9 @@ export interface VerificationRecordLike {
   faceScore?: number;
   voiceScore?: number;
   fingerprintScore?: number;
+  faceQuality?: number;
+  voiceQuality?: number;
+  fingerprintQuality?: number;
   createdAt?: { toMillis?: () => number } | string | number;
 }
 
@@ -230,6 +233,7 @@ export interface OperationalDatasetReport {
   livenessPassedCount: number;
   livenessFailedCount: number;
   livenessInconclusiveCount: number;
+  livenessNotSupportedCount: number;
   avgProcessingTimeMs: number | null;
   avgRiskScore: number | null;
 }
@@ -254,6 +258,21 @@ export interface BenchmarkDatasetReport {
   operationalOnlyClassification: ClassificationMetricsResult | null;
 }
 
+export interface SampleQualityDistribution {
+  measuredCount: number;
+  goodCount: number;
+  borderlineCount: number;
+  poorCount: number;
+  meanQuality: number | null;
+}
+
+export interface LivenessBreakdown {
+  passed: number;
+  failed: number;
+  inconclusive: number;
+  notSupported: number;
+}
+
 export interface ComprehensiveAnalyticsReport {
   totalIdentities: number;
   activeIdentities: number;
@@ -265,11 +284,15 @@ export interface ComprehensiveAnalyticsReport {
   successfulVerifications: number;
   rejectedVerifications: number;
   notEvaluatedVerifications: number;
+  inconclusiveRate: number;
   captureFailureCount: number;
   captureFailureRate: number;
   operationalVerificationSuccessRate: number; // Match / Evaluated operational attempts
   livenessKnownCount: number;
   livenessSuccessRate: number;
+  livenessFailureRate: number;
+  livenessBreakdown: LivenessBreakdown;
+  sampleQualityDistribution: SampleQualityDistribution;
   conflictCount: number;
   avgRiskScore: number | null;
   latency: {
@@ -347,6 +370,7 @@ export function buildBiometricAnalyticsReport(
   const successful = records.filter((r) => r.outcome === 'match').length;
   const rejected = records.filter((r) => r.outcome === 'no_match').length;
   const notEvaluated = records.filter((r) => r.outcome === 'not_evaluated' || r.finalDecision === 'INCONCLUSIVE').length;
+  const inconclusiveRate = records.length ? Number((notEvaluated / records.length).toFixed(4)) : 0;
   const captureFailureCount = records.filter(isCaptureFailureRecord).length;
   const captureFailureRate = records.length ? Number((captureFailureCount / records.length).toFixed(4)) : 0;
 
@@ -361,11 +385,31 @@ export function buildBiometricAnalyticsReport(
     ? Number((successful / evaluatedAll.length).toFixed(4))
     : 0;
 
-  const liveKnown = records.filter(
-    (r) => typeof r.livenessPassed === 'boolean' && r.livenessStatus !== 'INCONCLUSIVE' && r.livenessStatus !== 'NOT SUPPORTED'
-  );
-  const livePass = liveKnown.filter((r) => r.livenessPassed === true || r.livenessStatus === 'LIVENESS PASSED').length;
-  const livenessSuccessRate = liveKnown.length ? Number((livePass / liveKnown.length).toFixed(4)) : 0;
+  const livePassed = records.filter((r) => r.livenessStatus === 'LIVENESS PASSED' || (!r.livenessStatus && r.livenessPassed === true)).length;
+  const liveFailed = records.filter((r) => r.livenessStatus === 'LIVENESS FAILED' || (!r.livenessStatus && r.livenessPassed === false)).length;
+  const liveInconclusive = records.filter((r) => r.livenessStatus === 'INCONCLUSIVE').length;
+  const liveNotSupported = records.filter((r) => r.livenessStatus === 'NOT SUPPORTED').length;
+  const liveKnownCount = livePassed + liveFailed;
+  const livenessSuccessRate = liveKnownCount ? Number((livePassed / liveKnownCount).toFixed(4)) : 0;
+  const livenessFailureRate = liveKnownCount ? Number((liveFailed / liveKnownCount).toFixed(4)) : 0;
+
+  const qualitySamples: number[] = [];
+  for (const r of records) {
+    for (const qVal of [r.faceQuality, r.voiceQuality, r.fingerprintQuality]) {
+      if (typeof qVal === 'number' && Number.isFinite(qVal) && qVal >= 0 && qVal <= 100) {
+        qualitySamples.push(qVal);
+      }
+    }
+  }
+  const sampleQualityDistribution: SampleQualityDistribution = {
+    measuredCount: qualitySamples.length,
+    goodCount: qualitySamples.filter((q) => q >= 65).length,
+    borderlineCount: qualitySamples.filter((q) => q >= 40 && q < 65).length,
+    poorCount: qualitySamples.filter((q) => q < 40).length,
+    meanQuality: qualitySamples.length
+      ? Number((qualitySamples.reduce((a, b) => a + b, 0) / qualitySamples.length).toFixed(1))
+      : null,
+  };
 
   const riskKnown = records.filter((r) => typeof r.riskScore === 'number');
   const avgRiskScore = riskKnown.length
@@ -428,7 +472,8 @@ export function buildBiometricAnalyticsReport(
     operationalMatchRate: evalOp.length ? Number((opMatches / evalOp.length).toFixed(4)) : null,
     livenessPassedCount: operational.filter((r) => r.livenessStatus === 'LIVENESS PASSED' || (!r.livenessStatus && r.livenessPassed === true)).length,
     livenessFailedCount: operational.filter((r) => r.livenessStatus === 'LIVENESS FAILED' || (!r.livenessStatus && r.livenessPassed === false)).length,
-    livenessInconclusiveCount: operational.filter((r) => r.livenessStatus === 'INCONCLUSIVE' || r.livenessStatus === 'NOT SUPPORTED').length,
+    livenessInconclusiveCount: operational.filter((r) => r.livenessStatus === 'INCONCLUSIVE').length,
+    livenessNotSupportedCount: operational.filter((r) => r.livenessStatus === 'NOT SUPPORTED').length,
     avgProcessingTimeMs: opLatencies.length ? Number((opLatencies.reduce((a, b) => a + b, 0) / opLatencies.length).toFixed(1)) : null,
     avgRiskScore: opRisks.length ? Number((opRisks.reduce((s, r) => s + (r.riskScore || 0), 0) / opRisks.length).toFixed(1)) : null,
   };
@@ -448,7 +493,7 @@ export function buildBiometricAnalyticsReport(
     operationalLabeledTrials: labeledOperational.length,
     syntheticLabeledTrials: labeledQa.length,
     insufficientData: classification.insufficientData,
-    insufficientDataMessage: classification.insufficientData ? 'Insufficient evaluation data.' : 'Statistically grounded evaluation sample.',
+    insufficientDataMessage: classification.insufficientData ? 'Insufficient validated data' : 'Statistically grounded evaluation sample.',
     classification,
     operationalOnlyClassification: opOnlyClassification,
   };
@@ -519,11 +564,20 @@ export function buildBiometricAnalyticsReport(
     successfulVerifications: successful,
     rejectedVerifications: rejected,
     notEvaluatedVerifications: notEvaluated,
+    inconclusiveRate,
     captureFailureCount,
     captureFailureRate,
     operationalVerificationSuccessRate,
-    livenessKnownCount: liveKnown.length,
+    livenessKnownCount: liveKnownCount,
     livenessSuccessRate,
+    livenessFailureRate,
+    livenessBreakdown: {
+      passed: livePassed,
+      failed: liveFailed,
+      inconclusive: liveInconclusive,
+      notSupported: liveNotSupported,
+    },
+    sampleQualityDistribution,
     conflictCount: records.filter((r) => r.conflictDetected === true).length,
     avgRiskScore,
     latency,
@@ -542,7 +596,7 @@ export function buildBiometricAnalyticsReport(
     },
     failedBreakdown,
     methodologyNote:
-      'Operational Data, Synthetic QA Data, and Labeled Benchmark Data are tracked strictly separately. Classification Accuracy, TAR/GAR, FAR/IAR, FRR, Precision, Recall, F1, EER, and Wilson 95% CIs come exclusively from ground-truth labeled trials; displays "Insufficient evaluation data." if fewer than 3 genuine or 3 impostor trials exist.',
+      'Operational Data, Synthetic QA Data, and Labeled Benchmark Data are tracked strictly separately. Classification Accuracy, TAR/GAR, FAR/IAR, FRR, Precision, Recall, F1, EER, and Wilson 95% CIs come exclusively from ground-truth labeled trials; displays "Insufficient validated data" if fewer than 3 genuine or 3 impostor trials exist.',
   };
 }
 

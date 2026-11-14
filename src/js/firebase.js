@@ -19,7 +19,6 @@ import {
   deleteDoc,
   collection,
   query,
-  where,
   orderBy,
   limit,
   onSnapshot,
@@ -330,6 +329,11 @@ export async function recordVerificationMetadata({
   riskLevel,
   livenessPassed,
   livenessScore,
+  livenessDecision,
+  challengeVerified,
+  identityConfidence,
+  sampleQualityScore,
+  livenessConfidence,
   adaptiveApplied,
 }) {
   const uid = auth.currentUser?.uid;
@@ -360,6 +364,12 @@ export async function recordVerificationMetadata({
     if (['LIVENESS PASSED', 'LIVENESS FAILED', 'INCONCLUSIVE', 'NOT SUPPORTED'].includes(livenessStatus)) {
       docData.livenessStatus = livenessStatus;
     }
+    if (['PASSED', 'FAILED', 'INCONCLUSIVE'].includes(livenessDecision)) {
+      docData.livenessDecision = livenessDecision;
+    }
+    if (typeof challengeVerified === 'boolean') {
+      docData.challengeVerified = challengeVerified;
+    }
     if (typeof riskScore === 'number') docData.riskScore = Math.min(100, Math.max(0, Math.round(riskScore)));
     if (['low', 'medium', 'high', 'critical'].includes(riskLevel)) docData.riskLevel = riskLevel;
     if (typeof livenessPassed === 'boolean') docData.livenessPassed = livenessPassed;
@@ -372,6 +382,15 @@ export async function recordVerificationMetadata({
     }
     if (typeof confidence === 'number' && Number.isFinite(confidence)) {
       docData.confidence = Math.min(1, Math.max(0, Number(confidence.toFixed(3))));
+    }
+    if (typeof identityConfidence === 'number' && Number.isFinite(identityConfidence)) {
+      docData.identityConfidence = Math.min(1, Math.max(0, Number(identityConfidence.toFixed(3))));
+    }
+    if (typeof sampleQualityScore === 'number' && Number.isFinite(sampleQualityScore)) {
+      docData.sampleQualityScore = Math.min(1, Math.max(0, Number(sampleQualityScore.toFixed(3))));
+    }
+    if (typeof livenessConfidence === 'number' && Number.isFinite(livenessConfidence)) {
+      docData.livenessConfidence = Math.min(1, Math.max(0, Number(livenessConfidence.toFixed(3))));
     }
     if (['high', 'moderate', 'low'].includes(confidenceBand)) docData.confidenceBand = confidenceBand;
     if (typeof conflictDetected === 'boolean') docData.conflictDetected = conflictDetected;
@@ -618,6 +637,10 @@ export async function saveSystemSettings(cfg) {
   const path = `users/${uid}/system_settings/default`;
   const t0 = performance.now();
   try {
+    const clampWeight = (val, def) => {
+      const n = Number(val);
+      return Number.isFinite(n) ? Number(Math.min(1.0, Math.max(0.05, n)).toFixed(3)) : def;
+    };
     const payload = {
       settingId: 'default',
       organizationName: String(cfg.organizationName || 'BioGuard X Research').slice(0, 120),
@@ -626,6 +649,12 @@ export async function saveSystemSettings(cfg) {
       fingerprintThreshold: Number(cfg.fingerprintThreshold ?? 0.72),
       threeModalThreshold: Number(cfg.threeModalThreshold ?? 0.74),
       maxHoldHours: Math.min(4, Math.max(1, Number(cfg.maxHoldHours ?? 4))),
+      strictLiveness: Boolean(cfg.strictLiveness),
+      modalityWeights: {
+        face: clampWeight(cfg.modalityWeights?.face, 0.45),
+        voice: clampWeight(cfg.modalityWeights?.voice, 0.28),
+        fingerprint: clampWeight(cfg.modalityWeights?.fingerprint, 0.27),
+      },
       updatedAt: serverTimestamp(),
       updatedBy: uid,
     };

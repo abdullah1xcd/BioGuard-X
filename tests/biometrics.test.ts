@@ -530,7 +530,7 @@ test('Metrics & Subject-Disjoint Evaluation: exact confusion formulas, Wilson CI
   assert.equal(mixedReport.datasets.benchmark.totalLabeledTrials, 2);
   assert.equal(mixedReport.datasets.benchmark.operationalLabeledTrials, 0);
   assert.equal(mixedReport.datasets.benchmark.insufficientData, true);
-  assert.equal(mixedReport.datasets.benchmark.insufficientDataMessage, 'Insufficient evaluation data.');
+  assert.equal(mixedReport.datasets.benchmark.insufficientDataMessage, 'Insufficient validated data');
 });
 
 test('Server Vault AES-256-GCM v2 secret enforcement, key rotation, health diagnostics & HTTP auth checks', async () => {
@@ -707,4 +707,236 @@ test('Developer/Testing Mode is strictly isolated to authorized admins and defau
   assert.equal(recommendPipelineForModalities(['voice', 'fingerprint']), 'voice_fingerprint');
   assert.equal(recommendPipelineForModalities(['face', 'voice', 'fingerprint']), 'three_modal');
 });
+
+test('Fusion Engine hardening: validates inputs, fails closed when omitted/strict liveness, supports custom modalityWeights & separated confidences', () => {
+  const thresholds = { face: 0.72, voice: 0.70, fingerprint: 0.72, early: 0.72, threeModal: 0.74 };
+
+  // 1. Out-of-range / NaN inputs throw explicit errors instead of silently saturating
+  assert.throws(
+    () =>
+      fuseMultimodalScores({
+        pipeline: 'face_only',
+        thresholds,
+        available: { face: { score: Number.NaN, qualityScore: 80 } },
+        livenessPassed: true,
+      }),
+    /Invalid biometric parameter/i
+  );
+  assert.throws(
+    () =>
+      fuseMultimodalScores({
+        pipeline: 'face_only',
+        thresholds,
+        available: { face: { score: 1.25, qualityScore: 80 } },
+        livenessPassed: true,
+      }),
+    /Invalid biometric parameter/i
+  );
+  assert.throws(
+    () =>
+      fuseMultimodalScores({
+        pipeline: 'face_only',
+        thresholds,
+        available: { face: { score: 0.85, qualityScore: 140 } },
+        livenessPassed: true,
+      }),
+    /Invalid biometric parameter/i
+  );
+  assert.throws(
+    () =>
+      fuseMultimodalScores({
+        pipeline: 'face_only',
+        thresholds,
+        modalityWeights: { face: 0 },
+        available: { face: { score: 0.85, qualityScore: 85 } },
+        livenessPassed: true,
+      }),
+    /Invalid biometric parameter/i
+  );
+
+  // 2. Omitted liveness NEVER silently upgrades to LIVENESS PASSED
+  const omittedLiv = fuseMultimodalScores({
+    pipeline: 'face_only',
+    thresholds,
+    available: { face: { score: 0.88, qualityScore: 90 } },
+  });
+  assert.equal(omittedLiv.livenessStatus, 'INCONCLUSIVE');
+  assert.equal(omittedLiv.livenessDecision, 'INCONCLUSIVE');
+  assert.equal(omittedLiv.finalDecision, 'VERIFIED');
+
+  // 3. strictLiveness policy blocks INCONCLUSIVE liveness from verifying
+  const strictBlocked = fuseMultimodalScores({
+    pipeline: 'face_only',
+    thresholds,
+    livenessPolicy: { strictLiveness: true },
+    livenessStatus: 'INCONCLUSIVE',
+    available: { face: { score: 0.92, qualityScore: 92 } },
+  });
+  assert.equal(strictBlocked.finalDecision, 'INCONCLUSIVE');
+  assert.equal(strictBlocked.outcome, 'not_evaluated');
+  assert.equal(strictBlocked.reasonCode, 'liveness_inconclusive_blocked');
+
+  // 4. Custom modalityWeights normalize cleanly and shift fused score deterministically
+  const voiceHeavy = fuseMultimodalScores({
+    pipeline: 'face_voice',
+    fusionPolicy: 'weighted_score',
+    thresholds,
+    modalityWeights: { face: 0.2, voice: 0.8 },
+    available: {
+      face: { score: 0.90, qualityScore: 90 },
+      voice: { score: 0.72, qualityScore: 90 },
+    },
+    livenessPassed: true,
+    livenessScore: 0.90,
+  });
+  const faceHeavy = fuseMultimodalScores({
+    pipeline: 'face_voice',
+    fusionPolicy: 'weighted_score',
+    thresholds,
+    modalityWeights: { face: 0.8, voice: 0.2 },
+    available: {
+      face: { score: 0.90, qualityScore: 90 },
+      voice: { score: 0.72, qualityScore: 90 },
+    },
+    livenessPassed: true,
+    livenessScore: 0.90,
+  });
+  assert.ok(faceHeavy.finalScore > voiceHeavy.finalScore + 0.08);
+
+  // 5. Separated confidence metrics (identityConfidence, sampleQualityScore, livenessConfidence)
+  assert.ok(faceHeavy.identityConfidence > 0 && faceHeavy.identityConfidence <= 0.99);
+  assert.equal(faceHeavy.sampleQualityScore, 0.9);
+  assert.equal(faceHeavy.livenessConfidence, 0.9);
+  assert.equal(strictBlocked.livenessConfidence, 0.5);
+});
+
+test('Analytics report tracks inconclusiveRate, livenessFailureRate, livenessBreakdown, and sampleQualityDistribution', () => {
+  const report = buildBiometricAnalyticsReport(
+    [
+      {
+        outcome: 'match',
+        finalDecision: 'VERIFIED',
+        score: 0.9,
+        faceQuality: 86,
+        livenessStatus: 'LIVENESS PASSED',
+        groundTruth: 'unlabeled',
+      },
+      {
+        outcome: 'not_evaluated',
+        finalDecision: 'INCONCLUSIVE',
+        score: 0.55,
+        faceQuality: 48,
+        livenessStatus: 'INCONCLUSIVE',
+        groundTruth: 'unlabeled',
+      },
+      {
+        outcome: 'no_match',
+        finalDecision: 'REJECTED',
+        score: 0.35,
+        faceQuality: 22,
+        livenessStatus: 'LIVENESS FAILED',
+        groundTruth: 'unlabeled',
+      },
+      {
+        outcome: 'match',
+        finalDecision: 'VERIFIED',
+        score: 0.88,
+        faceQuality: 80,
+        livenessStatus: 'NOT SUPPORTED',
+        datasetCategory: 'synthetic_qa',
+        isTestProbe: true,
+        groundTruth: 'genuine',
+      },
+    ],
+    2,
+    2
+  );
+
+  assert.equal(report.inconclusiveRate, 0.25);
+  assert.equal(report.livenessKnownCount, 2);
+  assert.equal(report.livenessFailureRate, 0.5);
+  assert.deepEqual(report.livenessBreakdown, {
+    passed: 1,
+    failed: 1,
+    inconclusive: 1,
+    notSupported: 1,
+  });
+  assert.equal(report.datasets.operational.livenessNotSupportedCount, 0);
+  assert.equal(report.sampleQualityDistribution.measuredCount, 4);
+  assert.equal(report.sampleQualityDistribution.goodCount, 2);
+  assert.equal(report.sampleQualityDistribution.borderlineCount, 1);
+  assert.equal(report.sampleQualityDistribution.poorCount, 1);
+  assert.equal(report.datasets.benchmark.insufficientDataMessage, 'Insufficient validated data');
+});
+
+test('Server challenge tokens, anti-replay nonces, strict CORS guard & security headers', async () => {
+  process.env.BIOGUARD_SKIP_LISTEN = '1';
+  const serverMod = await import('../server.ts');
+  const {
+    isOriginAllowed,
+    createChallengeToken,
+    verifyChallengeToken,
+    consumeReplayNonceLocal,
+    app,
+  } = serverMod;
+
+  // 1. Origin / CORS validation
+  assert.equal(isOriginAllowed('https://bioguard.example', 'bioguard.example'), true);
+  assert.equal(isOriginAllowed('https://evil.example', 'bioguard.example'), false);
+  assert.equal(isOriginAllowed('not-a-url', 'bioguard.example'), false);
+
+  // 2. Single-use challenge tokens: valid -> verified -> replay rejected; tampered / wrong uid rejected
+  const secret = 'test-challenge-secret-minimum-32-characters-long';
+  const issued = createChallengeToken({ uid: 'user_123', ttlMs: 30_000, secretOverride: secret });
+  assert.ok(['blink', 'turn_left', 'turn_right'].includes(issued.faceChallenge));
+  assert.equal(issued.voicePassphrase.split(' ').length, 3);
+
+  const tampered = `${issued.challengeToken.slice(0, -4)}AAAA`;
+  const tamperedRes = await verifyChallengeToken({ token: tampered, uid: 'user_123', secretOverride: secret });
+  assert.equal(tamperedRes.valid, false);
+  assert.equal(tamperedRes.reason, 'invalid_challenge_signature');
+
+  const wrongUidRes = await verifyChallengeToken({ token: issued.challengeToken, uid: 'other_user', secretOverride: secret });
+  assert.equal(wrongUidRes.valid, false);
+  assert.equal(wrongUidRes.reason, 'challenge_subject_mismatch');
+
+  const okRes = await verifyChallengeToken({ token: issued.challengeToken, uid: 'user_123', secretOverride: secret });
+  assert.equal(okRes.valid, true);
+  assert.equal(okRes.payload?.nonce, issued.nonce);
+
+  const replayRes = await verifyChallengeToken({ token: issued.challengeToken, uid: 'user_123', secretOverride: secret });
+  assert.equal(replayRes.valid, false);
+  assert.equal(replayRes.reason, 'challenge_replay_detected');
+
+  // 3. Idempotency replay store
+  assert.equal(consumeReplayNonceLocal('unit_test', 'nonce_abc', 30_000), true);
+  assert.equal(consumeReplayNonceLocal('unit_test', 'nonce_abc', 30_000), false);
+
+  // 4. HTTP headers, strict 403 CORS rejection, and 401 auth on /api/v1/liveness/challenge
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address() as AddressInfo;
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  try {
+    const hRes = await fetch(`${baseUrl}/api/v1/health`);
+    assert.equal(hRes.status, 200);
+    assert.equal(hRes.headers.get('cross-origin-opener-policy'), 'same-origin-allow-popups');
+    assert.equal(hRes.headers.get('x-content-type-options'), 'nosniff');
+    assert.notEqual(hRes.headers.get('x-frame-options'), 'DENY');
+
+    const corsDenied = await fetch(`${baseUrl}/api/v1/health`, {
+      headers: { Origin: 'https://evil.example' },
+    });
+    assert.equal(corsDenied.status, 403);
+    const corsJson = (await corsDenied.json()) as { error: string };
+    assert.equal(corsJson.error, 'cors_origin_denied');
+
+    const challengeUnauth = await fetch(`${baseUrl}/api/v1/liveness/challenge`, { method: 'POST' });
+    assert.equal(challengeUnauth.status, 401);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  }
+});
+
 

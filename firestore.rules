@@ -105,8 +105,9 @@ service cloud.firestore {
       return data.keys().hasAll(['verificationId', 'identityRef', 'modalities', 'outcome', 'policyDecision', 'reasonCode', 'operatorUid', 'createdAt']) &&
         data.keys().hasOnly([
           'verificationId', 'identityRef', 'modalities', 'pipeline', 'outcome', 'finalDecision', 'policyDecision', 'reasonCode',
-          'score', 'riskScore', 'riskLevel', 'livenessPassed', 'livenessStatus', 'livenessScore', 'adaptiveApplied',
-          'groundTruth', 'datasetCategory', 'isTestProbe', 'captureFailure', 'processingTimeMs', 'confidence', 'confidenceBand', 'conflictDetected',
+          'score', 'riskScore', 'riskLevel', 'livenessPassed', 'livenessStatus', 'livenessDecision', 'livenessScore', 'challengeVerified',
+          'adaptiveApplied', 'groundTruth', 'datasetCategory', 'isTestProbe', 'captureFailure', 'processingTimeMs',
+          'confidence', 'identityConfidence', 'sampleQualityScore', 'livenessConfidence', 'confidenceBand', 'conflictDetected',
           'featureVersion', 'faceScore', 'voiceScore', 'fingerprintScore', 'faceQuality', 'voiceQuality', 'fingerprintQuality',
           'faceStatus', 'voiceStatus', 'fingerprintStatus', 'matchedMinutiae', 'probeMinutiae',
           'operatorUid', 'createdAt'
@@ -125,7 +126,9 @@ service cloud.firestore {
         (!('riskLevel' in data) || data.riskLevel in ['low', 'medium', 'high', 'critical']) &&
         (!('livenessPassed' in data) || data.livenessPassed is bool) &&
         (!('livenessStatus' in data) || data.livenessStatus in ['LIVENESS PASSED', 'LIVENESS FAILED', 'INCONCLUSIVE', 'NOT SUPPORTED']) &&
+        (!('livenessDecision' in data) || data.livenessDecision in ['PASSED', 'FAILED', 'INCONCLUSIVE']) &&
         (!('livenessScore' in data) || (data.livenessScore is number && data.livenessScore >= 0 && data.livenessScore <= 1)) &&
+        (!('challengeVerified' in data) || data.challengeVerified is bool) &&
         (!('adaptiveApplied' in data) || data.adaptiveApplied is bool) &&
         (!('groundTruth' in data) || data.groundTruth in ['genuine', 'impostor', 'unlabeled']) &&
         (!('datasetCategory' in data) || data.datasetCategory in ['operational', 'synthetic_qa', 'benchmark_eval']) &&
@@ -133,6 +136,9 @@ service cloud.firestore {
         (!('captureFailure' in data) || data.captureFailure is bool) &&
         (!('processingTimeMs' in data) || (data.processingTimeMs is number && data.processingTimeMs >= 0 && data.processingTimeMs <= 120000)) &&
         (!('confidence' in data) || (data.confidence is number && data.confidence >= 0 && data.confidence <= 1)) &&
+        (!('identityConfidence' in data) || (data.identityConfidence is number && data.identityConfidence >= 0 && data.identityConfidence <= 1)) &&
+        (!('sampleQualityScore' in data) || (data.sampleQualityScore is number && data.sampleQualityScore >= 0 && data.sampleQualityScore <= 1)) &&
+        (!('livenessConfidence' in data) || (data.livenessConfidence is number && data.livenessConfidence >= 0 && data.livenessConfidence <= 1)) &&
         (!('confidenceBand' in data) || data.confidenceBand in ['high', 'moderate', 'low']) &&
         (!('conflictDetected' in data) || data.conflictDetected is bool) &&
         (!('featureVersion' in data) || (data.featureVersion is string && data.featureVersion.size() <= 32)) &&
@@ -217,7 +223,10 @@ service cloud.firestore {
 
     function isValidSettings(data) {
       return data.keys().hasAll(['settingId', 'organizationName', 'faceThreshold', 'voiceThreshold', 'fingerprintThreshold', 'threeModalThreshold', 'maxHoldHours', 'updatedAt', 'updatedBy']) &&
-        data.keys().hasOnly(['settingId', 'organizationName', 'faceThreshold', 'voiceThreshold', 'fingerprintThreshold', 'threeModalThreshold', 'maxHoldHours', 'fusionPolicy', 'securityPreset', 'updatedAt', 'updatedBy']) &&
+        data.keys().hasOnly([
+          'settingId', 'organizationName', 'faceThreshold', 'voiceThreshold', 'fingerprintThreshold', 'threeModalThreshold',
+          'maxHoldHours', 'fusionPolicy', 'securityPreset', 'strictLiveness', 'modalityWeights', 'updatedAt', 'updatedBy'
+        ]) &&
         isValidId(data.settingId) &&
         data.organizationName is string && data.organizationName.size() >= 1 && data.organizationName.size() <= 120 &&
         data.faceThreshold is number && data.faceThreshold >= 0.3 && data.faceThreshold <= 0.98 &&
@@ -227,6 +236,14 @@ service cloud.firestore {
         data.maxHoldHours is number && data.maxHoldHours >= 1 && data.maxHoldHours <= 4 &&
         (!('fusionPolicy' in data) || data.fusionPolicy in ['weighted_score', 'strict_and', 'hierarchical_adaptive']) &&
         (!('securityPreset' in data) || data.securityPreset in ['balanced', 'strict', 'convenience', 'custom']) &&
+        (!('strictLiveness' in data) || data.strictLiveness is bool) &&
+        (!('modalityWeights' in data) || (
+          data.modalityWeights is map &&
+          data.modalityWeights.keys().hasOnly(['face', 'voice', 'fingerprint']) &&
+          (!('face' in data.modalityWeights) || (data.modalityWeights.face is number && data.modalityWeights.face >= 0.05 && data.modalityWeights.face <= 1.0)) &&
+          (!('voice' in data.modalityWeights) || (data.modalityWeights.voice is number && data.modalityWeights.voice >= 0.05 && data.modalityWeights.voice <= 1.0)) &&
+          (!('fingerprint' in data.modalityWeights) || (data.modalityWeights.fingerprint is number && data.modalityWeights.fingerprint >= 0.05 && data.modalityWeights.fingerprint <= 1.0))
+        )) &&
         data.updatedAt == request.time &&
         data.updatedBy == request.auth.uid;
     }
@@ -421,7 +438,10 @@ service cloud.firestore {
         allow update: if isValidId(userId) && isValidId(settingId) && isVerifiedUser() && isOwner(userId) &&
           isValidSettings(incoming()) &&
           incoming().settingId == existing().settingId &&
-          incoming().diff(existing()).affectedKeys().hasOnly(['organizationName', 'faceThreshold', 'voiceThreshold', 'fingerprintThreshold', 'threeModalThreshold', 'maxHoldHours', 'fusionPolicy', 'securityPreset', 'updatedAt', 'updatedBy']) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'organizationName', 'faceThreshold', 'voiceThreshold', 'fingerprintThreshold', 'threeModalThreshold',
+            'maxHoldHours', 'fusionPolicy', 'securityPreset', 'strictLiveness', 'modalityWeights', 'updatedAt', 'updatedBy'
+          ]) &&
           canWriteOwnWorkspace(userId);
         allow delete: if false;
       }

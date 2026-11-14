@@ -1,5 +1,8 @@
 node_modules/
 dist/
+dev-dist/
+coverage/
+.vite/
 data/
 .env
 *.log

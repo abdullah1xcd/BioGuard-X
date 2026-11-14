@@ -42,9 +42,24 @@ export function rotateVaultKeys(force = false) {
   });
 }
 
+function makeIdempotencyKey() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `bgx_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+}
+
+export function requestLivenessChallenge() {
+  return apiFetch('/api/v1/liveness/challenge', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
 export function enrollBiometricIdentity({ identityRef, consentRecorded, samples, quality }) {
   return apiFetch('/api/v1/identities/enroll', {
     method: 'POST',
+    headers: { 'Idempotency-Key': makeIdempotencyKey() },
     body: JSON.stringify({ identityRef, consentRecorded, samples, quality }),
   });
 }
@@ -54,6 +69,9 @@ export function verifyMultimodalBiometrics({
   pipeline,
   fusionPolicy = 'hierarchical_adaptive',
   thresholds,
+  strictLiveness,
+  modalityWeights,
+  challengeToken,
   samples,
   quality,
   adaptiveEnabled = true,
@@ -62,11 +80,15 @@ export function verifyMultimodalBiometrics({
 }) {
   return apiFetch('/api/v1/verification/multimodal', {
     method: 'POST',
+    headers: { 'Idempotency-Key': makeIdempotencyKey() },
     body: JSON.stringify({
       identityRef,
       pipeline,
       fusionPolicy,
       thresholds,
+      strictLiveness,
+      modalityWeights,
+      challengeToken,
       samples,
       quality,
       adaptiveEnabled,
@@ -81,10 +103,11 @@ export function compareIdentities({
   identityRefB,
   thresholds,
   fusionPolicy = 'hierarchical_adaptive',
+  modalityWeights,
 }) {
   return apiFetch('/api/v1/identities/compare', {
     method: 'POST',
-    body: JSON.stringify({ identityRefA, identityRefB, thresholds, fusionPolicy }),
+    body: JSON.stringify({ identityRefA, identityRefB, thresholds, fusionPolicy, modalityWeights }),
   });
 }
 
@@ -95,6 +118,7 @@ export function identifyBiometricProbe({
   quality,
   thresholds,
   fusionPolicy = 'hierarchical_adaptive',
+  modalityWeights,
   topK = 5,
 }) {
   return apiFetch('/api/v1/identities/identify', {
@@ -106,6 +130,7 @@ export function identifyBiometricProbe({
       quality,
       thresholds,
       fusionPolicy,
+      modalityWeights,
       topK,
     }),
   });

@@ -13,6 +13,12 @@ export const DEFAULT_THRESHOLDS = {
   maxHoldHours: 4,
   fusionPolicy: 'hierarchical_adaptive',
   securityPreset: 'balanced',
+  strictLiveness: false,
+  modalityWeights: {
+    face: 0.45,
+    voice: 0.28,
+    fingerprint: 0.27,
+  },
 };
 
 export const FUSION_POLICIES = [

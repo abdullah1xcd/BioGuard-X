@@ -252,6 +252,7 @@ export function renderCompareIdentities(container, { appState, navigate }) {
         identityRefA: refA,
         identityRefB: refB,
         thresholds: getThresholds(),
+        modalityWeights: appState.settings?.modalityWeights,
         fusionPolicy,
       });
 
@@ -521,6 +522,7 @@ export function renderCompareIdentities(container, { appState, navigate }) {
     const payload = {
       fusionPolicy,
       thresholds: getThresholds(),
+      modalityWeights: appState.settings?.modalityWeights,
       topK,
     };
 

@@ -611,7 +611,7 @@ export function renderSettings(container, { appState, navigate, applyTheme, setD
       </div>
 
       <details class="advanced-details">
-        <summary>Advanced Threshold Calibration (Face, Voice, Fingerprint &amp; Hold Window)</summary>
+        <summary>Advanced Threshold Calibration, Liveness Policy &amp; Modality Weights</summary>
         <div class="advanced-details-body">
           <div class="form-grid">
             <div class="form-field">
@@ -631,10 +631,27 @@ export function renderSettings(container, { appState, navigate, applyTheme, setD
               <input class="input mono" id="st-3-thr" type="number" step="0.01" min="0.3" max="0.98" ${isAdmin ? '' : 'disabled'} value="${settings.threeModalThreshold}" />
             </div>
             <div class="form-field">
+              <label class="field-label" for="st-w-face">Face Fusion Weight (0.05–1.0)</label>
+              <input class="input mono" id="st-w-face" type="number" step="0.01" min="0.05" max="1" ${isAdmin ? '' : 'disabled'} value="${settings.modalityWeights?.face ?? 0.45}" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="st-w-voice">Voice Fusion Weight (0.05–1.0)</label>
+              <input class="input mono" id="st-w-voice" type="number" step="0.01" min="0.05" max="1" ${isAdmin ? '' : 'disabled'} value="${settings.modalityWeights?.voice ?? 0.28}" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="st-w-fp">Fingerprint Fusion Weight (0.05–1.0)</label>
+              <input class="input mono" id="st-w-fp" type="number" step="0.01" min="0.05" max="1" ${isAdmin ? '' : 'disabled'} value="${settings.modalityWeights?.fingerprint ?? 0.27}" />
+            </div>
+            <div class="form-field">
               <label class="field-label" for="st-hold">Max Temporary Hold (Hours, 1–4)</label>
               <input class="input mono" id="st-hold" type="number" min="1" max="4" ${isAdmin ? '' : 'disabled'} value="${settings.maxHoldHours}" />
             </div>
           </div>
+
+          <label class="checkbox-row" style="margin-top:4px;">
+            <input type="checkbox" id="st-strict-liveness" ${settings.strictLiveness ? 'checked' : ''} ${isAdmin ? '' : 'disabled'} />
+            <span>Strict Liveness Policy (block VERIFIED when liveness is INCONCLUSIVE or NOT SUPPORTED; returns INCONCLUSIVE unless live screening passes)</span>
+          </label>
         </div>
       </details>
       ${isAdmin ? '<button type="submit" class="btn btn-primary" style="align-self:flex-start;">Save Organization Policy</button>' : ''}
@@ -709,37 +726,38 @@ export function renderSettings(container, { appState, navigate, applyTheme, setD
   const renderDiagnosticsList = (diag = null) => {
     const faceSt = getFaceEngineStatus();
     const h = appState.health;
+    const comps = diag?.components || {};
     const rows = [
       { label: 'Frontend SPA Shell', status: 'OPERATIONAL', note: 'Active browser runtime' },
       {
         label: 'Biometric Verification API',
-        status: diag?.subsystems?.api?.status || (h?.status === 'ok' ? 'OPERATIONAL' : 'OFFLINE'),
-        note: diag?.subsystems?.api?.latencyMs ? `${diag.subsystems.api.latencyMs}ms probe` : h?.status === 'ok' ? 'Express / Serverless reachable' : 'Unreachable',
+        status: comps.biometricApi?.status || (h?.status === 'ok' ? 'OPERATIONAL' : 'OFFLINE'),
+        note: diag?.totalProbeMs ? `${diag.totalProbeMs}ms probe` : comps.biometricApi?.detail || (h?.status === 'ok' ? 'Express / Serverless reachable' : 'Unreachable'),
       },
       {
         label: 'Firebase Authentication',
-        status: appState.fbUser?.emailVerified ? 'OPERATIONAL' : appState.fbUser ? 'DEGRADED' : 'OFFLINE',
-        note: appState.fbUser?.emailVerified ? 'Verified Google account' : 'Verification pending',
+        status: comps.firebaseAuth?.status || (appState.fbUser?.emailVerified ? 'OPERATIONAL' : appState.fbUser ? 'DEGRADED' : 'OFFLINE'),
+        note: comps.firebaseAuth?.detail || (appState.fbUser?.emailVerified ? 'Verified Google account' : 'Verification pending'),
       },
       {
         label: 'Cloud Firestore Sync',
-        status: diag?.subsystems?.firestore?.status || (appState.firestoreOk ? 'OPERATIONAL' : 'OFFLINE'),
-        note: appState.firestoreOk ? 'Isolated UID workspace' : 'Client offline',
+        status: comps.cloudFirestore?.status || (appState.firestoreOk ? 'OPERATIONAL' : 'OFFLINE'),
+        note: comps.cloudFirestore?.detail || (appState.firestoreOk ? 'Isolated UID workspace' : 'Client offline'),
       },
       {
         label: 'Biometric Vault Storage',
-        status: diag?.subsystems?.vault?.status || (h?.vault_ready ? 'OPERATIONAL' : 'NOT CONFIGURED'),
-        note: h?.vault_ready ? `AES-256-GCM (${h.vault_mode || 'env_secret_v2'})` : 'BIOGUARD_VAULT_SECRET unset',
+        status: comps.vaultStorage?.status || (h?.vault_ready ? 'OPERATIONAL' : 'NOT CONFIGURED'),
+        note: comps.vaultStorage?.detail || (h?.vault_ready ? `AES-256-GCM (${h.vault_mode || 'env_secret_v2'})` : 'BIOGUARD_VAULT_SECRET unset'),
       },
       {
         label: 'Rate Limiter Backend',
-        status: diag?.subsystems?.rateLimiter?.status || (h?.rate_limit_mode === 'degraded_local_fallback' ? 'DEGRADED' : h ? 'NOT TESTED' : 'OFFLINE'),
-        note: diag?.subsystems?.rateLimiter?.mode || h?.rate_limit_mode || 'Run diagnostics to check',
+        status: comps.rateLimiter?.status || (h?.rate_limit_mode === 'degraded_local_fallback' ? 'DEGRADED' : h ? 'NOT TESTED' : 'OFFLINE'),
+        note: comps.rateLimiter?.detail || comps.rateLimiter?.mode || h?.rate_limit_mode || 'Run diagnostics to check',
       },
       {
         label: 'AI Security Analyst (Gemini)',
-        status: diag?.subsystems?.gemini?.status || (h?.gemini_configured ? 'OPERATIONAL' : 'NOT CONFIGURED'),
-        note: h?.gemini_configured ? 'Server-side API ready' : 'GEMINI_API_KEY unset',
+        status: comps.aiAnalyst?.status || (h?.gemini_configured ? 'OPERATIONAL' : 'NOT CONFIGURED'),
+        note: comps.aiAnalyst?.detail || (h?.gemini_configured ? 'Server-side API ready' : 'GEMINI_API_KEY unset'),
       },
       {
         label: 'Face ML Engine',
@@ -791,14 +809,16 @@ export function renderSettings(container, { appState, navigate, applyTheme, setD
           onClick: async ({ close }) => {
             try {
               const r = await rotateVaultKeys(true);
+              const rotated = r.rotatedCount ?? r.rotated ?? 0;
+              const scanned = r.totalEntries ?? r.totalScanned ?? rotated;
               await appendAuditLog({
                 action: 'vault_key_rotation',
                 resourceType: 'vault',
                 resourceId: 'all',
-                result: `Rotated ${r.rotated} vault(s) across ${r.totalScanned} scanned`,
+                result: `Rotated ${rotated} vault(s) across ${scanned} scanned`,
               }).catch(() => null);
               close();
-              showToast(`Rotated ${r.rotated} vault file(s).`, 'success');
+              showToast(`Rotated ${rotated} vault file(s).`, 'success');
             } catch (err) {
               showToast(err.message, 'danger');
             }
@@ -886,10 +906,16 @@ export function renderSettings(container, { appState, navigate, applyTheme, setD
       voiceThreshold: Number(container.querySelector('#st-v-thr').value),
       fingerprintThreshold: Number(container.querySelector('#st-fp-thr').value),
       threeModalThreshold: Number(container.querySelector('#st-3-thr').value),
+      strictLiveness: Boolean(container.querySelector('#st-strict-liveness')?.checked),
+      modalityWeights: {
+        face: Number(container.querySelector('#st-w-face')?.value ?? 0.45),
+        voice: Number(container.querySelector('#st-w-voice')?.value ?? 0.28),
+        fingerprint: Number(container.querySelector('#st-w-fp')?.value ?? 0.27),
+      },
     };
     openModal({
       title: 'Save Organization Security Policy?',
-      bodyHtml: `<p style="font-size:13.5px;color:var(--text-secondary);">Update active fusion policy to <strong class="mono">${escapeHtml(cfg.fusionPolicy)}</strong> (${escapeHtml(cfg.securityPreset)}) with thresholds Face=${cfg.faceThreshold}, Voice=${cfg.voiceThreshold}, Fingerprint=${cfg.fingerprintThreshold}?</p>`,
+      bodyHtml: `<p style="font-size:13.5px;color:var(--text-secondary);">Update active fusion policy to <strong class="mono">${escapeHtml(cfg.fusionPolicy)}</strong> (${escapeHtml(cfg.securityPreset)}, strictLiveness=${cfg.strictLiveness}) with thresholds Face=${cfg.faceThreshold}, Voice=${cfg.voiceThreshold}, Fingerprint=${cfg.fingerprintThreshold}?</p>`,
       footerButtons: [
         { label: 'Cancel', variant: 'btn-secondary' },
         {

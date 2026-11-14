@@ -80,8 +80,8 @@ export async function triggerPwaInstall() {
   }
 
   const env = getInstallEnvironment();
-  let stepsHtml = '';
-  let heading = 'Install BioGuard X on Mobile or Laptop';
+  let stepsHtml;
+  let heading;
 
   if (env.iosSafari) {
     heading = 'Install BioGuard X on iPhone / iPad';

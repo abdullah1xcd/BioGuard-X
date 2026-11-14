@@ -12,6 +12,7 @@ import {
   enrollBiometricIdentity,
   verifyMultimodalBiometrics,
   deleteIdentityFromVault,
+  requestLivenessChallenge,
 } from './api.js';
 import {
   saveIdentityMetadata,
@@ -1122,6 +1123,7 @@ export function renderVerification(container, { appState, navigate }) {
   let guidanceTimer = null;
   let lastWavUrl = null;
   let currentIsTestProbe = false;
+  let activeChallenge = null;
 
   const stopCamera = () => {
     if (guidanceTimer) {
@@ -1246,6 +1248,7 @@ export function renderVerification(container, { appState, navigate }) {
               </div>
               <span id="mv-face-st" class="state-text state-neutral">Empty</span>
             </div>
+            <div id="mv-face-challenge-banner" class="challenge-banner" hidden></div>
             <div id="mv-face-live-wrap" class="preview-frame" style="max-height:175px;" hidden></div>
             <div id="mv-face-q" class="meta-line">Live camera or photo upload</div>
             <div class="row-wrap">
@@ -1270,6 +1273,7 @@ export function renderVerification(container, { appState, navigate }) {
               </div>
               <span id="mv-voice-st" class="state-text state-neutral">Empty</span>
             </div>
+            <div id="mv-voice-challenge-banner" class="challenge-banner" hidden></div>
             <div id="mv-voice-audio-slot" hidden><audio id="mv-voice-player" controls style="width:100%;height:34px;"></audio></div>
             <div id="mv-voice-q" class="meta-line">Record 2.4s microphone or audio upload</div>
             <div class="row-wrap">
@@ -1329,6 +1333,8 @@ export function renderVerification(container, { appState, navigate }) {
   const faceSt = container.querySelector('#mv-face-st');
   const faceQEl = container.querySelector('#mv-face-q');
   const faceLiveWrap = container.querySelector('#mv-face-live-wrap');
+  const faceChallengeBanner = container.querySelector('#mv-face-challenge-banner');
+  const voiceChallengeBanner = container.querySelector('#mv-voice-challenge-banner');
   const faceSnapBtn = container.querySelector('#mv-face-snap');
   const faceStopBtn = container.querySelector('#mv-face-stop');
   const voiceSt = container.querySelector('#mv-voice-st');
@@ -1590,11 +1596,29 @@ export function renderVerification(container, { appState, navigate }) {
     faceLiveWrap.hidden = true;
   };
 
+  const describeFaceChallenge = (ch) => {
+    if (ch === 'blink') return 'Active Challenge: Blink naturally once during capture';
+    if (ch === 'turn_left') return 'Active Challenge: Turn head gently left, then look straight';
+    if (ch === 'turn_right') return 'Active Challenge: Turn head gently right, then look straight';
+    return 'Hold steady for 3-frame multi-frame liveness check';
+  };
+
   container.querySelector('#mv-face-cam').addEventListener('click', async () => {
     try {
       haltProbeCamera();
       faceSt.className = 'state-text state-warning';
       faceSt.textContent = 'Starting Camera...';
+      if (!activeChallenge) {
+        activeChallenge = await requestLivenessChallenge().catch(() => null);
+      }
+      if (faceChallengeBanner) {
+        if (activeChallenge?.faceChallenge) {
+          faceChallengeBanner.textContent = describeFaceChallenge(activeChallenge.faceChallenge);
+          faceChallengeBanner.hidden = false;
+        } else {
+          faceChallengeBanner.hidden = true;
+        }
+      }
       await ensureFaceEngineReady();
 
       activeStream = await openCameraStream();
@@ -1605,7 +1629,9 @@ export function renderVerification(container, { appState, navigate }) {
       oval.className = 'face-guide-oval';
       const msgBadge = document.createElement('div');
       msgBadge.className = 'face-guide-status';
-      msgBadge.textContent = 'Align face in oval...';
+      msgBadge.textContent = activeChallenge?.faceChallenge
+        ? describeFaceChallenge(activeChallenge.faceChallenge)
+        : 'Align face in oval...';
 
       wrap.appendChild(v);
       wrap.appendChild(oval);
@@ -1622,7 +1648,9 @@ export function renderVerification(container, { appState, navigate }) {
         if (!activeStream) return;
         try {
           const g = await inspectLiveFaceGuidance(v);
-          msgBadge.textContent = g.message;
+          msgBadge.textContent = activeChallenge?.faceChallenge && g.ready
+            ? `${g.message} · ${describeFaceChallenge(activeChallenge.faceChallenge)}`
+            : g.message;
           oval.classList.toggle('ready', Boolean(g.ready));
         } catch {
           // Ignore single frame errors
@@ -1631,21 +1659,28 @@ export function renderVerification(container, { appState, navigate }) {
 
       faceSnapBtn.onclick = async () => {
         faceSnapBtn.disabled = true;
-        faceSnapBtn.textContent = 'Checking 3 Frames...';
+        faceSnapBtn.textContent = activeChallenge?.faceChallenge ? 'Checking 4 Frames...' : 'Checking 3 Frames...';
         faceSt.className = 'state-text state-warning';
-        faceSt.textContent = 'Analyzing 3 Frames...';
+        faceSt.textContent = 'Analyzing Live Frames...';
         try {
-          const res = await captureMultiFrameFaceFeatures(v, 220);
+          const res = await captureMultiFrameFaceFeatures(v, {
+            delayMs: 260,
+            challenge: activeChallenge?.faceChallenge,
+          });
           haltProbeCamera();
           faceVec = res.vector;
           faceQuality = res.quality;
           currentIsTestProbe = false;
           if (gtSel.value !== 'unlabeled') gtSel.value = 'unlabeled';
           faceSt.className = `state-text ${faceQuality.spoofRiskFlag ? 'state-warning' : 'state-success'}`;
-          faceSt.textContent = faceQuality.spoofRiskFlag ? 'Spoof Warning' : 'Live 3-Frame ✓';
+          faceSt.textContent = faceQuality.spoofRiskFlag
+            ? 'Spoof Warning'
+            : faceQuality.challengeCompleted
+            ? 'Challenge ✓'
+            : `Live ${faceQuality.frameCount || 3}-Frame ✓`;
           faceQEl.textContent = `Q:${faceQuality.faceQualityScore}/100 · Cons:${faceQuality.frameConsistencyCosine} · Motion:${faceQuality.frameMotionScore}${
             typeof faceQuality.antispoofScore === 'number' ? ` · AntiSpoof:${Math.round(faceQuality.antispoofScore * 100)}%` : ''
-          }`;
+          }${typeof faceQuality.challengeCompleted === 'boolean' ? ` · Challenge:${faceQuality.challengeCompleted ? 'Completed' : 'Not Detected'}` : ''}`;
         } catch (err) {
           faceVec = null;
           faceQuality = null;
@@ -1685,6 +1720,13 @@ export function renderVerification(container, { appState, navigate }) {
   container.querySelector('#mv-voice-mic').addEventListener('click', async (e) => {
     const b = e.currentTarget; b.disabled = true;
     try {
+      if (!activeChallenge) {
+        activeChallenge = await requestLivenessChallenge().catch(() => null);
+      }
+      if (voiceChallengeBanner && activeChallenge?.voicePassphrase) {
+        voiceChallengeBanner.textContent = `Speak clearly: "${activeChallenge.voicePassphrase}" (acoustic replay/DR screening only; spoken-text ASR not enabled)`;
+        voiceChallengeBanner.hidden = false;
+      }
       const p = await recordMicrophonePCM(2400, ({ elapsedSec, totalSec }) => {
         b.textContent = `${elapsedSec.toFixed(1)}/${totalSec.toFixed(1)}s`;
       });
@@ -1739,6 +1781,8 @@ export function renderVerification(container, { appState, navigate }) {
 
     try {
       const s = appState.settings || {};
+      const submittedChallengeToken = activeChallenge?.challengeToken;
+      activeChallenge = null;
       const res = await verifyMultimodalBiometrics({
         identityRef,
         pipeline: selectedPipeline,
@@ -1749,6 +1793,9 @@ export function renderVerification(container, { appState, navigate }) {
           fingerprint: s.fingerprintThreshold ?? 0.72,
           threeModal: s.threeModalThreshold ?? 0.74,
         },
+        strictLiveness: Boolean(s.strictLiveness),
+        modalityWeights: s.modalityWeights,
+        challengeToken: submittedChallengeToken,
         samples,
         quality,
         adaptiveEnabled,
@@ -1776,11 +1823,16 @@ export function renderVerification(container, { appState, navigate }) {
         outcome: res.outcome,
         finalDecision,
         livenessStatus,
+        livenessDecision: res.livenessDecision,
+        challengeVerified: res.challengeVerified,
         datasetCategory,
         captureFailure: false,
         reasonCode: res.reasonCode,
         score: res.score,
         confidence: res.confidence,
+        identityConfidence: res.identityConfidence,
+        sampleQualityScore: res.sampleQualityScore,
+        livenessConfidence: res.livenessConfidence,
         confidenceBand: res.confidenceBand,
         conflictDetected: res.conflictDetected,
         processingTimeMs: res.processingTimeMs,
@@ -1876,14 +1928,14 @@ export function renderVerification(container, { appState, navigate }) {
               <span class="kpi-meta">Required: ${fmtPct(res.threshold)}</span>
             </div>
             <div class="kpi-cell">
-              <span class="kpi-label">Calibrated Confidence</span>
+              <span class="kpi-label">Composite Confidence</span>
               <span class="kpi-value ${confCls}">${fmtPct(res.confidence || 0)}</span>
               <span class="kpi-meta" style="text-transform:capitalize;">${escapeHtml(res.confidenceBand || 'low')} certainty</span>
             </div>
             <div class="kpi-cell">
               <span class="kpi-label">Liveness Screening</span>
               <span class="kpi-value ${liveCls}" style="font-size:17px;">${escapeHtml(livenessStatus)}</span>
-              <span class="kpi-meta">Integrity score ${Math.round((res.liveness?.score ?? 0) * 100)}%</span>
+              <span class="kpi-meta">Score ${Math.round((res.liveness?.score ?? 0) * 100)}% · Challenge: ${res.challengeVerified ? 'Verified' : 'None'}</span>
             </div>
             <div class="kpi-cell">
               <span class="kpi-label">Risk Indicator</span>
@@ -1892,9 +1944,30 @@ export function renderVerification(container, { appState, navigate }) {
             </div>
           </div>
 
+          <div class="confidence-split-grid">
+            <div class="confidence-split-cell">
+              <span class="meta-line">Identity Match Margin</span>
+              <strong class="mono">${typeof res.identityConfidence === 'number' ? fmtPct(res.identityConfidence) : '—'}</strong>
+            </div>
+            <div class="confidence-split-cell">
+              <span class="meta-line">Sample Quality Index</span>
+              <strong class="mono">${typeof res.sampleQualityScore === 'number' ? fmtPct(res.sampleQualityScore) : '—'}</strong>
+            </div>
+            <div class="confidence-split-cell">
+              <span class="meta-line">Liveness Integrity</span>
+              <strong class="mono">${typeof res.livenessConfidence === 'number' ? fmtPct(res.livenessConfidence) : '—'}</strong>
+            </div>
+          </div>
+
           <div class="progress-track">
             <div class="progress-fill ${finalDecision === 'VERIFIED' ? 'success' : 'danger'}" style="width:${Math.min(100, Math.round(res.score * 100))}%"></div>
           </div>
+
+          ${
+            res.trustedSensorAttestation === false && (livenessStatus === 'NOT SUPPORTED' || livenessStatus === 'INCONCLUSIVE')
+              ? `<div class="meta-line">Sensor attestation: <span class="mono">unattested browser capture</span> — liveness is software-screened only unless an active challenge passes on live camera.</div>`
+              : ''
+          }
 
           ${
             fpEval

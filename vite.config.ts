@@ -44,7 +44,7 @@ export default defineConfig(() => {
         workbox: {
           maximumFileSizeToCacheInBytes: 8 * 1024 * 1024,
           globPatterns: ['build/**/*.{js,css}', 'index.html', 'icon.svg', 'pwa-*.png', 'apple-touch-icon.png'],
-          globIgnores: ['assets/aistudio/**', 'models/**'],
+          globIgnores: ['models/**'],
           navigateFallback: '/index.html',
           navigateFallbackDenylist: [/^\/api\//],
           runtimeCaching: [

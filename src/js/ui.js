@@ -374,7 +374,7 @@ export async function openCameraStream() {
     } catch (err) {
       lastErr = err;
       if (err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError') {
-        throw new Error('Camera permission was denied. Allow camera access in your browser/device settings.');
+        throw new Error('Camera permission was denied. Allow camera access in your browser/device settings.', { cause: err });
       }
     }
   }

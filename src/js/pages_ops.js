@@ -153,9 +153,16 @@ export function renderAnalytics(container, { appState }) {
     });
     latestReport = report;
 
+    const dsOp = report.datasets.operational;
+    const dsQa = report.datasets.syntheticQa;
+    const dsBm = report.datasets.benchmark;
+
     const livenessPct = report.livenessKnownCount ? fmtPct(report.livenessSuccessRate) : '—';
-    const opPct = report.datasets.operational.attempts > 0 ? fmtPct(report.datasets.operational.operationalMatchRate) : '—';
-    const capFailPct = fmtPct(report.datasets.operational.captureFailureRate);
+    const opPct = dsOp.operationalMatchRate !== null ? fmtPct(dsOp.operationalMatchRate) : '—';
+    const capFailPct = dsOp.captureFailureRate !== null ? fmtPct(dsOp.captureFailureRate) : '—';
+    const incPct = report.totalAttempts > 0 ? fmtPct(report.inconclusiveRate) : '—';
+    const liveFailPct = report.livenessKnownCount ? fmtPct(report.livenessFailureRate) : '—';
+    const qDist = report.sampleQualityDistribution;
 
     container.querySelector('#an-kpis').innerHTML = `
       <div class="kpi-cell">
@@ -166,23 +173,19 @@ export function renderAnalytics(container, { appState }) {
       <div class="kpi-cell">
         <span class="kpi-label">Verified / Rejected / Inc.</span>
         <span class="kpi-value">${report.successfulVerifications} / ${report.rejectedVerifications} / ${report.notEvaluatedVerifications}</span>
-        <span class="kpi-meta">Capture failure rate: ${capFailPct}</span>
+        <span class="kpi-meta">Inconclusive ${incPct} · Capture fail ${capFailPct}</span>
       </div>
       <div class="kpi-cell">
         <span class="kpi-label">Operational Match Rate</span>
         <span class="kpi-value">${opPct}</span>
-        <span class="kpi-meta">${report.datasets.operational.attempts} real ops · ${report.datasets.syntheticQa.attempts} QA probe(s)</span>
+        <span class="kpi-meta">${dsOp.totalAttempts} real ops · ${dsQa.totalProbes} QA probe(s)</span>
       </div>
       <div class="kpi-cell">
-        <span class="kpi-label">Confirmed Liveness Rate</span>
-        <span class="kpi-value">${livenessPct}</span>
+        <span class="kpi-label">Confirmed Liveness Pass / Fail</span>
+        <span class="kpi-value">${livenessPct} <span style="font-size:14px;color:var(--text-muted);">/ ${liveFailPct}</span></span>
         <span class="kpi-meta">${report.livenessKnownCount} live/spoof check(s) · ${report.conflictCount} conflict(s)</span>
       </div>
     `;
-
-    const dsOp = report.datasets.operational;
-    const dsQa = report.datasets.syntheticQa;
-    const dsBm = report.datasets.benchmark;
 
     container.querySelector('#an-datasets-panel').innerHTML = `
       <div class="panel-header">
@@ -195,12 +198,12 @@ export function renderAnalytics(container, { appState }) {
         <div class="dataset-card">
           <div class="row-between">
             <strong>1. Real Operational Data</strong>
-            <span class="state-text state-success">${dsOp.attempts} attempt(s)</span>
+            <span class="state-text state-success">${dsOp.totalAttempts} attempt(s)</span>
           </div>
           <div class="divider-list" style="font-size:12.5px;">
             <div class="divider-row"><span>Verified / Rejected / Inconclusive</span><span class="mono">${dsOp.verifiedCount} / ${dsOp.rejectedCount} / ${dsOp.inconclusiveCount}</span></div>
-            <div class="divider-row"><span>Operational Match Rate</span><span class="mono">${dsOp.attempts ? fmtPct(dsOp.operationalMatchRate) : '—'}</span></div>
-            <div class="divider-row"><span>Capture Failures / Rate</span><span class="mono">${dsOp.captureFailureCount} (${fmtPct(dsOp.captureFailureRate)})</span></div>
+            <div class="divider-row"><span>Operational Match Rate</span><span class="mono">${opPct}</span></div>
+            <div class="divider-row"><span>Capture Failures / Rate</span><span class="mono">${dsOp.captureFailureCount} (${capFailPct})</span></div>
             <div class="divider-row"><span>Liveness Pass / Fail / Inc. / NS</span><span class="mono">${dsOp.livenessPassedCount} / ${dsOp.livenessFailedCount} / ${dsOp.livenessInconclusiveCount} / ${dsOp.livenessNotSupportedCount}</span></div>
           </div>
         </div>
@@ -208,11 +211,12 @@ export function renderAnalytics(container, { appState }) {
         <div class="dataset-card">
           <div class="row-between">
             <strong>2. Synthetic QA / Testing Data</strong>
-            <span class="state-text state-warning">${dsQa.attempts} probe(s)</span>
+            <span class="state-text state-warning">${dsQa.totalProbes} probe(s)</span>
           </div>
           <div class="divider-list" style="font-size:12.5px;">
             <div class="divider-row"><span>Verified / Rejected / Inconclusive</span><span class="mono">${dsQa.verifiedCount} / ${dsQa.rejectedCount} / ${dsQa.inconclusiveCount}</span></div>
-            <div class="divider-row"><span>Genuine / Impostor QA Labels</span><span class="mono">${dsQa.genuineCount} / ${dsQa.impostorCount}</span></div>
+            <div class="divider-row"><span>Genuine / Impostor QA Labels</span><span class="mono">${dsQa.genuineProbes} / ${dsQa.impostorProbes}</span></div>
+            <div class="divider-row"><span>Sample Quality (Good / Bord / Poor)</span><span class="mono">${qDist.goodCount} / ${qDist.borderlineCount} / ${qDist.poorCount}${qDist.meanQuality !== null ? ` (μ=${qDist.meanQuality})` : ''}</span></div>
             <div class="divider-row"><span>Operational Contamination</span><span class="state-text state-success">Excluded (0%)</span></div>
           </div>
         </div>
@@ -220,12 +224,13 @@ export function renderAnalytics(container, { appState }) {
         <div class="dataset-card">
           <div class="row-between">
             <strong>3. Labeled Benchmark Evaluation</strong>
-            <span class="state-text ${dsBm.insufficientData ? 'state-warning' : 'state-success'}">${dsBm.sampleCount} trial(s)</span>
+            <span class="state-text ${dsBm.insufficientData ? 'state-warning' : 'state-success'}">${dsBm.totalLabeledTrials} trial(s)</span>
           </div>
           <div class="divider-list" style="font-size:12.5px;">
             <div class="divider-row"><span>Operational vs Synthetic Labeled</span><span class="mono">${dsBm.operationalLabeledTrials} ops · ${dsBm.syntheticLabeledTrials} synth</span></div>
-            <div class="divider-row"><span>Genuine / Impostor Counts</span><span class="mono">${dsBm.genuineCount} / ${dsBm.impostorCount}</span></div>
-            <div class="divider-row"><span>Statistical Readiness</span><span class="state-text ${dsBm.insufficientData ? 'state-warning' : 'state-success'}">${dsBm.insufficientData ? 'Insufficient evaluation data.' : 'Ready (≥3 per class)'}</span></div>
+            <div class="divider-row"><span>Genuine / Impostor Counts</span><span class="mono">${dsBm.classification.genuineCount} / ${dsBm.classification.impostorCount}</span></div>
+            <div class="divider-row"><span>Liveness (Pass / Fail / Inc / NS)</span><span class="mono">${report.livenessBreakdown.passed} / ${report.livenessBreakdown.failed} / ${report.livenessBreakdown.inconclusive} / ${report.livenessBreakdown.notSupported}</span></div>
+            <div class="divider-row"><span>Statistical Readiness</span><span class="state-text ${dsBm.insufficientData ? 'state-warning' : 'state-success'}">${dsBm.insufficientData ? 'Insufficient validated data' : 'Ready (≥3 per class)'}</span></div>
           </div>
         </div>
       </div>
@@ -242,12 +247,12 @@ export function renderAnalytics(container, { appState }) {
           <h2 class="panel-title">Measured Classification Accuracy (Benchmark Labeled Trials)</h2>
           <p class="panel-subtitle">Sample size: ${c.sampleCount} labeled (${c.genuineCount} genuine, ${c.impostorCount} impostor) · ${report.unlabeledAttempts} unlabeled excluded · Range: ${escapeHtml(drStart)} → ${escapeHtml(drEnd)}</p>
         </div>
-        <span class="state-text ${c.insufficientData ? 'state-warning' : 'state-success'}">${c.insufficientData ? 'Insufficient evaluation data.' : 'Statistically Grounded'}</span>
+        <span class="state-text ${c.insufficientData ? 'state-warning' : 'state-success'}">${c.insufficientData ? 'Insufficient validated data' : 'Statistically Grounded'}</span>
       </div>
 
       ${
         c.insufficientData
-          ? `<div class="notice-strip warning"><div><strong>${escapeHtml(dsBm.insufficientDataMessage || 'Insufficient evaluation data.')}</strong><div>${escapeHtml(c.insufficientReason)} Run at least 3 Genuine and 3 Impostor labeled evaluation trials to report statistically valid FAR, FRR, and EER bounds.</div></div></div>`
+          ? `<div class="notice-strip warning"><div><strong>${escapeHtml(dsBm.insufficientDataMessage || 'Insufficient validated data')}</strong><div>${escapeHtml(c.insufficientReason)} Run at least 3 Genuine and 3 Impostor labeled evaluation trials to report statistically valid FAR, FRR, and EER bounds.</div></div></div>`
           : ''
       }
 
@@ -304,7 +309,7 @@ export function renderAnalytics(container, { appState }) {
             </tbody>
           </table>
         </div>`
-          : `<div class="empty-state"><div class="empty-title">Insufficient evaluation data.</div><div class="empty-desc">Operational traffic remains excluded from accuracy claims unless explicitly labeled as genuine or impostor.</div></div>`
+          : `<div class="empty-state"><div class="empty-title">Insufficient validated data</div><div class="empty-desc">Operational traffic remains excluded from accuracy claims unless explicitly labeled as genuine or impostor.</div></div>`
       }
     `;
 
@@ -465,7 +470,7 @@ export function renderAnalytics(container, { appState }) {
   });
 
   container.querySelector('#an-export-csv').addEventListener('click', () => {
-    const header = 'verificationId,identityRef,pipeline,modalities,outcome,policyDecision,reasonCode,score,confidence,confidenceBand,conflictDetected,groundTruth,isTestProbe,processingTimeMs,faceScore,voiceScore,fingerprintScore,riskScore,riskLevel,livenessPassed,adaptiveApplied\n';
+    const header = 'verificationId,identityRef,pipeline,modalities,outcome,finalDecision,policyDecision,reasonCode,score,confidence,identityConfidence,sampleQualityScore,livenessConfidence,confidenceBand,conflictDetected,groundTruth,isTestProbe,processingTimeMs,faceScore,voiceScore,fingerprintScore,riskScore,riskLevel,livenessStatus,livenessPassed,adaptiveApplied\n';
     const lines = getFilteredVerifications()
       .map((v) =>
         [
@@ -474,10 +479,14 @@ export function renderAnalytics(container, { appState }) {
           v.pipeline,
           (v.modalities || []).join('+'),
           v.outcome,
+          v.finalDecision ?? '',
           v.policyDecision,
           v.reasonCode,
           v.score,
           v.confidence ?? '',
+          v.identityConfidence ?? '',
+          v.sampleQualityScore ?? '',
+          v.livenessConfidence ?? '',
           v.confidenceBand ?? '',
           v.conflictDetected ?? '',
           v.groundTruth ?? 'unlabeled',
@@ -488,6 +497,7 @@ export function renderAnalytics(container, { appState }) {
           v.fingerprintScore ?? '',
           v.riskScore ?? '',
           v.riskLevel ?? '',
+          v.livenessStatus ?? '',
           v.livenessPassed ?? '',
           v.adaptiveApplied ?? '',
         ]
