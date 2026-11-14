@@ -1,5 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "express",
-  "buildCommand": "npm run build"
+  "buildCommand": "npm run build",
+  "functions": {
+    "server.ts": {
+      "includeFiles": "src/shared/**/*.ts"
+    }
+  }
 }
