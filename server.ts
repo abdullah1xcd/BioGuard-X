@@ -1395,12 +1395,7 @@ app.post(
     const versionMismatches: string[] = [];
     let legacyCompatibility = entry.featureVersion !== FEATURE_VERSION;
 
-    const available: Partial<Record<ModalityName, {
-      score: number;
-      rawCosine?: number;
-      qualityScore: number;
-      details?: Record<string, unknown>;
-    }>> = {};
+    const available: Parameters<typeof fuseMultimodalScores>[0]['available'] = {};
 
     if (faceParsed && refsFace.length > 0) {
       const sameDimRefs = refsFace.filter((r) => r.length === faceParsed.dim);
@@ -1608,12 +1603,7 @@ function compareEntriesServer(
   thresholds: ThresholdConfig,
   fusionPolicy: FusionPolicy
 ) {
-  const available: Partial<Record<ModalityName, {
-    score: number;
-    rawCosine?: number;
-    qualityScore: number;
-    details?: Record<string, unknown>;
-  }>> = {};
+  const available: Parameters<typeof fuseMultimodalScores>[0]['available'] = {};
   const incompatibleModalities: string[] = [];
   let legacyCompatibility =
     entryA.featureVersion !== FEATURE_VERSION || entryB.featureVersion !== FEATURE_VERSION;
