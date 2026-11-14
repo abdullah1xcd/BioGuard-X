@@ -42,15 +42,24 @@ service cloud.firestore {
       );
     }
 
+    // The verified bootstrap super-admin is provisioned by email before a
+    // /users/{uid} profile necessarily exists. Permit that one account to use
+    // its own workspace while preserving active-profile checks for everyone else.
     function isActiveAccount(userId) {
-      return exists(/databases/$(database)/documents/users/$(userId)) &&
-        get(/databases/$(database)/documents/users/$(userId)).data.status == 'active';
+      return (isOwner(userId) && isBootstrappedAdmin()) ||
+        (
+          exists(/databases/$(database)/documents/users/$(userId)) &&
+          get(/databases/$(database)/documents/users/$(userId)).data.status == 'active'
+        );
     }
 
     function canWriteOwnWorkspace(userId) {
-      return exists(/databases/$(database)/documents/users/$(userId)) &&
-        get(/databases/$(database)/documents/users/$(userId)).data.status == 'active' &&
-        get(/databases/$(database)/documents/users/$(userId)).data.role != 'viewer';
+      return (isOwner(userId) && isBootstrappedAdmin()) ||
+        (
+          exists(/databases/$(database)/documents/users/$(userId)) &&
+          get(/databases/$(database)/documents/users/$(userId)).data.status == 'active' &&
+          get(/databases/$(database)/documents/users/$(userId)).data.role != 'viewer'
+        );
     }
 
     // Entity Validation Blueprints
