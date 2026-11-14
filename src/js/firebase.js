@@ -347,17 +347,36 @@ export async function recordVerificationMetadata({
   const path = `users/${uid}/verification_records/${verificationId}`;
   const t0 = performance.now();
   try {
-    const derivedDatasetCategory = datasetCategory
-      || (isTestProbe ? 'synthetic_qa' : groundTruth !== 'unlabeled' ? 'benchmark_eval' : 'operational');
+    // Build a Firestore-rules-safe record. Matcher telemetry can contain NaN/Infinity
+    // when a modality is unavailable; those values must never be sent to Firestore.
+    const safeModalities = Array.isArray(modalities)
+      ? modalities.filter((item) => typeof item === 'string' && item.length > 0).slice(0, 3)
+      : [];
+    if (!identityRef || typeof identityRef !== 'string' || identityRef.length > 64) {
+      throw new Error('Verification record rejected: invalid identity reference.');
+    }
+    if (safeModalities.length === 0) {
+      throw new Error('Verification record rejected: no valid modalities were evaluated.');
+    }
+    const safeOutcome = ['match', 'no_match', 'not_evaluated'].includes(outcome) ? outcome : 'not_evaluated';
+    const safeGroundTruth = ['genuine', 'impostor', 'unlabeled'].includes(groundTruth) ? groundTruth : 'unlabeled';
+    const derivedDatasetCategory = ['operational', 'synthetic_qa', 'benchmark_eval'].includes(datasetCategory)
+      ? datasetCategory
+      : (isTestProbe ? 'synthetic_qa' : safeGroundTruth !== 'unlabeled' ? 'benchmark_eval' : 'operational');
+    const finiteClamp = (value, min, max, digits = 3) =>
+      typeof value === 'number' && Number.isFinite(value)
+        ? Number(Math.min(max, Math.max(min, value)).toFixed(digits))
+        : null;
+    const safeScore = finiteClamp(score, 0, 1, 4);
     const docData = {
       verificationId,
       identityRef,
-      modalities: modalities.slice(0, 3),
+      modalities: safeModalities,
       pipeline: String(pipeline || 'hierarchical').slice(0, 64),
-      outcome,
+      outcome: safeOutcome,
       policyDecision: 'pending',
       reasonCode: String(reasonCode || 'evaluated').slice(0, 80),
-      score: typeof score === 'number' ? Number(score.toFixed(4)) : 0,
+      score: safeScore ?? 0,
       operatorUid: uid,
       datasetCategory: derivedDatasetCategory,
       captureFailure: Boolean(captureFailure),
@@ -378,7 +397,7 @@ export async function recordVerificationMetadata({
     if (typeof riskScore === 'number') docData.riskScore = Math.min(100, Math.max(0, Math.round(riskScore)));
     if (['low', 'medium', 'high', 'critical'].includes(riskLevel)) docData.riskLevel = riskLevel;
     if (typeof livenessPassed === 'boolean') docData.livenessPassed = livenessPassed;
-    if (typeof livenessScore === 'number') docData.livenessScore = Number(Math.min(1, Math.max(0, livenessScore)).toFixed(2));
+    { const value = finiteClamp(livenessScore, 0, 1, 2); if (value !== null) docData.livenessScore = value; }
     if (typeof adaptiveApplied === 'boolean') docData.adaptiveApplied = adaptiveApplied;
     if (['genuine', 'impostor', 'unlabeled'].includes(groundTruth)) docData.groundTruth = groundTruth;
     if (typeof isTestProbe === 'boolean') docData.isTestProbe = isTestProbe;
@@ -419,30 +438,30 @@ export async function recordVerificationMetadata({
     }
 
     if (modalityEvaluations?.face) {
-      docData.faceScore = Number(Math.min(1, Math.max(0, modalityEvaluations.face.score)).toFixed(4));
-      docData.faceQuality = Math.min(100, Math.max(0, Math.round(modalityEvaluations.face.qualityScore)));
+      { const value = finiteClamp(modalityEvaluations.face.score, 0, 1, 4); if (value !== null) docData.faceScore = value; }
+      { const value = finiteClamp(modalityEvaluations.face.qualityScore, 0, 100, 0); if (value !== null) docData.faceQuality = value; }
       if (['MATCH', 'NO MATCH', 'INCONCLUSIVE'].includes(modalityEvaluations.face.status)) {
         docData.faceStatus = modalityEvaluations.face.status;
       }
     }
     if (modalityEvaluations?.voice) {
-      docData.voiceScore = Number(Math.min(1, Math.max(0, modalityEvaluations.voice.score)).toFixed(4));
-      docData.voiceQuality = Math.min(100, Math.max(0, Math.round(modalityEvaluations.voice.qualityScore)));
+      { const value = finiteClamp(modalityEvaluations.voice.score, 0, 1, 4); if (value !== null) docData.voiceScore = value; }
+      { const value = finiteClamp(modalityEvaluations.voice.qualityScore, 0, 100, 0); if (value !== null) docData.voiceQuality = value; }
       if (['MATCH', 'NO MATCH', 'INCONCLUSIVE'].includes(modalityEvaluations.voice.status)) {
         docData.voiceStatus = modalityEvaluations.voice.status;
       }
     }
     if (modalityEvaluations?.fingerprint) {
-      docData.fingerprintScore = Number(Math.min(1, Math.max(0, modalityEvaluations.fingerprint.score)).toFixed(4));
-      docData.fingerprintQuality = Math.min(100, Math.max(0, Math.round(modalityEvaluations.fingerprint.qualityScore)));
+      { const value = finiteClamp(modalityEvaluations.fingerprint.score, 0, 1, 4); if (value !== null) docData.fingerprintScore = value; }
+      { const value = finiteClamp(modalityEvaluations.fingerprint.qualityScore, 0, 100, 0); if (value !== null) docData.fingerprintQuality = value; }
       if (['MATCH', 'NO MATCH', 'INCONCLUSIVE'].includes(modalityEvaluations.fingerprint.status)) {
         docData.fingerprintStatus = modalityEvaluations.fingerprint.status;
       }
       const fpDet = modalityEvaluations.fingerprint.details || {};
-      if (typeof fpDet.matchedMinutiae === 'number') {
+      if (typeof fpDet.matchedMinutiae === 'number' && Number.isFinite(fpDet.matchedMinutiae)) {
         docData.matchedMinutiae = Math.max(0, Math.min(500, Math.round(fpDet.matchedMinutiae)));
       }
-      if (typeof fpDet.probeMinutiae === 'number') {
+      if (typeof fpDet.probeMinutiae === 'number' && Number.isFinite(fpDet.probeMinutiae)) {
         docData.probeMinutiae = Math.max(0, Math.min(500, Math.round(fpDet.probeMinutiae)));
       }
     }
