@@ -394,7 +394,7 @@ export async function recordVerificationMetadata({
     if (typeof challengeVerified === 'boolean') {
       docData.challengeVerified = challengeVerified;
     }
-    if (typeof riskScore === 'number') docData.riskScore = Math.min(100, Math.max(0, Math.round(riskScore)));
+    { const value = finiteClamp(riskScore, 0, 100, 0); if (value !== null) docData.riskScore = value; }
     if (['low', 'medium', 'high', 'critical'].includes(riskLevel)) docData.riskLevel = riskLevel;
     if (typeof livenessPassed === 'boolean') docData.livenessPassed = livenessPassed;
     { const value = finiteClamp(livenessScore, 0, 1, 2); if (value !== null) docData.livenessScore = value; }
