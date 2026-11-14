@@ -939,4 +939,59 @@ test('Server challenge tokens, anti-replay nonces, strict CORS guard & security 
   }
 });
 
+test('Server error mapping: preserves Firestore status codes, maps vault decryption failures to 422, and formats structured diagnostics', async () => {
+  process.env.BIOGUARD_SKIP_LISTEN = '1';
+  const serverMod = await import('../server.ts');
+  const {
+    BackendHttpError,
+    mapFirestoreHttpError,
+    encryptVaultMap,
+    decryptVaultMapWithMeta,
+  } = serverMod;
 
+  // 1. Firestore HTTP error classification
+  const err401 = mapFirestoreHttpError('vault read', 401, JSON.stringify({ error: { status: 'UNAUTHENTICATED', message: 'Invalid auth' } }));
+  assert.ok(err401 instanceof BackendHttpError);
+  assert.equal(err401.status, 401);
+  assert.equal(err401.code, 'firestore_unauthenticated');
+
+  const err403 = mapFirestoreHttpError('vault write', 403, JSON.stringify({ error: { status: 'PERMISSION_DENIED', message: 'Missing permissions' } }));
+  assert.equal(err403.status, 403);
+  assert.equal(err403.code, 'firestore_permission_denied');
+  assert.match(err403.message, /firestore\.rules/i);
+
+  const err400 = mapFirestoreHttpError('vault write', 400, JSON.stringify({ error: { status: 'INVALID_ARGUMENT', message: 'Payload too large' } }));
+  assert.equal(err400.status, 400);
+  assert.equal(err400.code, 'firestore_invalid_argument');
+
+  const err429 = mapFirestoreHttpError('vault read', 429, JSON.stringify({ error: { status: 'RESOURCE_EXHAUSTED', message: 'Quota' } }));
+  assert.equal(err429.status, 429);
+  assert.equal(err429.code, 'firestore_quota_exceeded');
+
+  const err404 = mapFirestoreHttpError('vault list', 404, JSON.stringify({ error: { status: 'NOT_FOUND', message: 'Database missing' } }));
+  assert.equal(err404.status, 503);
+  assert.equal(err404.code, 'firestore_database_not_found');
+
+  const err502 = mapFirestoreHttpError('vault read', 502, 'Bad Gateway');
+  assert.equal(err502.status, 503);
+  assert.equal(err502.code, 'firestore_unavailable');
+
+  // 2. Decryption failure with wrong secret throws BackendHttpError(422, 'vault_decryption_failed')
+  const sampleVault = {
+    ID_ERR_01: {
+      identityRef: 'ID_ERR_01',
+      featureVersion: FEATURE_VERSION,
+      enrolledAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      modalities: { face: [[0.5, 0.5, 0.5]] },
+    },
+  };
+  const encrypted = encryptVaultMap(sampleVault, 'correct-secret-minimum-32-characters-0001');
+  assert.throws(
+    () => decryptVaultMapWithMeta(encrypted, 'wrong-secret-minimum-32-characters-99999'),
+    (err: unknown) =>
+      err instanceof BackendHttpError &&
+      err.status === 422 &&
+      err.code === 'vault_decryption_failed'
+  );
+});

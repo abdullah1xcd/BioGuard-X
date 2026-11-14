@@ -244,8 +244,9 @@ function renderSidebar() {
   const healthEl = document.getElementById('health-indicator');
   if (healthEl) {
     const apiOk = appState.health?.status === 'ok';
+    const vaultMissing = apiOk && appState.health?.vault_ready === false;
     healthEl.innerHTML = `
-      <div><strong class="${apiOk ? 'state-success' : 'state-danger'}">${apiOk ? 'API Ready' : 'API Offline'}</strong>${isDevTestingModeActive(appState) ? ' · <span class="state-warning">Dev Mode</span>' : ''}</div>
+      <div><strong class="${vaultMissing ? 'state-warning' : apiOk ? 'state-success' : 'state-danger'}">${vaultMissing ? 'Vault Unconfigured' : apiOk ? 'API Ready' : 'API Offline'}</strong>${isDevTestingModeActive(appState) ? ' · <span class="state-warning">Dev Mode</span>' : ''}</div>
       <div>Vault: ${appState.identities.length} · Sync: ${appState.firestoreOk ? 'Live' : 'Offline'}</div>
     `;
   }

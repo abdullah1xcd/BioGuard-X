@@ -1032,12 +1032,12 @@ export function renderEnrollment(container, { appState, navigate }) {
         resourceId: identityRef,
         result: `Enrolled [${apiRes.registeredModalities.join(', ')}] (${apiRes.featureVersion}) in ${apiRes.processingTimeMs}ms`,
         requestId: apiRes.requestId,
-      });
+      }).catch(() => null);
       await pushNotification({
         title: 'Identity Enrolled',
         message: `${displayName} (${identityRef}) enrolled with [${apiRes.registeredModalities.join(', ')}].`,
         type: 'success',
-      });
+      }).catch(() => null);
 
       const usedSynthetic =
         faceQuality?.captureSource === 'test_sample' ||
@@ -1089,7 +1089,19 @@ export function renderEnrollment(container, { appState, navigate }) {
       showToast(`Identity "${identityRef}" enrolled.`, 'success');
       haltCameraUI();
     } catch (err) {
-      container.querySelector('#be-result').innerHTML = `<div class="notice-strip danger"><div><strong>Enrollment Quality / Validation Rejected</strong><div>${escapeHtml(err.message)}</div></div></div>`;
+      const code = String(err?.code || '');
+      const status = Number(err?.status || 0);
+      const heading =
+        code === 'vault_secret_not_configured'
+          ? 'Vault Encryption Secret Not Configured'
+          : code.startsWith('firestore_')
+          ? 'Firestore Configuration / Permission Error'
+          : status >= 500 || code === 'backend_unavailable'
+          ? 'Backend / Storage Request Failed'
+          : code === 'vault_decryption_failed'
+          ? 'Existing Vault Record Decryption Mismatch'
+          : 'Enrollment Quality / Validation Rejected';
+      container.querySelector('#be-result').innerHTML = `<div class="notice-strip danger"><div><strong>${escapeHtml(heading)}</strong><div>${escapeHtml(err.message)}</div></div></div>`;
       showToast(err.message, 'danger');
     } finally {
       submitBtn.disabled = false;

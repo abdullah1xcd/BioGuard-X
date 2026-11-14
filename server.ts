@@ -138,6 +138,67 @@ export class VaultSecretError extends Error {
   }
 }
 
+export class BackendHttpError extends Error {
+  status: number;
+  code: string;
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.name = 'BackendHttpError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export function mapFirestoreHttpError(op: string, statusCode: number, rawDetail: string): BackendHttpError {
+  let parsedStatus = '';
+  let parsedMsg = '';
+  try {
+    const j = JSON.parse(rawDetail) as { error?: { status?: string; message?: string } };
+    parsedStatus = String(j?.error?.status || '');
+    parsedMsg = String(j?.error?.message || '');
+  } catch {
+    // Plain-text upstream error body
+  }
+  const detailHint = parsedMsg || rawDetail.slice(0, 220);
+
+  if (statusCode === 401 || parsedStatus === 'UNAUTHENTICATED') {
+    return new BackendHttpError(401, 'firestore_unauthenticated', `Firestore authentication failed during ${op}. Sign out and sign in again.`);
+  }
+  if (statusCode === 403 || parsedStatus === 'PERMISSION_DENIED') {
+    return new BackendHttpError(
+      403,
+      'firestore_permission_denied',
+      `Firestore rejected ${op} due to security rules or account permissions${detailHint ? ` (${detailHint})` : ''}. Ensure your email is verified and latest firestore.rules are deployed.`
+    );
+  }
+  if (statusCode === 400 || parsedStatus === 'INVALID_ARGUMENT') {
+    return new BackendHttpError(
+      400,
+      'firestore_invalid_argument',
+      `Firestore rejected ${op} payload${detailHint ? ` (${detailHint})` : ''}.`
+    );
+  }
+  if (statusCode === 429 || parsedStatus === 'RESOURCE_EXHAUSTED') {
+    return new BackendHttpError(
+      429,
+      'firestore_quota_exceeded',
+      'Firestore free-tier quota exceeded. Retry later or check Firebase billing/usage.'
+    );
+  }
+  if (statusCode === 404 || parsedStatus === 'NOT_FOUND') {
+    return new BackendHttpError(
+      503,
+      'firestore_database_not_found',
+      `Firestore database or collection path could not be resolved during ${op} (project=${firebaseConfig.projectId}, db=${firebaseConfig.firestoreDatabaseId}).`
+    );
+  }
+  return new BackendHttpError(
+    503,
+    'firestore_unavailable',
+    `Firestore ${op} failed with HTTP ${statusCode}${detailHint ? `: ${detailHint}` : ''}.`
+  );
+}
+
 export function isVaultSecretConfigured(): boolean {
   return Boolean(process.env.BIOGUARD_VAULT_SECRET && process.env.BIOGUARD_VAULT_SECRET.trim().length >= 32);
 }
@@ -216,7 +277,12 @@ export function decryptVaultMapWithMeta(
       lastErr = err;
     }
   }
-  throw lastErr instanceof Error ? lastErr : new Error('Failed to decrypt biometric vault record.');
+  if (lastErr instanceof VaultSecretError) throw lastErr;
+  throw new BackendHttpError(
+    422,
+    'vault_decryption_failed',
+    'Unable to decrypt existing encrypted vault record with the current BIOGUARD_VAULT_SECRET. Configure BIOGUARD_VAULT_SECRET_PREVIOUS if the secret changed, or enroll under a new Identity Reference ID.'
+  );
 }
 
 export function decryptVaultMap(raw: string, overrideSecret?: string): Record<string, VaultEntry> {
@@ -230,17 +296,31 @@ function firestoreDocUrl(docPath: string): string {
 
 async function loadVaultEntry(uid: string, identityRef: string, idToken: string): Promise<VaultEntry | null> {
   const url = firestoreDocUrl(`users/${encodeURIComponent(uid)}/biometric_vault/${encodeURIComponent(identityRef)}`);
-  const response = await fetch(url, { headers: { Authorization: `Bearer ${idToken}` } });
+  let response: globalThis.Response;
+  try {
+    response = await fetch(url, {
+      headers: { Authorization: `Bearer ${idToken}` },
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (err) {
+    throw new BackendHttpError(
+      503,
+      'firestore_unreachable',
+      `Failed to reach Firestore while reading vault entry (${err instanceof Error ? err.message : 'network error'}).`
+    );
+  }
   if (response.status === 404) return null;
   if (!response.ok) {
     const detail = await response.text().catch(() => '');
-    throw new Error(`Firestore vault document read failed (${response.status}): ${detail.slice(0, 300)}`);
+    throw mapFirestoreHttpError('vault read', response.status, detail);
   }
   const payload = (await response.json()) as {
     fields?: { encryptedPayload?: { stringValue?: string } };
   };
   const encryptedPayload = payload.fields?.encryptedPayload?.stringValue;
-  if (!encryptedPayload) throw new Error('Firestore vault document is missing encryptedPayload.');
+  if (!encryptedPayload) {
+    throw new BackendHttpError(422, 'vault_record_corrupt', 'Stored Firestore vault document is missing encryptedPayload.');
+  }
   const decrypted = decryptVaultMap(encryptedPayload);
   return decrypted[identityRef] || null;
 }
@@ -260,7 +340,7 @@ async function listVaultEntriesWithMeta(
     if (response.status === 404) break;
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
-      throw new Error(`Firestore vault list failed (${response.status}): ${detail.slice(0, 300)}`);
+      throw mapFirestoreHttpError('vault list', response.status, detail);
     }
     const payload = (await response.json()) as {
       documents?: Array<{
@@ -297,36 +377,57 @@ async function listVaultEntries(uid: string, idToken: string, maxDocs = 500): Pr
 
 async function saveVaultEntry(uid: string, entry: VaultEntry, idToken: string): Promise<void> {
   const identityRef = entry.identityRef;
+  const encryptedPayload = encryptVaultMap({ [identityRef]: entry });
   const url = firestoreDocUrl(`users/${encodeURIComponent(uid)}/biometric_vault/${encodeURIComponent(identityRef)}`);
-  const response = await fetch(url, {
-    method: 'PATCH',
-    headers: {
-      Authorization: `Bearer ${idToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      fields: {
-        identityRef: { stringValue: identityRef },
-        encryptedPayload: { stringValue: encryptVaultMap({ [identityRef]: entry }) },
-        updatedAt: { timestampValue: new Date().toISOString() },
+  let response: globalThis.Response;
+  try {
+    response = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+        'Content-Type': 'application/json',
       },
-    }),
-  });
+      body: JSON.stringify({
+        fields: {
+          identityRef: { stringValue: identityRef },
+          encryptedPayload: { stringValue: encryptedPayload },
+          updatedAt: { timestampValue: new Date().toISOString() },
+        },
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (err) {
+    throw new BackendHttpError(
+      503,
+      'firestore_unreachable',
+      `Failed to reach Firestore while saving vault entry (${err instanceof Error ? err.message : 'network error'}).`
+    );
+  }
   if (!response.ok) {
     const detail = await response.text().catch(() => '');
-    throw new Error(`Firestore vault write failed (${response.status}): ${detail.slice(0, 300)}`);
+    throw mapFirestoreHttpError('vault write', response.status, detail);
   }
 }
 
 async function deleteVaultEntry(uid: string, identityRef: string, idToken: string): Promise<void> {
   const url = firestoreDocUrl(`users/${encodeURIComponent(uid)}/biometric_vault/${encodeURIComponent(identityRef)}`);
-  const response = await fetch(url, {
-    method: 'DELETE',
-    headers: { Authorization: `Bearer ${idToken}` },
-  });
+  let response: globalThis.Response;
+  try {
+    response = await fetch(url, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${idToken}` },
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (err) {
+    throw new BackendHttpError(
+      503,
+      'firestore_unreachable',
+      `Failed to reach Firestore while deleting vault entry (${err instanceof Error ? err.message : 'network error'}).`
+    );
+  }
   if (!response.ok && response.status !== 404) {
     const detail = await response.text().catch(() => '');
-    throw new Error(`Firestore vault delete failed (${response.status}): ${detail.slice(0, 300)}`);
+    throw mapFirestoreHttpError('vault delete', response.status, detail);
   }
 }
 
@@ -2643,19 +2744,35 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (err instanceof VaultSecretError || errObj?.code === 'vault_secret_not_configured') {
     res.status(503).json({
       error: 'vault_secret_not_configured',
-      message: 'BIOGUARD_VAULT_SECRET (>=32 chars) is not configured on the server.',
+      message: 'BIOGUARD_VAULT_SECRET (>=32 chars) is missing or too short on the backend. Add it in Vercel Environment Variables / .env and redeploy.',
+    });
+    return;
+  }
+  if (err instanceof BackendHttpError) {
+    console.error(`BioGuard X backend HTTP error (${err.status} ${err.code}):`, err.message);
+    res.status(err.status).json({
+      error: err.code,
+      message: err.message,
+    });
+    return;
+  }
+  if (err instanceof TypeError || err instanceof RangeError) {
+    res.status(400).json({
+      error: 'invalid_biometric_parameters',
+      message: err.message || 'Invalid biometric parameters supplied.',
     });
     return;
   }
   const status = typeof errObj?.status === 'number' && errObj.status >= 400 && errObj.status < 600 ? errObj.status : 503;
   const code = typeof errObj?.code === 'string' ? errObj.code : 'backend_unavailable';
-  console.error(`BioGuard X API request failed (${status} ${code}):`, errObj?.message || 'Unknown error');
+  const rawMsg = errObj?.message ? String(errObj.message).slice(0, 240) : 'Unknown error';
+  console.error(`BioGuard X API request failed (${status} ${code}):`, rawMsg);
   res.status(status).json({
     error: code,
     message:
       status === 503
-        ? 'The backend could not complete this request. Check the Vercel function, vault secret, and Firestore configuration.'
-        : errObj?.message || 'Request failed.',
+        ? `The backend could not complete this request (${code}: ${rawMsg}). Check the Vercel function, BIOGUARD_VAULT_SECRET, and Firestore configuration.`
+        : rawMsg,
   });
 });
 

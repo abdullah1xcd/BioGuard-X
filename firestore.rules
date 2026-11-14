@@ -43,14 +43,18 @@ service cloud.firestore {
     }
 
     function isActiveAccount(userId) {
-      return exists(/databases/$(database)/documents/users/$(userId)) &&
-        get(/databases/$(database)/documents/users/$(userId)).data.status == 'active';
+      return (isBootstrappedAdmin() && isOwner(userId)) || (
+        exists(/databases/$(database)/documents/users/$(userId)) &&
+        get(/databases/$(database)/documents/users/$(userId)).data.status == 'active'
+      );
     }
 
     function canWriteOwnWorkspace(userId) {
-      return exists(/databases/$(database)/documents/users/$(userId)) &&
+      return (isBootstrappedAdmin() && isOwner(userId)) || (
+        exists(/databases/$(database)/documents/users/$(userId)) &&
         get(/databases/$(database)/documents/users/$(userId)).data.status == 'active' &&
-        get(/databases/$(database)/documents/users/$(userId)).data.role != 'viewer';
+        get(/databases/$(database)/documents/users/$(userId)).data.role != 'viewer'
+      );
     }
 
     // Entity Validation Blueprints
