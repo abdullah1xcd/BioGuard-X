@@ -335,6 +335,11 @@ export async function recordVerificationMetadata({
   sampleQualityScore,
   livenessConfidence,
   adaptiveApplied,
+  subjectKey,
+  partition,
+  sampleHash,
+  benchmarkBatchId,
+  provenanceSignature,
 }) {
   const uid = auth.currentUser?.uid;
   if (!uid) throw new Error('Not signed in');
@@ -396,6 +401,21 @@ export async function recordVerificationMetadata({
     if (typeof conflictDetected === 'boolean') docData.conflictDetected = conflictDetected;
     if (typeof featureVersion === 'string' && featureVersion.length > 0) {
       docData.featureVersion = featureVersion.slice(0, 32);
+    }
+    if (typeof subjectKey === 'string' && subjectKey.length > 0) {
+      docData.subjectKey = subjectKey.slice(0, 80);
+    }
+    if (partition === 'eval' || partition === 'unassigned') {
+      docData.partition = partition;
+    }
+    if (typeof sampleHash === 'string' && sampleHash.length > 0) {
+      docData.sampleHash = sampleHash.slice(0, 128);
+    }
+    if (typeof benchmarkBatchId === 'string' && benchmarkBatchId.length > 0) {
+      docData.benchmarkBatchId = benchmarkBatchId.slice(0, 80);
+    }
+    if (typeof provenanceSignature === 'string' && provenanceSignature.length > 0) {
+      docData.provenanceSignature = provenanceSignature.slice(0, 160);
     }
 
     if (modalityEvaluations?.face) {
@@ -649,7 +669,7 @@ export async function saveSystemSettings(cfg) {
       fingerprintThreshold: Number(cfg.fingerprintThreshold ?? 0.72),
       threeModalThreshold: Number(cfg.threeModalThreshold ?? 0.74),
       maxHoldHours: Math.min(4, Math.max(1, Number(cfg.maxHoldHours ?? 4))),
-      strictLiveness: Boolean(cfg.strictLiveness),
+      strictLiveness: cfg.strictLiveness !== false,
       modalityWeights: {
         face: clampWeight(cfg.modalityWeights?.face, 0.45),
         voice: clampWeight(cfg.modalityWeights?.voice, 0.28),

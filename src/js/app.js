@@ -27,19 +27,6 @@ import {
   renderEnrollment,
   renderIdentities,
 } from './pages_core.js';
-import { renderCompareIdentities } from './pages_compare.js';
-import {
-  renderAnalytics,
-  renderThreatIntel,
-  renderApprovals,
-  renderAutomationCenter,
-  renderAuditTrail,
-} from './pages_ops.js';
-import {
-  renderAiAnalyst,
-  renderAccessControl,
-  renderSettings,
-} from './pages_admin.js';
 import { initPwaUI } from './pwa.js';
 import { isAuthorizedDevAdmin, isDevTestingModeActive } from './config.js';
 
@@ -50,7 +37,12 @@ const NAV_GROUPS = [
     section: 'Overview',
     items: [
       { id: 'overview', label: 'Dashboard', icon: 'dashboard', render: renderOverview },
-      { id: 'analytics', label: 'Analytics & Reports', icon: 'barChart', render: renderAnalytics },
+      {
+        id: 'analytics',
+        label: 'Analytics & Reports',
+        icon: 'barChart',
+        load: async () => (await import('./pages_ops.js')).renderAnalytics,
+      },
     ],
   },
   {
@@ -58,19 +50,57 @@ const NAV_GROUPS = [
     items: [
       { id: 'enrollment', label: 'Enrollment', icon: 'userPlus', render: renderEnrollment, requirePermission: 'create_identity' },
       { id: 'verification', label: 'Verification', icon: 'layers', render: renderVerification, requirePermission: 'perform_verification' },
-      { id: 'compare', label: 'Identity Search', icon: 'compare', render: renderCompareIdentities, requirePermission: 'perform_verification' },
+      {
+        id: 'compare',
+        label: 'Identity Search',
+        icon: 'compare',
+        load: async () => (await import('./pages_compare.js')).renderCompareIdentities,
+        requirePermission: 'perform_verification',
+      },
       { id: 'identities', label: 'Identities', icon: 'users', render: renderIdentities },
     ],
   },
   {
     section: 'Security & Administration',
     items: [
-      { id: 'threat_intel', label: 'Threat Monitoring', icon: 'radar', render: renderThreatIntel, requirePermission: 'manage_alerts' },
-      { id: 'ai_analyst', label: 'AI Security Analyst', icon: 'cpu', render: renderAiAnalyst, requirePermission: 'use_ai_analyst' },
-      { id: 'approvals', label: 'Approval Requests', icon: 'checkSquare', render: renderApprovals },
-      { id: 'audit_trail', label: 'Audit Logs', icon: 'scroll', render: renderAuditTrail },
-      { id: 'access_control', label: 'Access Control', icon: 'lock', render: renderAccessControl },
-      { id: 'settings', label: 'Settings', icon: 'shieldCheck', render: renderSettings },
+      {
+        id: 'threat_intel',
+        label: 'Threat Monitoring',
+        icon: 'radar',
+        load: async () => (await import('./pages_ops.js')).renderThreatIntel,
+        requirePermission: 'manage_alerts',
+      },
+      {
+        id: 'ai_analyst',
+        label: 'AI Security Analyst',
+        icon: 'cpu',
+        load: async () => (await import('./pages_admin.js')).renderAiAnalyst,
+        requirePermission: 'use_ai_analyst',
+      },
+      {
+        id: 'approvals',
+        label: 'Approval Requests',
+        icon: 'checkSquare',
+        load: async () => (await import('./pages_ops.js')).renderApprovals,
+      },
+      {
+        id: 'audit_trail',
+        label: 'Audit Logs',
+        icon: 'scroll',
+        load: async () => (await import('./pages_ops.js')).renderAuditTrail,
+      },
+      {
+        id: 'access_control',
+        label: 'Access Control',
+        icon: 'lock',
+        load: async () => (await import('./pages_admin.js')).renderAccessControl,
+      },
+      {
+        id: 'settings',
+        label: 'Settings',
+        icon: 'shieldCheck',
+        load: async () => (await import('./pages_admin.js')).renderSettings,
+      },
     ],
   },
   {
@@ -80,7 +110,7 @@ const NAV_GROUPS = [
         id: 'automation',
         label: 'Automation Center',
         icon: 'workflow',
-        render: renderAutomationCenter,
+        load: async () => (await import('./pages_ops.js')).renderAutomationCenter,
         requirePermission: 'manage_workflows',
         showInSidebar: (state) => (state.workflows && state.workflows.length > 0) || isDevTestingModeActive(state),
       },
@@ -119,6 +149,7 @@ const appState = {
 
 let activeRoute = 'overview';
 let activeCleanup = null;
+let renderGeneration = 0;
 let unsubs = [];
 
 function resetAppStateData() {
@@ -333,7 +364,8 @@ function renderTopbarAccountAndAlerts() {
   }
 }
 
-function renderActiveView() {
+async function renderActiveView() {
+  const gen = ++renderGeneration;
   if (typeof activeCleanup === 'function') {
     activeCleanup();
     activeCleanup = null;
@@ -356,7 +388,21 @@ function renderActiveView() {
   });
 
   const main = document.getElementById('main-content');
-  const maybeCleanup = route.render(main, {
+  let renderFn = route.render;
+  if (!renderFn && typeof route.load === 'function') {
+    main.innerHTML = `<section class="panel"><div class="meta-line">Loading ${escapeHtml(route.label)}...</div></section>`;
+    try {
+      renderFn = await route.load();
+      route.render = renderFn;
+    } catch (err) {
+      if (gen !== renderGeneration) return;
+      main.innerHTML = `<section class="panel"><div class="notice-strip danger"><div><strong>Failed to load view</strong><div>${escapeHtml(err?.message || 'Module load error')}</div></div></div></section>`;
+      return;
+    }
+  }
+  if (gen !== renderGeneration || typeof renderFn !== 'function') return;
+
+  const maybeCleanup = renderFn(main, {
     appState,
     navigate,
     applyTheme,

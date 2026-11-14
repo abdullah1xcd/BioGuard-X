@@ -391,17 +391,32 @@ test('Multimodal Fusion Engine: enforces all 7 pipelines, conflict guard, strict
   assert.equal(livenessFailRes.livenessStatus, 'LIVENESS FAILED');
   assert.equal(livenessFailRes.reasonCode, 'spoof_or_liveness_failed');
 
-  // Static upload yields INCONCLUSIVE livenessStatus yet allows VERIFIED if identity evidence passes without spoof trigger
-  const staticFaceRes = fuseMultimodalScores({
+  // Static upload yields INCONCLUSIVE livenessStatus: blocked under strict default, allowed only when strictLiveness=false
+  const staticFaceStrictRes = fuseMultimodalScores({
     pipeline: 'face_only',
     thresholds,
     available: { face: { score: 0.91, qualityScore: 90 } },
-    livenessPassed: true,
+    livenessPassed: false,
     livenessStatus: 'INCONCLUSIVE',
     livenessScore: 0.5,
   });
-  assert.equal(staticFaceRes.livenessStatus, 'INCONCLUSIVE');
-  assert.equal(staticFaceRes.finalDecision, 'VERIFIED');
+  assert.equal(staticFaceStrictRes.livenessStatus, 'INCONCLUSIVE');
+  assert.equal(staticFaceStrictRes.finalDecision, 'INCONCLUSIVE');
+  assert.equal(staticFaceStrictRes.identityMatch.status, 'MATCH');
+  assert.equal(staticFaceStrictRes.livenessVerification.status, 'INCONCLUSIVE');
+  assert.equal(staticFaceStrictRes.livenessVerification.strictRequired, true);
+
+  const staticFaceRelaxedRes = fuseMultimodalScores({
+    pipeline: 'face_only',
+    thresholds,
+    livenessPolicy: { strictLiveness: false },
+    available: { face: { score: 0.91, qualityScore: 90 } },
+    livenessPassed: false,
+    livenessStatus: 'INCONCLUSIVE',
+    livenessScore: 0.5,
+  });
+  assert.equal(staticFaceRelaxedRes.livenessStatus, 'INCONCLUSIVE');
+  assert.equal(staticFaceRelaxedRes.finalDecision, 'VERIFIED');
 
   // Fingerprint INCONCLUSIVE must prevent false VERIFIED approval
   const fpIncRes = fuseMultimodalScores({
@@ -448,7 +463,7 @@ test('Metrics & Subject-Disjoint Evaluation: exact confusion formulas, Wilson CI
   const ci = wilsonCI95(3, 4);
   assert.ok(ci.low > 0.25 && ci.high < 0.99 && ci.low < 0.75 && ci.high > 0.75);
 
-  // Unlabeled operational records must NEVER count toward classification accuracy
+  // Unlabeled operational records and synthetic QA test probes must NEVER count toward real benchmark classification accuracy
   const report = buildBiometricAnalyticsReport(
     [
       { outcome: 'match', score: 0.95, groundTruth: 'unlabeled', livenessPassed: true, processingTimeMs: 42 },
@@ -460,10 +475,11 @@ test('Metrics & Subject-Disjoint Evaluation: exact confusion formulas, Wilson CI
     4
   );
   assert.equal(report.totalAttempts, 4);
-  assert.equal(report.labeledAttempts, 1);
-  assert.equal(report.unlabeledAttempts, 3);
-  assert.equal(report.classification.insufficientData, true, 'Must flag insufficientData when <3 genuine or <3 impostor');
-  assert.equal(report.classification.sampleCount, 1);
+  assert.equal(report.labeledAttempts, 0);
+  assert.equal(report.unlabeledAttempts, 4);
+  assert.equal(report.classification.insufficientData, true, 'Must flag insufficientData when no real benchmark_eval records exist');
+  assert.equal(report.classification.sampleCount, 0);
+  assert.equal(report.datasets.syntheticQa.totalProbes, 1);
   assert.equal(report.operationalVerificationSuccessRate, 0.6667);
   assert.equal(report.livenessSuccessRate, 0.6667);
   assert.equal(report.latency.measuredCount, 4);
@@ -510,7 +526,7 @@ test('Metrics & Subject-Disjoint Evaluation: exact confusion formulas, Wilson CI
   assert.equal(disjointMetrics.insufficientData, false);
   assert.ok(disjointMetrics.accuracy >= 0.83, `Expected subject-disjoint voice accuracy >= 0.83, got ${disjointMetrics.accuracy}`);
 
-  // Strict 3-dataset isolation + capture failure tracking
+  // Strict 3-dataset isolation + capture failure tracking + deduplication + subject-disjoint guard
   const mixedReport = buildBiometricAnalyticsReport(
     [
       { outcome: 'match', finalDecision: 'VERIFIED', score: 0.91, groundTruth: 'unlabeled', datasetCategory: 'operational', livenessStatus: 'LIVENESS PASSED', processingTimeMs: 44 },
@@ -527,10 +543,13 @@ test('Metrics & Subject-Disjoint Evaluation: exact confusion formulas, Wilson CI
   assert.equal(mixedReport.datasets.operational.captureFailureCount, 1);
   assert.equal(mixedReport.datasets.operational.captureFailureRate, 0.5);
   assert.equal(mixedReport.datasets.syntheticQa.totalProbes, 2);
-  assert.equal(mixedReport.datasets.benchmark.totalLabeledTrials, 2);
+  assert.equal(mixedReport.datasets.benchmark.totalLabeledTrials, 0);
   assert.equal(mixedReport.datasets.benchmark.operationalLabeledTrials, 0);
   assert.equal(mixedReport.datasets.benchmark.insufficientData, true);
-  assert.equal(mixedReport.datasets.benchmark.insufficientDataMessage, 'Insufficient validated data');
+  assert.equal(
+    mixedReport.datasets.benchmark.insufficientDataMessage,
+    'Real-world biometric accuracy has not yet been established.'
+  );
 });
 
 test('Server Vault AES-256-GCM v2 secret enforcement, key rotation, health diagnostics & HTTP auth checks', async () => {
@@ -754,7 +773,7 @@ test('Fusion Engine hardening: validates inputs, fails closed when omitted/stric
     /Invalid biometric parameter/i
   );
 
-  // 2. Omitted liveness NEVER silently upgrades to LIVENESS PASSED
+  // 2. Omitted liveness NEVER silently upgrades to LIVENESS PASSED and defaults strictLiveness to true
   const omittedLiv = fuseMultimodalScores({
     pipeline: 'face_only',
     thresholds,
@@ -762,7 +781,10 @@ test('Fusion Engine hardening: validates inputs, fails closed when omitted/stric
   });
   assert.equal(omittedLiv.livenessStatus, 'INCONCLUSIVE');
   assert.equal(omittedLiv.livenessDecision, 'INCONCLUSIVE');
-  assert.equal(omittedLiv.finalDecision, 'VERIFIED');
+  assert.equal(omittedLiv.finalDecision, 'INCONCLUSIVE');
+  assert.equal(omittedLiv.reasonCode, 'liveness_inconclusive_blocked');
+  assert.equal(omittedLiv.identityMatch.status, 'MATCH');
+  assert.equal(omittedLiv.livenessVerification.strictRequired, true);
 
   // 3. strictLiveness policy blocks INCONCLUSIVE liveness from verifying
   const strictBlocked = fuseMultimodalScores({
@@ -866,7 +888,10 @@ test('Analytics report tracks inconclusiveRate, livenessFailureRate, livenessBre
   assert.equal(report.sampleQualityDistribution.goodCount, 2);
   assert.equal(report.sampleQualityDistribution.borderlineCount, 1);
   assert.equal(report.sampleQualityDistribution.poorCount, 1);
-  assert.equal(report.datasets.benchmark.insufficientDataMessage, 'Insufficient validated data');
+  assert.equal(
+    report.datasets.benchmark.insufficientDataMessage,
+    'Real-world biometric accuracy has not yet been established.'
+  );
 });
 
 test('Server challenge tokens, anti-replay nonces, strict CORS guard & security headers', async () => {
@@ -995,3 +1020,396 @@ test('Server error mapping: preserves Firestore status codes, maps vault decrypt
       err.code === 'vault_decryption_failed'
   );
 });
+
+test('Server liveness security: ignores spoofed client booleans, validates server trajectory, flags flat audio, and enforces strict multimodal gating', async () => {
+  process.env.BIOGUARD_SKIP_LISTEN = '1';
+  const serverMod = await import('../server.ts');
+  const { evaluateLiveness } = serverMod;
+
+  // 1. Client-supplied challengeCompleted=true without multi-frame trajectory evidence MUST NOT pass
+  const spoofedBool = evaluateLiveness(
+    { face: true, voice: false, fingerprint: false },
+    {
+      face: {
+        isLiveCapture: true,
+        frameMotionScore: 0.03,
+        antispoofScore: 0.92,
+        challengeCompleted: true,
+      },
+    },
+    {
+      valid: true,
+      payload: {
+        v: 1,
+        uid: 'u1',
+        nonce: 'n1',
+        faceChallenge: 'turn_left',
+        voicePassphrase: 'alpha bravo charlie',
+        issuedAt: Date.now() - 1000,
+        expiresAt: Date.now() + 60_000,
+      },
+    }
+  );
+  assert.equal(spoofedBool.status, 'INCONCLUSIVE');
+  assert.equal(spoofedBool.challengeVerified, false);
+
+  // 2. Valid turn_left trajectory passes; wrong direction or static pose stays INCONCLUSIVE
+  const t0 = 1_700_000_000_000;
+  const validTurnLeft = evaluateLiveness(
+    { face: true, voice: false, fingerprint: false },
+    {
+      face: {
+        isLiveCapture: true,
+        frameMotionScore: 0.035,
+        antispoofScore: 0.91,
+        challengeEvidence: {
+          frames: [
+            { tMs: t0, yawDeg: 0.2, ear: 0.31, motionFromPrev: 0 },
+            { tMs: t0 + 260, yawDeg: -6.5, ear: 0.30, motionFromPrev: 0.025 },
+            { tMs: t0 + 520, yawDeg: -11.4, ear: 0.31, motionFromPrev: 0.035 },
+            { tMs: t0 + 780, yawDeg: -1.1, ear: 0.31, motionFromPrev: 0.028 },
+          ],
+        },
+      },
+    },
+    {
+      valid: true,
+      payload: {
+        v: 1,
+        uid: 'u1',
+        nonce: 'n2',
+        faceChallenge: 'turn_left',
+        voicePassphrase: 'alpha bravo charlie',
+        issuedAt: t0 - 500,
+        expiresAt: t0 + 60_000,
+      },
+    }
+  );
+  assert.equal(validTurnLeft.status, 'LIVENESS PASSED');
+  assert.equal(validTurnLeft.passed, true);
+  assert.equal(validTurnLeft.challengeVerified, true);
+
+  const wrongDirectionTurn = evaluateLiveness(
+    { face: true, voice: false, fingerprint: false },
+    {
+      face: {
+        isLiveCapture: true,
+        frameMotionScore: 0.035,
+        antispoofScore: 0.91,
+        challengeEvidence: {
+          frames: [
+            { tMs: t0, yawDeg: 0.0, ear: 0.31 },
+            { tMs: t0 + 260, yawDeg: 7.5, ear: 0.31 },
+            { tMs: t0 + 520, yawDeg: 11.0, ear: 0.31 },
+          ],
+        },
+      },
+    },
+    {
+      valid: true,
+      payload: {
+        v: 1,
+        uid: 'u1',
+        nonce: 'n3',
+        faceChallenge: 'turn_left',
+        voicePassphrase: 'alpha bravo charlie',
+        issuedAt: t0 - 500,
+        expiresAt: t0 + 60_000,
+      },
+    }
+  );
+  assert.equal(wrongDirectionTurn.status, 'INCONCLUSIVE');
+  assert.equal(wrongDirectionTurn.challengeVerified, false);
+
+  // 3. Valid blink trajectory verified via EAR sequence
+  const validBlink = evaluateLiveness(
+    { face: true, voice: false, fingerprint: false },
+    {
+      face: {
+        isLiveCapture: true,
+        frameMotionScore: 0.02,
+        antispoofScore: 0.90,
+        challengeEvidence: {
+          frames: [
+            { tMs: t0, yawDeg: 0.5, ear: 0.32 },
+            { tMs: t0 + 260, yawDeg: 0.6, ear: 0.16 },
+            { tMs: t0 + 520, yawDeg: 0.4, ear: 0.31 },
+          ],
+        },
+      },
+    },
+    {
+      valid: true,
+      payload: {
+        v: 1,
+        uid: 'u1',
+        nonce: 'n4',
+        faceChallenge: 'blink',
+        voicePassphrase: 'alpha bravo charlie',
+        issuedAt: t0 - 500,
+        expiresAt: t0 + 60_000,
+      },
+    }
+  );
+  assert.equal(validBlink.status, 'LIVENESS PASSED');
+  assert.equal(validBlink.challengeVerified, true);
+
+  // 4. Voice with client challengePassphraseMatch=true still stays INCONCLUSIVE (no ASR); flat constant audio fails
+  const voiceNoAsr = evaluateLiveness(
+    { face: false, voice: true, fingerprint: false },
+    {
+      voice: {
+        durationSec: 1.8,
+        meanRms: 0.12,
+        clippingRatio: 0.01,
+        dynamicRangeDb: 18,
+        segmentEnergies: [0.14, 0.06, 0.19, 0.04],
+        challengePassphraseMatch: true,
+      },
+    }
+  );
+  assert.equal(voiceNoAsr.perModality.voice, 'INCONCLUSIVE');
+  assert.equal(voiceNoAsr.status, 'INCONCLUSIVE');
+
+  const flatAudio = evaluateLiveness(
+    { face: false, voice: true, fingerprint: false },
+    {
+      voice: {
+        durationSec: 1.8,
+        meanRms: 0.25,
+        clippingRatio: 0.0,
+        dynamicRangeDb: 14,
+        segmentEnergies: [0.25, 0.251, 0.249, 0.25],
+      },
+    }
+  );
+  assert.equal(flatAudio.perModality.voice, 'LIVENESS FAILED');
+  assert.equal(flatAudio.status, 'LIVENESS FAILED');
+
+  // 5. Multimodal face PASSED + voice INCONCLUSIVE must remain overall INCONCLUSIVE (never upgrade)
+  const mixedFaceVoice = evaluateLiveness(
+    { face: true, voice: true, fingerprint: false },
+    {
+      face: {
+        isLiveCapture: true,
+        frameMotionScore: 0.03,
+        antispoofScore: 0.92,
+        challengeEvidence: {
+          frames: [
+            { tMs: t0, yawDeg: 0.0, ear: 0.32 },
+            { tMs: t0 + 260, yawDeg: 0.2, ear: 0.15 },
+            { tMs: t0 + 520, yawDeg: -0.1, ear: 0.31 },
+          ],
+        },
+      },
+      voice: {
+        durationSec: 1.5,
+        meanRms: 0.1,
+        clippingRatio: 0.0,
+        dynamicRangeDb: 16,
+        segmentEnergies: [0.11, 0.03, 0.15, 0.05],
+      },
+    },
+    {
+      valid: true,
+      payload: {
+        v: 1,
+        uid: 'u1',
+        nonce: 'n5',
+        faceChallenge: 'blink',
+        voicePassphrase: 'alpha bravo charlie',
+        issuedAt: t0 - 500,
+        expiresAt: t0 + 60_000,
+      },
+    }
+  );
+  assert.equal(mixedFaceVoice.perModality.face, 'LIVENESS PASSED');
+  assert.equal(mixedFaceVoice.perModality.voice, 'INCONCLUSIVE');
+  assert.equal(mixedFaceVoice.status, 'INCONCLUSIVE');
+  assert.equal(mixedFaceVoice.passed, false);
+});
+
+test('Production fail-closed signing keys, Firestore CAS rate limiter retries & production 503 unavailability', async () => {
+  process.env.BIOGUARD_SKIP_LISTEN = '1';
+  const serverMod = await import('../server.ts');
+  const {
+    VaultSecretError,
+    BackendHttpError,
+    createChallengeToken,
+    verifyChallengeToken,
+    signBenchmarkProvenance,
+    consumePersistentRateLimit,
+  } = serverMod;
+
+  const prevNodeEnv = process.env.NODE_ENV;
+  const prevSecret = process.env.BIOGUARD_VAULT_SECRET;
+  const prevAllowMem = process.env.BIOGUARD_ALLOW_MEMORY_RATE_LIMIT;
+  const prevUpUrl = process.env.UPSTASH_REDIS_REST_URL;
+  const prevUpTok = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+  try {
+    // 1. Fail closed in production when BIOGUARD_VAULT_SECRET is missing or short
+    process.env.NODE_ENV = 'production';
+    delete process.env.BIOGUARD_VAULT_SECRET;
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    delete process.env.BIOGUARD_ALLOW_MEMORY_RATE_LIMIT;
+
+    assert.throws(() => createChallengeToken({ uid: 'u_prod' }), VaultSecretError);
+    assert.throws(
+      () =>
+        signBenchmarkProvenance({
+          uid: 'u_prod',
+          identityRef: 'id_1',
+          datasetCategory: 'benchmark_eval',
+          groundTruth: 'genuine',
+          isTestProbe: false,
+          sampleHash: 'abc123',
+          score: 0.9,
+          finalDecision: 'VERIFIED',
+        }),
+      VaultSecretError
+    );
+
+    // 2. Modality-bound challenge tokens reject cross-modality reuse
+    const chSecret = 'prod-challenge-signing-secret-min-32-chars-999';
+    const boundCh = createChallengeToken({
+      uid: 'u_prod',
+      modalities: ['face'],
+      secretOverride: chSecret,
+    });
+    const mismatchRes = await verifyChallengeToken({
+      token: boundCh.challengeToken,
+      uid: 'u_prod',
+      expectedModalities: ['face', 'voice'],
+      consume: false,
+      secretOverride: chSecret,
+    });
+    assert.equal(mismatchRes.valid, false);
+    assert.equal(mismatchRes.reason, 'challenge_modality_mismatch:voice');
+
+    // 3. Firestore rate_limits CAS retry: omits stray uid field, sends currentDocument.updateTime, succeeds after 412 conflict
+    const observedBodies: Array<{ url: string; method: string; body?: Record<string, unknown> }> = [];
+    let attempt = 0;
+    const mockFetchCas: typeof fetch = async (input, init) => {
+      const url = String(input);
+      const method = init?.method || 'GET';
+      const parsedBody = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined;
+      observedBodies.push({ url, method, body: parsedBody });
+
+      if (method === 'GET') {
+        return new Response(
+          JSON.stringify({
+            updateTime: '2026-01-01T00:00:01.000Z',
+            fields: {
+              windowStartMs: { integerValue: String(1_700_000_000_000) },
+              count: { integerValue: '2' },
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      attempt++;
+      if (attempt === 1) {
+        return new Response(JSON.stringify({ error: { status: 'FAILED_PRECONDITION' } }), { status: 412 });
+      }
+      return new Response('{}', { status: 200 });
+    };
+
+    const rlOk = await consumePersistentRateLimit(
+      'verification',
+      10,
+      60_000,
+      'uid_cas',
+      'tok_cas',
+      '127.0.0.1',
+      { fetchImpl: mockFetchCas, nowMs: 1_700_000_005_000 }
+    );
+    assert.equal(rlOk.allowed, true);
+    assert.equal(rlOk.mode, 'firestore_persistent');
+    const patchCalls = observedBodies.filter((c) => c.method === 'PATCH');
+    assert.equal(patchCalls.length, 2, 'Expected retry after 412 CAS collision');
+    assert.ok(patchCalls[0].url.includes('currentDocument.updateTime='), 'Expected optimistic concurrency precondition');
+    const writtenFields = (patchCalls[0].body as { fields: Record<string, unknown> }).fields;
+    assert.equal('uid' in writtenFields, false, 'rate_limits document must omit disallowed uid field');
+    assert.deepEqual(Object.keys(writtenFields).sort(), ['bucketId', 'count', 'updatedAt', 'windowStartMs']);
+
+    // 4. Production runtime fails closed (503) when distributed rate limiter backend fails
+    const failingFetch: typeof fetch = async () => new Response('Unavailable', { status: 503 });
+    await assert.rejects(
+      () =>
+        consumePersistentRateLimit('verification', 10, 60_000, 'uid_cas', 'tok_cas', '127.0.0.1', {
+          fetchImpl: failingFetch,
+          nowMs: 1_700_000_005_000,
+        }),
+      (err: unknown) => err instanceof BackendHttpError && err.status === 503 && err.code === 'rate_limiter_unavailable'
+    );
+  } finally {
+    if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prevNodeEnv;
+    if (prevSecret === undefined) delete process.env.BIOGUARD_VAULT_SECRET;
+    else process.env.BIOGUARD_VAULT_SECRET = prevSecret;
+    if (prevAllowMem === undefined) delete process.env.BIOGUARD_ALLOW_MEMORY_RATE_LIMIT;
+    else process.env.BIOGUARD_ALLOW_MEMORY_RATE_LIMIT = prevAllowMem;
+    if (prevUpUrl === undefined) delete process.env.UPSTASH_REDIS_REST_URL;
+    else process.env.UPSTASH_REDIS_REST_URL = prevUpUrl;
+    if (prevUpTok === undefined) delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    else process.env.UPSTASH_REDIS_REST_TOKEN = prevUpTok;
+  }
+});
+
+test('Benchmark provenance enforces benchmark_eval isolation, sampleHash deduplication & subject-disjoint splits', () => {
+  const mkEval = (id: string, subjectKey: string, genuine: boolean, score: number, sampleHash: string, partition = 'eval') => ({
+    identityRef: id,
+    subjectKey,
+    datasetCategory: 'benchmark_eval',
+    partition,
+    sampleHash,
+    groundTruth: genuine ? 'genuine' : 'impostor',
+    isTestProbe: false,
+    score,
+    outcome: score >= 0.72 ? 'match' : 'no_match',
+    finalDecision: score >= 0.72 ? 'VERIFIED' : 'REJECTED',
+    livenessStatus: 'LIVENESS PASSED',
+  });
+
+  // 1. Repeated sampleHash deduplicated + synthetic_qa / train partition excluded
+  const cleanReport = buildBiometricAnalyticsReport(
+    [
+      mkEval('id1', 's1', true, 0.91, 'h1'),
+      mkEval('id1', 's1', true, 0.91, 'h1'), // duplicate hash excluded
+      mkEval('id2', 's2', true, 0.87, 'h2'),
+      mkEval('id3', 's3', true, 0.83, 'h3'),
+      mkEval('id4', 's4', false, 0.31, 'h4'),
+      mkEval('id5', 's5', false, 0.39, 'h5'),
+      mkEval('id6', 's6', false, 0.44, 'h6'),
+      mkEval('id7', 's7', true, 0.99, 'h7', 'train'), // train partition excluded from eval metrics
+    ],
+    6,
+    6
+  );
+  assert.equal(cleanReport.datasets.benchmark.totalLabeledTrials, 6);
+  assert.equal(cleanReport.datasets.benchmark.duplicateExcludedCount, 1);
+  assert.equal(cleanReport.datasets.benchmark.subjectOverlapDetected, false);
+  assert.equal(cleanReport.classification.insufficientData, false);
+  assert.equal(cleanReport.classification.accuracy, 1);
+
+  // 2. Subject overlap between train and eval flags leakage and refuses metric reporting
+  const leakyReport = buildBiometricAnalyticsReport(
+    [
+      mkEval('id1', 'shared_subj', true, 0.95, 'l1', 'train'),
+      mkEval('id1', 'shared_subj', true, 0.95, 'l2', 'eval'),
+      mkEval('id2', 's2', true, 0.88, 'l3', 'eval'),
+      mkEval('id3', 's3', true, 0.85, 'l4', 'eval'),
+      mkEval('id4', 's4', false, 0.30, 'l5', 'eval'),
+      mkEval('id5', 's5', false, 0.35, 'l6', 'eval'),
+      mkEval('id6', 's6', false, 0.40, 'l7', 'eval'),
+    ],
+    6,
+    6
+  );
+  assert.equal(leakyReport.datasets.benchmark.subjectOverlapDetected, true);
+  assert.equal(leakyReport.classification.subjectOverlapDetected, true);
+  assert.equal(leakyReport.classification.insufficientData, true);
+});
+

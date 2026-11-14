@@ -114,6 +114,7 @@ service cloud.firestore {
           'confidence', 'identityConfidence', 'sampleQualityScore', 'livenessConfidence', 'confidenceBand', 'conflictDetected',
           'featureVersion', 'faceScore', 'voiceScore', 'fingerprintScore', 'faceQuality', 'voiceQuality', 'fingerprintQuality',
           'faceStatus', 'voiceStatus', 'fingerprintStatus', 'matchedMinutiae', 'probeMinutiae',
+          'subjectKey', 'partition', 'sampleHash', 'benchmarkBatchId', 'provenanceSignature',
           'operatorUid', 'createdAt'
         ]) &&
         isValidId(data.verificationId) &&
@@ -157,6 +158,11 @@ service cloud.firestore {
         (!('fingerprintStatus' in data) || data.fingerprintStatus in ['MATCH', 'NO MATCH', 'INCONCLUSIVE', 'NOT EVALUATED']) &&
         (!('matchedMinutiae' in data) || (data.matchedMinutiae is number && data.matchedMinutiae >= 0)) &&
         (!('probeMinutiae' in data) || (data.probeMinutiae is number && data.probeMinutiae >= 0)) &&
+        (!('subjectKey' in data) || (data.subjectKey is string && data.subjectKey.size() <= 80)) &&
+        (!('partition' in data) || data.partition in ['eval', 'unassigned']) &&
+        (!('sampleHash' in data) || (data.sampleHash is string && data.sampleHash.size() <= 128)) &&
+        (!('benchmarkBatchId' in data) || (data.benchmarkBatchId is string && data.benchmarkBatchId.size() <= 80)) &&
+        (!('provenanceSignature' in data) || (data.provenanceSignature is string && data.provenanceSignature.size() <= 160)) &&
         data.operatorUid == request.auth.uid &&
         data.createdAt == request.time;
     }
@@ -304,7 +310,7 @@ service cloud.firestore {
           incoming().bucketId == existing().bucketId &&
           isActiveAccount(userId) &&
           (
-            (incoming().windowStartMs > existing().windowStartMs && incoming().count == 1) ||
+            (incoming().windowStartMs >= existing().windowStartMs + 10000 && incoming().count == 1) ||
             (incoming().windowStartMs == existing().windowStartMs && incoming().count == existing().count + 1)
           );
         allow delete: if false;

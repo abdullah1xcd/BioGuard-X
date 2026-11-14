@@ -159,6 +159,7 @@ export interface VoiceExtractionStats {
   medianF0Hz: number;
   f0Jitter: number;
   snrEstimateDb: number;
+  segmentEnergies?: number[];
   voiceQualityScore: number;
   qualityBand: 'good' | 'borderline' | 'poor';
   feedbackCode: VoiceFeedbackCode;
@@ -573,6 +574,16 @@ export function extractVoiceFeaturesV2(
     feedbackLabel = 'Replay / Synthetic Anomaly Detected';
   }
 
+  const qLen = Math.max(1, Math.floor(resampled.length / 4));
+  const segmentEnergies: number[] = [];
+  for (let q = 0; q < 4; q++) {
+    const start = q * qLen;
+    const end = q === 3 ? resampled.length : Math.min(resampled.length, start + qLen);
+    let sq = 0;
+    for (let i = start; i < end; i++) sq += resampled[i] * resampled[i];
+    segmentEnergies.push(Number(Math.sqrt(sq / Math.max(1, end - start)).toFixed(4)));
+  }
+
   return {
     vector,
     dim: vector.length,
@@ -593,6 +604,7 @@ export function extractVoiceFeaturesV2(
       medianF0Hz: Number(medianF0.toFixed(1)),
       f0Jitter,
       snrEstimateDb,
+      segmentEnergies,
       voiceQualityScore: finalQualityScore,
       qualityBand,
       feedbackCode,

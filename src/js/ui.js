@@ -323,29 +323,47 @@ export async function recordMicrophonePCM(durationMs = 2400, onProgress) {
   const processor = ctx.createScriptProcessor(4096, 1, 1);
   const chunks = [];
   const startedAt = performance.now();
+  let sampleRate = ctx.sampleRate;
 
-  processor.onaudioprocess = (e) => {
-    const ch = new Float32Array(e.inputBuffer.getChannelData(0));
-    chunks.push(ch);
-    if (onProgress) {
-      let sum = 0;
-      for (let i = 0; i < ch.length; i++) sum += ch[i] * ch[i];
-      const rms = Math.sqrt(sum / ch.length);
-      const elapsedSec = Math.min(durationMs / 1000, (performance.now() - startedAt) / 1000);
-      onProgress({ elapsedSec, totalSec: durationMs / 1000, rms });
+  try {
+    processor.onaudioprocess = (e) => {
+      const ch = new Float32Array(e.inputBuffer.getChannelData(0));
+      chunks.push(ch);
+      if (onProgress) {
+        let sum = 0;
+        for (let i = 0; i < ch.length; i++) sum += ch[i] * ch[i];
+        const rms = Math.sqrt(sum / ch.length);
+        const elapsedSec = Math.min(durationMs / 1000, (performance.now() - startedAt) / 1000);
+        onProgress({ elapsedSec, totalSec: durationMs / 1000, rms });
+      }
+    };
+
+    source.connect(processor);
+    processor.connect(ctx.destination);
+
+    await new Promise((resolve) => setTimeout(resolve, durationMs));
+    sampleRate = ctx.sampleRate;
+  } finally {
+    try {
+      processor.onaudioprocess = null;
+      processor.disconnect();
+    } catch {
+      // Ignore disconnect errors
     }
-  };
-
-  source.connect(processor);
-  processor.connect(ctx.destination);
-
-  await new Promise((resolve) => setTimeout(resolve, durationMs));
-
-  processor.disconnect();
-  source.disconnect();
-  stream.getTracks().forEach((t) => t.stop());
-  const sampleRate = ctx.sampleRate;
-  await ctx.close();
+    try {
+      source.disconnect();
+    } catch {
+      // Ignore disconnect errors
+    }
+    stream.getTracks().forEach((t) => {
+      try {
+        t.stop();
+      } catch {
+        // Ignore track stop errors
+      }
+    });
+    await ctx.close().catch(() => null);
+  }
 
   const totalLen = chunks.reduce((sum, c) => sum + c.length, 0);
   const out = new Float32Array(totalLen);

@@ -199,6 +199,11 @@ export interface VerificationRecordLike {
   groundTruth?: 'genuine' | 'impostor' | 'unlabeled';
   datasetCategory?: 'operational' | 'synthetic_qa' | 'benchmark_eval';
   isTestProbe?: boolean;
+  subjectKey?: string;
+  partition?: 'train' | 'eval' | 'unassigned';
+  sampleHash?: string;
+  benchmarkBatchId?: string;
+  provenanceSignature?: string;
   captureFailure?: boolean;
   faceScore?: number;
   voiceScore?: number;
@@ -252,6 +257,8 @@ export interface BenchmarkDatasetReport {
   totalLabeledTrials: number;
   operationalLabeledTrials: number;
   syntheticLabeledTrials: number;
+  duplicateExcludedCount: number;
+  subjectOverlapDetected: boolean;
   insufficientData: boolean;
   insufficientDataMessage: string;
   classification: ClassificationMetricsResult;
@@ -346,25 +353,53 @@ export function buildBiometricAnalyticsReport(
   const fpThr = defaultThresholds.fingerprint ?? 0.72;
   const mThr = defaultThresholds.threeModal ?? 0.74;
 
-  const operational = records.filter((r) => !r.isTestProbe && r.datasetCategory !== 'synthetic_qa');
+  const operational = records.filter(
+    (r) => !r.isTestProbe && r.datasetCategory !== 'synthetic_qa' && r.datasetCategory !== 'benchmark_eval'
+  );
   const testProbes = records.filter((r) => r.isTestProbe === true || r.datasetCategory === 'synthetic_qa');
 
-  const labeled = records.filter(
+  const rawBenchmarkEval = records.filter(
     (r) =>
+      r.datasetCategory === 'benchmark_eval' &&
+      r.isTestProbe !== true &&
       (r.groundTruth === 'genuine' || r.groundTruth === 'impostor') &&
       (r.outcome === 'match' || r.outcome === 'no_match')
   );
-  const labeledOperational = operational.filter(
-    (r) =>
-      (r.groundTruth === 'genuine' || r.groundTruth === 'impostor') &&
-      (r.outcome === 'match' || r.outcome === 'no_match')
+
+  const trainSubjects = new Set(
+    rawBenchmarkEval
+      .filter((r) => r.partition === 'train' && typeof r.subjectKey === 'string' && r.subjectKey.trim())
+      .map((r) => r.subjectKey!.trim())
   );
+  const evalSubjects = new Set(
+    rawBenchmarkEval
+      .filter((r) => r.partition !== 'train' && typeof r.subjectKey === 'string' && r.subjectKey.trim())
+      .map((r) => r.subjectKey!.trim())
+  );
+  const subjectOverlapDetected = [...evalSubjects].some((sk) => trainSubjects.has(sk));
+
+  const seenHashes = new Set<string>();
+  const benchmarkEval: VerificationRecordLike[] = [];
+  let duplicateExcludedCount = 0;
+  for (const r of rawBenchmarkEval) {
+    if (r.partition === 'train') continue;
+    const hashKey = r.sampleHash ? `${r.identityRef || ''}:${r.sampleHash}:${r.groundTruth}` : '';
+    if (hashKey && seenHashes.has(hashKey)) {
+      duplicateExcludedCount++;
+      continue;
+    }
+    if (hashKey) seenHashes.add(hashKey);
+    benchmarkEval.push(r);
+  }
+
   const labeledQa = testProbes.filter(
     (r) =>
       (r.groundTruth === 'genuine' || r.groundTruth === 'impostor') &&
       (r.outcome === 'match' || r.outcome === 'no_match')
   );
-  const unlabeled = records.filter((r) => r.groundTruth !== 'genuine' && r.groundTruth !== 'impostor');
+  const unlabeled = records.filter(
+    (r) => r.datasetCategory !== 'benchmark_eval' || (r.groundTruth !== 'genuine' && r.groundTruth !== 'impostor')
+  );
 
   const evaluatedAll = records.filter((r) => r.outcome === 'match' || r.outcome === 'no_match');
   const successful = records.filter((r) => r.outcome === 'match').length;
@@ -381,8 +416,6 @@ export function buildBiometricAnalyticsReport(
   const opCapFail = operational.filter(isCaptureFailureRecord).length;
   const operationalVerificationSuccessRate = evalOp.length
     ? Number((opMatches / evalOp.length).toFixed(4))
-    : evaluatedAll.length
-    ? Number((successful / evaluatedAll.length).toFixed(4))
     : 0;
 
   const livePassed = records.filter((r) => r.livenessStatus === 'LIVENESS PASSED' || (!r.livenessStatus && r.livenessPassed === true)).length;
@@ -452,9 +485,15 @@ export function buildBiometricAnalyticsReport(
       timestampMs: extractTimestampMs(r.createdAt),
     }));
 
-  const overallTrials = toTrials(labeled);
+  const overallTrials = toTrials(benchmarkEval);
   const classification = computeClassificationMetrics(overallTrials, fThr);
-  const opOnlyClassification = labeledOperational.length > 0 ? computeClassificationMetrics(toTrials(labeledOperational), fThr) : null;
+  if (subjectOverlapDetected) {
+    classification.insufficientData = true;
+    classification.insufficientReason = 'Train and eval benchmark splits contain overlapping subjectKey values.';
+  } else if (classification.insufficientData) {
+    classification.insufficientReason = 'Real-world biometric accuracy has not yet been established.';
+  }
+  const opOnlyClassification = benchmarkEval.length > 0 ? classification : null;
   const qaClassification = computeClassificationMetrics(toTrials(labeledQa), fThr);
 
   const opLatencies = operational
@@ -489,11 +528,16 @@ export function buildBiometricAnalyticsReport(
   };
 
   const benchmarkReport: BenchmarkDatasetReport = {
-    totalLabeledTrials: labeled.length,
-    operationalLabeledTrials: labeledOperational.length,
+    totalLabeledTrials: benchmarkEval.length,
+    operationalLabeledTrials: benchmarkEval.length,
     syntheticLabeledTrials: labeledQa.length,
-    insufficientData: classification.insufficientData,
-    insufficientDataMessage: classification.insufficientData ? 'Insufficient validated data' : 'Statistically grounded evaluation sample.',
+    duplicateExcludedCount,
+    subjectOverlapDetected,
+    insufficientData: classification.insufficientData || subjectOverlapDetected,
+    insufficientDataMessage:
+      classification.insufficientData || subjectOverlapDetected
+        ? 'Real-world biometric accuracy has not yet been established.'
+        : 'Statistically grounded subject-disjoint benchmark sample.',
     classification,
     operationalOnlyClassification: opOnlyClassification,
   };
@@ -522,7 +566,7 @@ export function buildBiometricAnalyticsReport(
     const meanSimilarity = sims.length ? Number((sims.reduce((a, b) => a + b, 0) / sims.length).toFixed(4)) : null;
 
     const modTrials: GroundTruthTrial[] = [];
-    for (const r of labeled) {
+    for (const r of benchmarkEval) {
       let s: number | null = null;
       if (mod === 'face' && typeof r.faceScore === 'number') s = r.faceScore;
       else if (mod === 'voice' && typeof r.voiceScore === 'number') s = r.voiceScore;
@@ -538,7 +582,7 @@ export function buildBiometricAnalyticsReport(
       totalEvaluations: modRecs.length,
       meanSimilarity,
       labeledCount: modTrials.length,
-      metrics: modTrials.length > 0 ? computeClassificationMetrics(modTrials, thr) : null,
+      metrics: modTrials.length > 0 && !subjectOverlapDetected ? computeClassificationMetrics(modTrials, thr) : null,
     };
   };
 
@@ -559,7 +603,7 @@ export function buildBiometricAnalyticsReport(
     totalAttempts: records.length,
     operationalAttempts: operational.length,
     testProbeAttempts: testProbes.length,
-    labeledAttempts: labeled.length,
+    labeledAttempts: benchmarkEval.length,
     unlabeledAttempts: unlabeled.length,
     successfulVerifications: successful,
     rejectedVerifications: rejected,
@@ -596,7 +640,7 @@ export function buildBiometricAnalyticsReport(
     },
     failedBreakdown,
     methodologyNote:
-      'Operational Data, Synthetic QA Data, and Labeled Benchmark Data are tracked strictly separately. Classification Accuracy, TAR/GAR, FAR/IAR, FRR, Precision, Recall, F1, EER, and Wilson 95% CIs come exclusively from ground-truth labeled trials; displays "Insufficient validated data" if fewer than 3 genuine or 3 impostor trials exist.',
+      'Operational Data, Synthetic QA Data, and Benchmark Evaluation Data are tracked strictly separately. Classification Accuracy, TAR/GAR, FAR/IAR, FRR, Precision, Recall, F1, EER, and Wilson 95% CIs exclude synthetic QA probes and unlabeled operational attempts, deduplicate repeated sample hashes, and display "Real-world biometric accuracy has not yet been established." until a subject-disjoint benchmark (>=3 genuine, >=3 impostor) exists.',
   };
 }
 

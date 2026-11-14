@@ -49,10 +49,11 @@ function makeIdempotencyKey() {
   return `bgx_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
 }
 
-export function requestLivenessChallenge() {
+export function requestLivenessChallenge(modalities) {
+  const payload = Array.isArray(modalities) && modalities.length > 0 ? { modalities } : {};
   return apiFetch('/api/v1/liveness/challenge', {
     method: 'POST',
-    body: JSON.stringify({}),
+    body: JSON.stringify(payload),
   });
 }
 
@@ -77,6 +78,7 @@ export function verifyMultimodalBiometrics({
   adaptiveEnabled = true,
   groundTruth = 'unlabeled',
   isTestProbe = false,
+  benchmarkMeta,
 }) {
   return apiFetch('/api/v1/verification/multimodal', {
     method: 'POST',
@@ -94,6 +96,7 @@ export function verifyMultimodalBiometrics({
       adaptiveEnabled,
       groundTruth,
       isTestProbe,
+      ...(benchmarkMeta && typeof benchmarkMeta === 'object' ? { benchmarkMeta } : {}),
     }),
   });
 }

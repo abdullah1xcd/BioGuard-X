@@ -2,8 +2,16 @@
 // Powered by @vladmandic/human (BlazeFace + FaceMesh 468 landmarks + HSE-FaceRes 1024-D + AntiSpoof + Liveness)
 // Model weights served locally from /models/human/ (zero external CDN runtime dependency)
 
-import { Human } from '@vladmandic/human';
 import { l2Normalize } from '../shared/voiceDsp.ts';
+
+let HumanCtor = null;
+async function getHumanCtor() {
+  if (!HumanCtor) {
+    const mod = await import('@vladmandic/human');
+    HumanCtor = mod.Human;
+  }
+  return HumanCtor;
+}
 
 let humanInstance = null;
 let initPromise = null;
@@ -63,6 +71,7 @@ export async function ensureFaceEngineReady(onProgress) {
     modelLoadError = '';
     if (onProgress) onProgress('Loading pretrained face recognition & anti-spoof models...');
     try {
+      const Human = await getHumanCtor();
       const h = new Human(HUMAN_CONFIG);
       try {
         await h.load();
@@ -312,6 +321,13 @@ export async function extractPretrainedFaceFeatures(source, extraMeta = {}) {
       ? 'Face Quality Good'
       : 'Acceptable Face Capture';
 
+  const imgW = source.videoWidth || source.naturalWidth || source.width || 640;
+  const rawNoseX = Array.isArray(face.mesh?.[1]) ? face.mesh[1][0] : undefined;
+  const noseXNorm =
+    typeof rawNoseX === 'number' && Number.isFinite(rawNoseX) && imgW > 0
+      ? Number(Math.max(0, Math.min(1, rawNoseX / imgW)).toFixed(4))
+      : undefined;
+
   return {
     vector: l2Normalize(Array.from(face.embedding)),
     dim: face.embedding.length,
@@ -325,6 +341,7 @@ export async function extractPretrainedFaceFeatures(source, extraMeta = {}) {
       posePitchDeg: pitchDeg,
       poseRollDeg: rollDeg,
       eyeAspectRatio,
+      ...(noseXNorm !== undefined ? { noseXNorm } : {}),
       antispoofScore,
       livenessNetScore,
       faceQualityScore,
@@ -385,7 +402,9 @@ export async function captureMultiFrameFaceFeatures(videoEl, opts = 220) {
   const targetFrames = challenge ? 4 : 3;
 
   const frames = [];
+  const frameTimes = [];
   for (let i = 0; i < targetFrames; i++) {
+    frameTimes.push(Date.now());
     frames.push(snapshotVideoToCanvas(videoEl));
     if (i < targetFrames - 1) {
       await new Promise((r) => setTimeout(r, delayMs));
@@ -393,8 +412,11 @@ export async function captureMultiFrameFaceFeatures(videoEl, opts = 220) {
   }
 
   let frameMotionScore = 0;
+  const motionFromPrevList = [0];
   for (let i = 0; i < frames.length - 1; i++) {
-    frameMotionScore = Math.max(frameMotionScore, computeCanvasMotion(frames[i], frames[i + 1]));
+    const pairMotion = computeCanvasMotion(frames[i], frames[i + 1]);
+    motionFromPrevList.push(pairMotion);
+    frameMotionScore = Math.max(frameMotionScore, pairMotion);
   }
   frameMotionScore = Number(frameMotionScore.toFixed(4));
 
@@ -405,7 +427,12 @@ export async function captureMultiFrameFaceFeatures(videoEl, opts = 220) {
       isLiveCapture: true,
       frameMotionScore,
     });
-    extracted.push({ feat, canvas: frames[i] });
+    extracted.push({
+      feat,
+      canvas: frames[i],
+      tMs: frameTimes[i],
+      motionFromPrev: motionFromPrevList[i] ?? 0,
+    });
   }
 
   let frameConsistencyCosine = 1;
@@ -439,6 +466,22 @@ export async function captureMultiFrameFaceFeatures(videoEl, opts = 220) {
   const headYawDeltaDeg =
     yawValues.length >= 2 ? Number((Math.max(...yawValues) - Math.min(...yawValues)).toFixed(1)) : 0;
 
+  // Build ordered challenge trajectory evidence before sorting extracted frames by quality
+  const challengeFrames = extracted.map((item, idx) => {
+    const q = item.feat.quality || {};
+    const prevT = idx > 0 ? extracted[idx - 1].tMs : item.tMs - 1;
+    const tMs = Math.max(prevT + 1, item.tMs);
+    item.tMs = tMs;
+    return {
+      tMs,
+      yawDeg: typeof q.poseYawDeg === 'number' ? q.poseYawDeg : 0,
+      ...(typeof q.posePitchDeg === 'number' ? { pitchDeg: q.posePitchDeg } : {}),
+      ...(typeof q.eyeAspectRatio === 'number' ? { ear: q.eyeAspectRatio } : {}),
+      ...(typeof q.noseXNorm === 'number' ? { noseXNorm: q.noseXNorm } : {}),
+      motionFromPrev: item.motionFromPrev,
+    };
+  });
+
   let challengeCompleted;
   if (challenge === 'blink') {
     challengeCompleted = blinkDetected;
@@ -459,6 +502,7 @@ export async function captureMultiFrameFaceFeatures(videoEl, opts = 220) {
   best.feat.quality.frameMotionScore = frameMotionScore;
   best.feat.quality.isLiveCapture = true;
   best.feat.quality.captureSource = 'webcam';
+  best.feat.quality.challengeEvidence = { frames: challengeFrames };
   if (eyeAspectRatioMin !== null) best.feat.quality.eyeAspectRatioMin = eyeAspectRatioMin;
   best.feat.quality.eyeAspectRatioDelta = eyeAspectRatioDelta;
   best.feat.quality.blinkDetected = blinkDetected;

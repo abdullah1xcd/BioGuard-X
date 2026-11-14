@@ -13,7 +13,7 @@ export const DEFAULT_THRESHOLDS = {
   maxHoldHours: 4,
   fusionPolicy: 'hierarchical_adaptive',
   securityPreset: 'balanced',
-  strictLiveness: false,
+  strictLiveness: true,
   modalityWeights: {
     face: 0.45,
     voice: 0.28,

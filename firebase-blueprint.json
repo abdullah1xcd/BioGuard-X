@@ -103,6 +103,11 @@
         "fingerprintStatus": { "type": "string", "enum": ["MATCH", "NO MATCH", "INCONCLUSIVE", "NOT EVALUATED"] },
         "matchedMinutiae": { "type": "number" },
         "probeMinutiae": { "type": "number" },
+        "subjectKey": { "type": "string", "maxLength": 80 },
+        "partition": { "type": "string", "enum": ["eval", "unassigned"] },
+        "sampleHash": { "type": "string", "maxLength": 128 },
+        "benchmarkBatchId": { "type": "string", "maxLength": 80 },
+        "provenanceSignature": { "type": "string", "maxLength": 160 },
         "operatorUid": { "type": "string", "minLength": 1, "maxLength": 128 },
         "createdAt": { "type": "string", "format": "date-time" }
       },

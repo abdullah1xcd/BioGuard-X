@@ -1232,7 +1232,18 @@ export function renderVerification(container, { appState, navigate }) {
                   <option value="genuine">Genuine Trial (Known Same Subject)</option>
                   <option value="impostor">Impostor Trial (Known Different Subject)</option>
                 </select>
-                <span class="meta-line">Labeled trials feed FAR, FRR, and EER accuracy reports</span>
+                <span class="meta-line">Labeled benchmark trials require an evaluation batch ID &amp; authorized role</span>
+              </div>
+            </div>
+
+            <div class="form-grid" id="mv-bm-meta-wrap" hidden>
+              <div class="form-field">
+                <label class="field-label" for="mv-bm-subject">Benchmark Subject Key (Disjoint Split)</label>
+                <input class="input mono" id="mv-bm-subject" type="text" maxlength="64" placeholder="e.g. subj_001 (defaults to claimed identity)" />
+              </div>
+              <div class="form-field">
+                <label class="field-label" for="mv-bm-batch">Benchmark Batch ID</label>
+                <input class="input mono" id="mv-bm-batch" type="text" maxlength="64" placeholder="e.g. eval_2026_r1 (min 3 chars)" />
               </div>
             </div>
 
@@ -1340,6 +1351,9 @@ export function renderVerification(container, { appState, navigate }) {
   const policyDescEl = container.querySelector('#mv-policy-desc');
   const activeSummaryEl = container.querySelector('#mv-active-summary');
   const gtSel = container.querySelector('#mv-gt');
+  const bmMetaWrap = container.querySelector('#mv-bm-meta-wrap');
+  const bmSubjectIn = container.querySelector('#mv-bm-subject');
+  const bmBatchIn = container.querySelector('#mv-bm-batch');
   const enrolledInfoEl = container.querySelector('#mv-enrolled-info');
   const pipeDescEl = container.querySelector('#mv-pipe-desc');
   const faceSt = container.querySelector('#mv-face-st');
@@ -1412,9 +1426,18 @@ export function renderVerification(container, { appState, navigate }) {
 
   syncAdaptiveUI();
 
+  const syncBenchmarkFields = () => {
+    if (bmMetaWrap) bmMetaWrap.hidden = gtSel.value === 'unlabeled';
+  };
+  syncBenchmarkFields();
+  gtSel.addEventListener('change', syncBenchmarkFields);
+
   idSel.addEventListener('change', () => {
     const idObj = getSelectedIdentity();
     selectedPipeline = recommendPipelineForModalities(idObj?.registeredModalities || []);
+    activeChallenge = null;
+    if (faceChallengeBanner) faceChallengeBanner.hidden = true;
+    if (voiceChallengeBanner) voiceChallengeBanner.hidden = true;
     syncAdaptiveUI();
   });
 
@@ -1621,7 +1644,7 @@ export function renderVerification(container, { appState, navigate }) {
       faceSt.className = 'state-text state-warning';
       faceSt.textContent = 'Starting Camera...';
       if (!activeChallenge) {
-        activeChallenge = await requestLivenessChallenge().catch(() => null);
+        activeChallenge = await requestLivenessChallenge(['face', 'voice']).catch(() => null);
       }
       if (faceChallengeBanner) {
         if (activeChallenge?.faceChallenge) {
@@ -1733,7 +1756,7 @@ export function renderVerification(container, { appState, navigate }) {
     const b = e.currentTarget; b.disabled = true;
     try {
       if (!activeChallenge) {
-        activeChallenge = await requestLivenessChallenge().catch(() => null);
+        activeChallenge = await requestLivenessChallenge(['face', 'voice']).catch(() => null);
       }
       if (voiceChallengeBanner && activeChallenge?.voicePassphrase) {
         voiceChallengeBanner.textContent = `Speak clearly: "${activeChallenge.voicePassphrase}" (acoustic replay/DR screening only; spoken-text ASR not enabled)`;
@@ -1795,6 +1818,16 @@ export function renderVerification(container, { appState, navigate }) {
       const s = appState.settings || {};
       const submittedChallengeToken = activeChallenge?.challengeToken;
       activeChallenge = null;
+      const subjectKeyInput = bmSubjectIn?.value.trim() || '';
+      const batchIdInput = bmBatchIn?.value.trim() || '';
+      const benchmarkMeta =
+        groundTruth !== 'unlabeled' && (subjectKeyInput || batchIdInput)
+          ? {
+              ...(subjectKeyInput ? { subjectKey: subjectKeyInput } : {}),
+              ...(batchIdInput ? { batchId: batchIdInput } : {}),
+            }
+          : undefined;
+
       const res = await verifyMultimodalBiometrics({
         identityRef,
         pipeline: selectedPipeline,
@@ -1805,7 +1838,7 @@ export function renderVerification(container, { appState, navigate }) {
           fingerprint: s.fingerprintThreshold ?? 0.72,
           threeModal: s.threeModalThreshold ?? 0.74,
         },
-        strictLiveness: Boolean(s.strictLiveness),
+        strictLiveness: s.strictLiveness !== false,
         modalityWeights: s.modalityWeights,
         challengeToken: submittedChallengeToken,
         samples,
@@ -1813,6 +1846,7 @@ export function renderVerification(container, { appState, navigate }) {
         adaptiveEnabled,
         groundTruth,
         isTestProbe: currentIsTestProbe,
+        benchmarkMeta,
       });
 
       const finalDecision =
@@ -1822,11 +1856,12 @@ export function renderVerification(container, { appState, navigate }) {
         res.livenessStatus ||
         res.liveness?.status ||
         (res.liveness?.passed ? 'LIVENESS PASSED' : 'INCONCLUSIVE');
-      const datasetCategory = currentIsTestProbe
-        ? 'synthetic_qa'
-        : groundTruth !== 'unlabeled'
-        ? 'benchmark_eval'
-        : 'operational';
+      const authDatasetCategory =
+        res.provenance?.datasetCategory ||
+        (currentIsTestProbe ? 'synthetic_qa' : 'operational');
+      const authGroundTruth = res.provenance?.groundTruth || groundTruth;
+      const authIsTestProbe =
+        typeof res.provenance?.isTestProbe === 'boolean' ? res.provenance.isTestProbe : currentIsTestProbe;
 
       const verId = await recordVerificationMetadata({
         identityRef,
@@ -1837,7 +1872,7 @@ export function renderVerification(container, { appState, navigate }) {
         livenessStatus,
         livenessDecision: res.livenessDecision,
         challengeVerified: res.challengeVerified,
-        datasetCategory,
+        datasetCategory: authDatasetCategory,
         captureFailure: false,
         reasonCode: res.reasonCode,
         score: res.score,
@@ -1849,8 +1884,13 @@ export function renderVerification(container, { appState, navigate }) {
         conflictDetected: res.conflictDetected,
         processingTimeMs: res.processingTimeMs,
         featureVersion: res.featureVersion,
-        groundTruth,
-        isTestProbe: currentIsTestProbe,
+        groundTruth: authGroundTruth,
+        isTestProbe: authIsTestProbe,
+        subjectKey: res.provenance?.subjectKey,
+        partition: res.provenance?.partition,
+        sampleHash: res.provenance?.sampleHash,
+        benchmarkBatchId: res.provenance?.benchmarkBatchId,
+        provenanceSignature: res.provenance?.provenanceSignature,
         modalityEvaluations: res.modalityEvaluations,
         riskScore: res.risk?.score,
         riskLevel: res.risk?.level,
@@ -1908,13 +1948,27 @@ export function renderVerification(container, { appState, navigate }) {
       const fpEval = res.modalityEvaluations?.fingerprint || null;
       const fpDet = fpEval?.details || {};
 
+      const identityMatchStatus =
+        res.identityMatch?.status ||
+        (res.score >= (res.threshold ?? 0.72) ? 'MATCH' : 'NO MATCH');
+      const identityMatchCls =
+        identityMatchStatus === 'MATCH'
+          ? 'state-success'
+          : identityMatchStatus === 'NO MATCH'
+          ? 'state-danger'
+          : 'state-warning';
+
       resultEl.innerHTML = `
         <section class="panel stack-md">
           <div class="decision-banner ${bannerVariant}">
             <div class="stack-sm" style="gap:4px;">
-              <span class="state-text ${outcomeCls}" style="font-size:15px;">${escapeHtml(finalDecision)}</span>
+              <span class="state-text ${outcomeCls}" style="font-size:15px;">Final Decision: ${escapeHtml(finalDecision)}</span>
               <h3 class="panel-title">${escapeHtml(res.identityRef)}</h3>
               <div class="meta-line">
+                <span>Identity Match: <strong class="${identityMatchCls}">${escapeHtml(identityMatchStatus)}</strong></span>
+                <span aria-hidden="true">·</span>
+                <span>Liveness: <strong class="${liveCls}">${escapeHtml(livenessStatus)}</strong></span>
+                <span aria-hidden="true">·</span>
                 <span>Reason: <strong class="mono">${escapeHtml(res.reasonCode)}</strong></span>
                 <span aria-hidden="true">·</span>
                 <span>Request: <span class="mono">${escapeHtml(res.requestId)}</span></span>
@@ -1935,9 +1989,9 @@ export function renderVerification(container, { appState, navigate }) {
 
           <div class="kpi-strip">
             <div class="kpi-cell">
-              <span class="kpi-label">Similarity Score</span>
-              <span class="kpi-value">${fmtPct(res.score)}</span>
-              <span class="kpi-meta">Required: ${fmtPct(res.threshold)}</span>
+              <span class="kpi-label">Identity Match / Similarity</span>
+              <span class="kpi-value ${identityMatchCls}">${fmtPct(res.score)}</span>
+              <span class="kpi-meta">${escapeHtml(identityMatchStatus)} · Required: ${fmtPct(res.threshold)}</span>
             </div>
             <div class="kpi-cell">
               <span class="kpi-label">Composite Confidence</span>
@@ -1947,7 +2001,7 @@ export function renderVerification(container, { appState, navigate }) {
             <div class="kpi-cell">
               <span class="kpi-label">Liveness Screening</span>
               <span class="kpi-value ${liveCls}" style="font-size:17px;">${escapeHtml(livenessStatus)}</span>
-              <span class="kpi-meta">Score ${Math.round((res.liveness?.score ?? 0) * 100)}% · Challenge: ${res.challengeVerified ? 'Verified' : 'None'}</span>
+              <span class="kpi-meta">Score ${Math.round((res.liveness?.score ?? 0) * 100)}% · Challenge: ${res.challengeVerified ? 'Verified' : 'Unverified'}</span>
             </div>
             <div class="kpi-cell">
               <span class="kpi-label">Risk Indicator</span>

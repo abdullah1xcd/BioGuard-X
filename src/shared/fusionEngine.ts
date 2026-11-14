@@ -69,6 +69,19 @@ export interface FusionEvaluationResult {
   rejectionReasons: string[];
   outcome: 'match' | 'no_match' | 'not_evaluated';
   finalDecision: FinalDecision;
+  identityMatch: {
+    passed: boolean;
+    score: number;
+    threshold: number;
+    status: ModalityStatus;
+  };
+  livenessVerification: {
+    status: LivenessStatus;
+    decision: LivenessDecision;
+    score: number;
+    confidence: number;
+    strictRequired: boolean;
+  };
   livenessStatus: LivenessStatus;
   livenessDecision: LivenessDecision;
   fusionExplanation: string;
@@ -344,6 +357,7 @@ export function fuseMultimodalScores(params: {
   let baseThreshold = thrMap.face;
   let stage: string | undefined;
 
+  const strictLivenessDefault = livenessPolicy?.strictLiveness ?? true;
   if (pipeline === 'face' || pipeline === 'face_only') {
     requested = ['face'];
     baseThreshold = thrMap.face;
@@ -387,6 +401,14 @@ export function fuseMultimodalScores(params: {
         rejectionReasons: [msg],
         outcome: 'not_evaluated',
         finalDecision: 'INCONCLUSIVE',
+        identityMatch: { passed: false, score: 0, threshold: thrMap.face, status: 'NOT EVALUATED' },
+        livenessVerification: {
+          status: livenessStatus,
+          decision: livenessDecision,
+          score: livenessScore,
+          confidence: livenessConfidence,
+          strictRequired: strictLivenessDefault,
+        },
         livenessStatus,
         livenessDecision,
         fusionExplanation: msg,
@@ -427,6 +449,14 @@ export function fuseMultimodalScores(params: {
           rejectionReasons: [msg],
           outcome: 'not_evaluated',
           finalDecision: 'INCONCLUSIVE',
+          identityMatch: { passed: false, score: fEval.score, threshold: thrMap.face, status: 'INCONCLUSIVE' },
+          livenessVerification: {
+            status: livenessStatus,
+            decision: livenessDecision,
+            score: livenessScore,
+            confidence: livenessConfidence,
+            strictRequired: strictLivenessDefault,
+          },
           livenessStatus,
           livenessDecision,
           fusionExplanation: msg,
@@ -477,6 +507,14 @@ export function fuseMultimodalScores(params: {
       rejectionReasons: [msg],
       outcome: 'not_evaluated',
       finalDecision: 'INCONCLUSIVE',
+      identityMatch: { passed: false, score: 0, threshold: baseThreshold, status: 'NOT EVALUATED' },
+      livenessVerification: {
+        status: livenessStatus,
+        decision: livenessDecision,
+        score: livenessScore,
+        confidence: livenessConfidence,
+        strictRequired: strictLivenessDefault,
+      },
       livenessStatus,
       livenessDecision,
       fusionExplanation: msg,
@@ -526,11 +564,35 @@ export function fuseMultimodalScores(params: {
     );
   }
 
-  const strictLivenessRequired = Boolean(
-    livenessPolicy?.strictLiveness ||
-      (livenessPolicy?.requiredModalities &&
-        evals.some((e) => livenessPolicy.requiredModalities?.includes(e.modality)))
-  );
+  const strictLivenessRequired =
+    livenessPolicy?.strictLiveness !== false ||
+    Boolean(
+      livenessPolicy?.requiredModalities &&
+        evals.some((e) => livenessPolicy.requiredModalities?.includes(e.modality))
+    );
+
+  // Compute independent Identity Match assessment (strictly separated from Liveness Verification)
+  let identityMatchPassed = false;
+  let identityMatchStatus: ModalityStatus = 'NO MATCH';
+  if (conflictDetected || strongMismatches.length > 0) {
+    identityMatchPassed = false;
+    identityMatchStatus = 'NO MATCH';
+  } else if (inconclusiveMods.length === evals.length || (inconclusiveMods.length > 0 && (evals.length === 1 || fusionPolicy === 'strict_and'))) {
+    identityMatchPassed = false;
+    identityMatchStatus = 'INCONCLUSIVE';
+  } else if (fusionPolicy === 'strict_and') {
+    identityMatchPassed = failing.length === 0 && finalScore >= baseThreshold;
+    identityMatchStatus = identityMatchPassed ? 'MATCH' : 'NO MATCH';
+  } else if (finalScore >= baseThreshold && inconclusiveMods.length === 0) {
+    identityMatchPassed = true;
+    identityMatchStatus = 'MATCH';
+  } else if (finalScore >= baseThreshold && inconclusiveMods.length > 0) {
+    identityMatchPassed = false;
+    identityMatchStatus = 'INCONCLUSIVE';
+  } else {
+    identityMatchPassed = false;
+    identityMatchStatus = 'NO MATCH';
+  }
 
   // Determine 3-state Final Decision: VERIFIED | REJECTED | INCONCLUSIVE
   let outcome: 'match' | 'no_match' | 'not_evaluated' = 'no_match';
@@ -563,12 +625,12 @@ export function fuseMultimodalScores(params: {
         `${inc.modality} probe returned INCONCLUSIVE (quality ${inc.qualityScore}/100, similarity ${(inc.score * 100).toFixed(1)}%). Recapture required.`
       );
     }
-  } else if (strictLivenessRequired && livenessDecision === 'INCONCLUSIVE') {
+  } else if (strictLivenessRequired && livenessDecision !== 'PASSED') {
     outcome = 'not_evaluated';
     finalDecision = 'INCONCLUSIVE';
     reasonCode = 'liveness_inconclusive_blocked';
     rejectionReasons.push(
-      `Strict liveness policy requires verified live capture (current liveness status: ${livenessStatus}).`
+      `Strict liveness policy requires confirmed LIVENESS PASSED (current liveness status: ${livenessStatus}; identity similarity ${(finalScore * 100).toFixed(1)}%).`
     );
   } else if (fusionPolicy === 'strict_and') {
     if (failing.length === 0 && finalScore >= baseThreshold) {
@@ -635,7 +697,7 @@ export function fuseMultimodalScores(params: {
     finalDecision === 'VERIFIED'
       ? `VERIFIED under ${fusionPolicy} policy. Fused score ${(finalScore * 100).toFixed(1)}% met threshold ${(baseThreshold * 100).toFixed(0)}% across [${modSummary}]. Liveness status: ${livenessStatus}.`
       : finalDecision === 'INCONCLUSIVE'
-      ? `INCONCLUSIVE outcome (${reasonCode}). ${rejectionReasons[0] || `Evaluated [${modSummary}].`} Re-capture with higher quality or an additional modality is advised.`
+      ? `INCONCLUSIVE outcome (${reasonCode}). ${rejectionReasons[0] || `Evaluated [${modSummary}].`} Identity match: ${identityMatchStatus}; Liveness: ${livenessStatus}.`
       : `REJECTED under ${fusionPolicy} policy (${reasonCode}). ${rejectionReasons[0] || `Fused score ${(finalScore * 100).toFixed(1)}% vs ${(baseThreshold * 100).toFixed(0)}% threshold.`} [${modSummary}].`;
 
   return {
@@ -655,6 +717,19 @@ export function fuseMultimodalScores(params: {
     rejectionReasons,
     outcome,
     finalDecision,
+    identityMatch: {
+      passed: identityMatchPassed,
+      score: finalScore,
+      threshold: baseThreshold,
+      status: identityMatchStatus,
+    },
+    livenessVerification: {
+      status: livenessStatus,
+      decision: livenessDecision,
+      score: livenessScore,
+      confidence: livenessConfidence,
+      strictRequired: strictLivenessRequired,
+    },
     livenessStatus,
     livenessDecision,
     fusionExplanation,

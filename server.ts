@@ -71,6 +71,15 @@ interface VaultEntry {
   };
 }
 
+interface FaceChallengeFrame {
+  tMs: number;
+  yawDeg: number;
+  pitchDeg?: number;
+  ear?: number | null;
+  noseXNorm?: number | null;
+  motionFromPrev?: number;
+}
+
 interface ModalityQualityInput {
   face?: {
     meanBrightness?: number;
@@ -96,6 +105,9 @@ interface ModalityQualityInput {
     headYawDeltaDeg?: number;
     challengeType?: string;
     challengeCompleted?: boolean;
+    challengeEvidence?: {
+      frames?: FaceChallengeFrame[];
+    };
   };
   voice?: {
     durationSec?: number;
@@ -111,8 +123,15 @@ interface ModalityQualityInput {
     voiceLivenessScore?: number;
     feedbackLabel?: string;
     spoofSignals?: string[];
+    segmentEnergies?: number[];
+    voicedFrames?: number;
+    f0Jitter?: number;
     captureSource?: string;
     challengePassphraseMatch?: boolean;
+    asrAssertion?: {
+      verified?: boolean;
+      transcript?: string;
+    };
   };
   fingerprint?: {
     ridgeDensity?: number;
@@ -126,6 +145,11 @@ interface ModalityQualityInput {
     templateStatus?: string;
     validPrint?: boolean;
     captureSource?: string;
+    padAttestation?: {
+      sensorId?: string;
+      attested?: boolean;
+      signature?: string;
+    };
   };
 }
 
@@ -682,12 +706,72 @@ export async function consumeReplayNonce(namespace: string, key: string, ttlMs =
   return consumeReplayNonceLocal(namespace, cleanKey, ttlMs);
 }
 
+function isProductionRuntime(): boolean {
+  return process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+}
+
 function getChallengeSigningKey(secretOverride?: string): Buffer {
   const raw = secretOverride !== undefined ? secretOverride.trim() : process.env.BIOGUARD_VAULT_SECRET?.trim() || '';
   if (raw.length >= 32) {
     return crypto.createHmac('sha256', raw).update('bioguard-liveness-challenge-v1').digest();
   }
+  if (isProductionRuntime() && process.env.BIOGUARD_ALLOW_EPHEMERAL_CHALLENGE !== 'true') {
+    throw new VaultSecretError('BIOGUARD_VAULT_SECRET (>=32 chars) must be configured in production for challenge token signing.');
+  }
   return EPHEMERAL_CHALLENGE_KEY;
+}
+
+function getProvenanceSigningKey(secretOverride?: string): Buffer {
+  const raw = secretOverride !== undefined ? secretOverride.trim() : process.env.BIOGUARD_VAULT_SECRET?.trim() || '';
+  if (raw.length >= 32) {
+    return crypto.createHmac('sha256', raw).update('bioguard-benchmark-provenance-v1').digest();
+  }
+  if (isProductionRuntime() && process.env.BIOGUARD_ALLOW_EPHEMERAL_CHALLENGE !== 'true') {
+    throw new VaultSecretError('BIOGUARD_VAULT_SECRET (>=32 chars) must be configured in production for benchmark provenance signing.');
+  }
+  return crypto.createHmac('sha256', EPHEMERAL_CHALLENGE_KEY).update('dev-provenance-v1').digest();
+}
+
+export function computeProbeSampleHash(samples: { face?: unknown; voice?: unknown; fingerprint?: unknown }, pipeline: string): string {
+  const canonical = JSON.stringify({
+    pipeline,
+    face: samples.face ?? null,
+    voice: samples.voice ?? null,
+    fingerprint: samples.fingerprint ?? null,
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+export function signBenchmarkProvenance(
+  record: {
+    uid: string;
+    identityRef: string;
+    datasetCategory: 'operational' | 'synthetic_qa' | 'benchmark_eval';
+    groundTruth: 'genuine' | 'impostor' | 'unlabeled';
+    isTestProbe: boolean;
+    subjectKey?: string;
+    partition?: 'train' | 'eval' | 'unassigned';
+    sampleHash: string;
+    benchmarkBatchId?: string;
+    score: number;
+    finalDecision: string;
+  },
+  secretOverride?: string
+): string {
+  const canonical = JSON.stringify([
+    record.uid,
+    record.identityRef,
+    record.datasetCategory,
+    record.groundTruth,
+    record.isTestProbe,
+    record.subjectKey || '',
+    record.partition || 'unassigned',
+    record.sampleHash,
+    record.benchmarkBatchId || '',
+    Number(record.score.toFixed(4)),
+    record.finalDecision,
+  ]);
+  return crypto.createHmac('sha256', getProvenanceSigningKey(secretOverride)).update(canonical).digest('hex');
 }
 
 export interface LivenessChallengePayload {
@@ -696,6 +780,7 @@ export interface LivenessChallengePayload {
   nonce: string;
   faceChallenge: 'blink' | 'turn_left' | 'turn_right';
   voicePassphrase: string;
+  modalities?: ModalityName[];
   issuedAt: number;
   expiresAt: number;
 }
@@ -703,12 +788,14 @@ export interface LivenessChallengePayload {
 export function createChallengeToken(params: {
   uid: string;
   ttlMs?: number;
+  modalities?: ModalityName[];
   secretOverride?: string;
 }): {
   challengeToken: string;
   nonce: string;
   faceChallenge: 'blink' | 'turn_left' | 'turn_right';
   voicePassphrase: string;
+  modalities?: ModalityName[];
   issuedAt: number;
   expiresAt: number;
 } {
@@ -726,6 +813,9 @@ export function createChallengeToken(params: {
     picked.push(pool.splice(idx, 1)[0]);
   }
   const voicePassphrase = picked.join(' ');
+  const cleanMods = Array.isArray(params.modalities)
+    ? params.modalities.filter((m): m is ModalityName => m === 'face' || m === 'voice' || m === 'fingerprint')
+    : undefined;
 
   const payload: LivenessChallengePayload = {
     v: 1,
@@ -733,6 +823,7 @@ export function createChallengeToken(params: {
     nonce,
     faceChallenge,
     voicePassphrase,
+    ...(cleanMods && cleanMods.length > 0 ? { modalities: cleanMods } : {}),
     issuedAt,
     expiresAt,
   };
@@ -747,6 +838,7 @@ export function createChallengeToken(params: {
     nonce,
     faceChallenge,
     voicePassphrase,
+    ...(cleanMods && cleanMods.length > 0 ? { modalities: cleanMods } : {}),
     issuedAt,
     expiresAt,
   };
@@ -755,6 +847,7 @@ export function createChallengeToken(params: {
 export async function verifyChallengeToken(params: {
   token: string;
   uid: string;
+  expectedModalities?: ModalityName[];
   consume?: boolean;
   secretOverride?: string;
 }): Promise<{ valid: boolean; reason?: string; payload?: LivenessChallengePayload }> {
@@ -791,6 +884,18 @@ export async function verifyChallengeToken(params: {
   if (typeof parsed.expiresAt !== 'number' || now > parsed.expiresAt) {
     return { valid: false, reason: 'challenge_expired' };
   }
+  if (
+    Array.isArray(parsed.modalities) &&
+    parsed.modalities.length > 0 &&
+    Array.isArray(params.expectedModalities) &&
+    params.expectedModalities.length > 0
+  ) {
+    const bound = new Set(parsed.modalities);
+    const missingMod = params.expectedModalities.find((m) => !bound.has(m));
+    if (missingMod) {
+      return { valid: false, reason: `challenge_modality_mismatch:${missingMod}` };
+    }
+  }
 
   if (params.consume !== false) {
     const fresh = await consumeReplayNonce(`challenge:${params.uid}`, parsed.nonce, parsed.expiresAt - now + 10_000);
@@ -801,9 +906,73 @@ export async function verifyChallengeToken(params: {
   return { valid: true, payload: parsed };
 }
 
+function validateFaceChallengeTrajectory(
+  expectedChallenge: 'blink' | 'turn_left' | 'turn_right',
+  frames: FaceChallengeFrame[] | undefined
+): { passed: boolean; reason: string } {
+  if (!Array.isArray(frames) || frames.length < 3) {
+    return { passed: false, reason: `Insufficient multi-frame trajectory evidence (${Array.isArray(frames) ? frames.length : 0}/3 frames)` };
+  }
+
+  const clean = frames.slice(0, 12);
+  for (let i = 0; i < clean.length; i++) {
+    const f = clean[i];
+    if (typeof f?.tMs !== 'number' || !Number.isFinite(f.tMs) || typeof f?.yawDeg !== 'number' || !Number.isFinite(f.yawDeg)) {
+      return { passed: false, reason: 'Malformed trajectory frame timestamp or pose angle' };
+    }
+    if (i > 0 && f.tMs <= clean[i - 1].tMs) {
+      return { passed: false, reason: 'Non-monotonic frame timestamps in challenge trajectory' };
+    }
+  }
+
+  const spanMs = clean[clean.length - 1].tMs - clean[0].tMs;
+  if (spanMs < 400) {
+    return { passed: false, reason: `Capture span too brief (${spanMs}ms < 400ms minimum)` };
+  }
+
+  if (expectedChallenge === 'blink') {
+    const ears = clean.map((f) => f.ear).filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
+    if (ears.length < 2) {
+      return { passed: false, reason: 'Insufficient Eye Aspect Ratio (EAR) readings for blink verification' };
+    }
+    const minEar = Math.min(...ears);
+    const maxEar = Math.max(...ears);
+    const earDelta = maxEar - minEar;
+    if (minEar < 0.24 || earDelta >= 0.04) {
+      return { passed: true, reason: `Blink trajectory verified server-side (EAR min=${minEar.toFixed(3)}, delta=${earDelta.toFixed(3)})` };
+    }
+    return { passed: false, reason: `No natural eye blink detected in EAR sequence (min=${minEar.toFixed(3)}, delta=${earDelta.toFixed(3)})` };
+  }
+
+  const yaws = clean.map((f) => f.yawDeg);
+  const baseYaw = yaws[0];
+  const minYaw = Math.min(...yaws);
+  const maxYaw = Math.max(...yaws);
+  const spanYaw = maxYaw - minYaw;
+  const minDelta = minYaw - baseYaw;
+  const maxDelta = maxYaw - baseYaw;
+
+  if (spanYaw < 5) {
+    return { passed: false, reason: `Insufficient head rotation span (${spanYaw.toFixed(1)}° < 5.0° required for ${expectedChallenge})` };
+  }
+
+  if (expectedChallenge === 'turn_left') {
+    if (minDelta <= -5 || (minYaw <= -5 && maxDelta < 4)) {
+      return { passed: true, reason: `Left head-turn trajectory verified server-side (minDelta=${minDelta.toFixed(1)}°, span=${spanYaw.toFixed(1)}°)` };
+    }
+    return { passed: false, reason: `Head turned in wrong direction for turn_left (minDelta=${minDelta.toFixed(1)}°, maxDelta=${maxDelta.toFixed(1)}°)` };
+  }
+
+  // turn_right
+  if (maxDelta >= 5 || (maxYaw >= 5 && minDelta > -4)) {
+    return { passed: true, reason: `Right head-turn trajectory verified server-side (maxDelta=${maxDelta.toFixed(1)}°, span=${spanYaw.toFixed(1)}°)` };
+  }
+  return { passed: false, reason: `Head turned in wrong direction for turn_right (maxDelta=${maxDelta.toFixed(1)}°, minDelta=${minDelta.toFixed(1)}°)` };
+}
+
 // Honest 4-state Liveness & Anti-Spoofing Evaluator
-// Never falsely reports LIVENESS PASSED on static uploads or browser fingerprint images without hardware PAD sensors.
-function evaluateLiveness(
+// Never trusts client booleans (challengeCompleted / challengePassphraseMatch), never hides INCONCLUSIVE/NOT SUPPORTED.
+export function evaluateLiveness(
   modalities: { face: boolean; voice: boolean; fingerprint: boolean },
   quality: ModalityQualityInput | undefined,
   challengeCtx?: { valid: boolean; reason?: string; payload?: LivenessChallengePayload }
@@ -825,7 +994,7 @@ function evaluateLiveness(
   let challengeVerified = false;
 
   if (challengeCtx && !challengeCtx.valid && challengeCtx.reason) {
-    checks.push(`Liveness challenge token invalid (${challengeCtx.reason}); treating active challenge as unverified.`);
+    checks.push(`Liveness challenge token invalid (${challengeCtx.reason}); active challenge unverified.`);
   }
 
   if (modalities.face) {
@@ -833,9 +1002,11 @@ function evaluateLiveness(
     const isSynthetic = fq?.captureSource === 'test_sample' || fq?.captureSource === 'test_impostor';
     if (!fq) {
       perModality.face = 'INCONCLUSIVE';
+      score = Math.min(score, 0.55);
       checks.push('Face liveness: INCONCLUSIVE (no telemetry supplied)');
     } else if (isSynthetic) {
       perModality.face = 'NOT SUPPORTED';
+      score = Math.min(score, 0.55);
       checks.push('Synthetic QA probe — physical camera liveness NOT SUPPORTED');
     } else {
       let faceFailed = false;
@@ -862,38 +1033,40 @@ function evaluateLiveness(
           faceFailed = true;
           spoofSignals.push(`Static webcam feed detected (motion=${fq.frameMotionScore ?? 0}; possible photo/screen spoof)`);
         }
-        const expectedChallenge = challengeCtx?.valid ? challengeCtx.payload?.faceChallenge : undefined;
-        const challengePassed = Boolean(
-          challengeCtx?.valid &&
-            fq.challengeCompleted === true &&
-            (!expectedChallenge || !fq.challengeType || fq.challengeType === expectedChallenge)
-        );
-        if (challengePassed) {
-          challengeVerified = true;
-        }
 
         if (faceFailed) {
           perModality.face = 'LIVENESS FAILED';
-        } else if (challengeCtx && !challengeCtx.valid) {
+        } else if (!challengeCtx || !challengeCtx.valid || !challengeCtx.payload?.faceChallenge) {
           perModality.face = 'INCONCLUSIVE';
           score = Math.min(score, 0.62);
-          checks.push(`Live motion observed, but cryptographic challenge verification failed (${challengeCtx.reason}).`);
-        } else if (fq.challengeCompleted === false) {
-          perModality.face = 'INCONCLUSIVE';
-          score = Math.min(score, 0.58);
-          checks.push(`Active face challenge (${fq.challengeType || expectedChallenge || 'liveness'}) was not completed during capture.`);
-        } else {
-          score = Math.min(0.98, Math.max(score, 0.86) + (challengePassed ? 0.10 : 0.06));
-          perModality.face = 'LIVENESS PASSED';
           checks.push(
-            `Live multi-frame motion verified (delta=${fq.frameMotionScore}${challengePassed ? `, challenge=${expectedChallenge}` : ''}${typeof fq.antispoofScore === 'number' ? `, neural=${Math.round(fq.antispoofScore * 100)}%` : ''})`
+            challengeCtx?.reason
+              ? `Face live motion observed, but server challenge verification failed (${challengeCtx.reason}).`
+              : 'Face live motion observed without valid signed server challenge token (INCONCLUSIVE).'
           );
+        } else {
+          const expectedChallenge = challengeCtx.payload.faceChallenge;
+          const traj = validateFaceChallengeTrajectory(expectedChallenge, fq.challengeEvidence?.frames);
+          if (traj.passed) {
+            challengeVerified = true;
+            score = Math.min(0.98, Math.max(score, 0.88) + 0.08);
+            perModality.face = 'LIVENESS PASSED';
+            checks.push(
+              `Live multi-frame motion verified (delta=${fq.frameMotionScore}); ${traj.reason}${
+                typeof fq.antispoofScore === 'number' ? ` (neural=${Math.round(fq.antispoofScore * 100)}%)` : ''
+              }`
+            );
+          } else {
+            perModality.face = 'INCONCLUSIVE';
+            score = Math.min(score, 0.56);
+            checks.push(`Active face challenge (${expectedChallenge}) failed server trajectory check: ${traj.reason}`);
+          }
         }
       } else {
         perModality.face = faceFailed ? 'LIVENESS FAILED' : 'INCONCLUSIVE';
         if (!faceFailed) {
-          score = Math.min(score, 0.68);
-          checks.push('Static image upload: active liveness challenge INCONCLUSIVE (pass-through texture screening only)');
+          score = Math.min(score, 0.60);
+          checks.push('Static image upload: active liveness challenge INCONCLUSIVE (no multi-frame live trajectory)');
         }
       }
     }
@@ -904,9 +1077,11 @@ function evaluateLiveness(
     const isSynthetic = vq?.captureSource === 'test_sample' || vq?.captureSource === 'test_impostor';
     if (!vq) {
       perModality.voice = 'INCONCLUSIVE';
+      score = Math.min(score, 0.55);
       checks.push('Voice liveness: INCONCLUSIVE (no acoustic telemetry)');
     } else if (isSynthetic) {
       perModality.voice = 'NOT SUPPORTED';
+      score = Math.min(score, 0.55);
     } else if (typeof vq.clippingRatio === 'number' && vq.clippingRatio > 0.12) {
       score -= 0.34;
       perModality.voice = 'LIVENESS FAILED';
@@ -915,29 +1090,37 @@ function evaluateLiveness(
       score -= 0.30;
       perModality.voice = 'LIVENESS FAILED';
       spoofSignals.push(`Low acoustic dynamic range (${vq.dynamicRangeDb} dB)`);
+    } else if (
+      Array.isArray(vq.segmentEnergies) &&
+      vq.segmentEnergies.length >= 4 &&
+      Math.max(...vq.segmentEnergies) > 0 &&
+      (Math.max(...vq.segmentEnergies) - Math.min(...vq.segmentEnergies)) / Math.max(...vq.segmentEnergies) < 0.04
+    ) {
+      score -= 0.30;
+      perModality.voice = 'LIVENESS FAILED';
+      spoofSignals.push('Flat constant-envelope audio segment energy detected (possible tone/synthetic replay)');
     } else if (Array.isArray(vq.spoofSignals) && vq.spoofSignals.length > 0) {
       score -= 0.28;
       perModality.voice = 'LIVENESS FAILED';
       spoofSignals.push(...vq.spoofSignals);
-    } else if (challengeCtx?.valid && vq.challengePassphraseMatch === true) {
-      perModality.voice = 'LIVENESS PASSED';
-      challengeVerified = true;
-      score = Math.min(0.96, Math.max(score, 0.85));
-      checks.push(`Voice acoustic & passphrase challenge verified (DR=${vq.dynamicRangeDb ?? '—'}dB, SNR=${vq.snrEstimateDb ?? '—'}dB)`);
     } else {
       perModality.voice = 'INCONCLUSIVE';
-      checks.push(`Voice spectral replay check clean (DR=${vq.dynamicRangeDb ?? '—'}dB, SNR=${vq.snrEstimateDb ?? '—'}dB); spoken passphrase verification INCONCLUSIVE in browser mic mode`);
+      score = Math.min(score, 0.64);
+      checks.push(
+        `Voice acoustic replay screening clean (DR=${vq.dynamicRangeDb ?? '—'}dB, SNR=${vq.snrEstimateDb ?? '—'}dB); spoken-passphrase ASR verification unavailable in browser mic mode (status INCONCLUSIVE).`
+      );
     }
   }
 
   if (modalities.fingerprint) {
     const fpq = quality?.fingerprint;
-    if (fpq && fpq.validPrint === false && fpq.captureSource !== 'test_sample') {
+    if (fpq && fpq.validPrint === false && fpq.captureSource !== 'test_sample' && fpq.captureSource !== 'test_impostor') {
       score -= 0.38;
       perModality.fingerprint = 'LIVENESS FAILED';
       spoofSignals.push('Fingerprint ridge coherence/structure outside natural bounds');
     } else {
       perModality.fingerprint = 'NOT SUPPORTED';
+      score = Math.min(score, 0.58);
       checks.push('Fingerprint hardware PAD / live sweat-pore liveness sensor NOT SUPPORTED in browser upload mode');
     }
   }
@@ -947,10 +1130,6 @@ function evaluateLiveness(
   if (vals.includes('LIVENESS FAILED') || spoofSignals.length > 0) {
     status = 'LIVENESS FAILED';
   } else if (vals.length > 0 && vals.every((v) => v === 'LIVENESS PASSED')) {
-    status = 'LIVENESS PASSED';
-  } else if (perModality.face === 'LIVENESS PASSED' && !modalities.voice && !modalities.fingerprint) {
-    status = 'LIVENESS PASSED';
-  } else if (perModality.face === 'LIVENESS PASSED' && perModality.voice !== 'INCONCLUSIVE') {
     status = 'LIVENESS PASSED';
   } else if (vals.length > 0 && vals.every((v) => v === 'NOT SUPPORTED')) {
     status = 'NOT SUPPORTED';
@@ -962,7 +1141,7 @@ function evaluateLiveness(
     status === 'LIVENESS FAILED' ? 'FAILED' : status === 'LIVENESS PASSED' ? 'PASSED' : 'INCONCLUSIVE';
   const clamped = Number(Math.max(0.05, Math.min(0.99, score)).toFixed(2));
   return {
-    passed: status !== 'LIVENESS FAILED' && clamped >= 0.45,
+    passed: status === 'LIVENESS PASSED' && clamped >= 0.45,
     status,
     decision,
     score: clamped,
@@ -982,7 +1161,7 @@ function computeRiskAssessment(params: {
   identityRef: string;
   pipeline: string;
   enrolledModalitiesCount: number;
-  liveness: { passed: boolean; score: number; spoofSignals: string[] };
+  liveness: { passed: boolean; status: LivenessStatus; score: number; spoofSignals: string[] };
   preliminaryScore: number;
   baseThreshold: number;
   conflictDetected: boolean;
@@ -1006,9 +1185,12 @@ function computeRiskAssessment(params: {
     riskScore += 20;
     factors.push('Prior spoofing/liveness alert recorded in session window (+20)');
   }
-  if (!params.liveness.passed) {
+  if (params.liveness.status === 'LIVENESS FAILED') {
     riskScore += 45;
     factors.push(`Liveness check failed: ${params.liveness.spoofSignals[0] || 'spoof signal'} (+45)`);
+  } else if (params.liveness.status !== 'LIVENESS PASSED') {
+    riskScore += 15;
+    factors.push(`Liveness attestation incomplete (${params.liveness.status}) (+15)`);
   }
   if (params.conflictDetected) {
     riskScore += 28;
@@ -1123,21 +1305,30 @@ function checkLocalRateLimit(key: string, maxRequests: number, windowMs: number)
   return true;
 }
 
-async function consumePersistentRateLimit(
+export function sanitizeClientIp(req: Request): string {
+  const raw = String(req.ip || req.socket?.remoteAddress || 'anon').replace(/^::ffff:/, '');
+  const clean = raw.replace(/[^a-zA-Z0-9_.:-]/g, '_').slice(0, 64);
+  return clean || 'anon';
+}
+
+export async function consumePersistentRateLimit(
   bucketName: string,
   maxRequests: number,
   windowMs: number,
   uid: string | undefined,
   idToken: string | undefined,
-  ip: string
+  ip: string,
+  opts?: { fetchImpl?: typeof fetch; nowMs?: number }
 ): Promise<{ allowed: boolean; mode: typeof activeRateLimitMode }> {
+  const fetchFn = opts?.fetchImpl || fetch;
+  const now = opts?.nowMs ?? Date.now();
   const upstashUrl = process.env.UPSTASH_REDIS_REST_URL?.trim();
   const upstashToken = process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
 
   if (upstashUrl && upstashToken) {
     try {
       const redisKey = `bgx:rl:${bucketName}:${uid || ip}`;
-      const r = await fetch(`${upstashUrl.replace(/\/$/, '')}/pipeline`, {
+      const r = await fetchFn(`${upstashUrl.replace(/\/$/, '')}/pipeline`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${upstashToken}`,
@@ -1156,77 +1347,98 @@ async function consumePersistentRateLimit(
         return { allowed: count <= maxRequests, mode: 'upstash_redis' };
       }
     } catch {
-      // Fall through cleanly to Firestore or local fallback
+      // Fall through cleanly to Firestore CAS or fail-closed check
     }
   }
 
   if (uid && idToken) {
-    try {
-      const safeBucket = bucketName.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48);
-      const docUrl = firestoreDocUrl(`users/${encodeURIComponent(uid)}/rate_limits/${encodeURIComponent(safeBucket)}`);
-      const now = Date.now();
-      const alignedWindowStart = Math.floor(now / windowMs) * windowMs;
-      const getRes = await fetch(docUrl, {
-        headers: { Authorization: `Bearer ${idToken}` },
-        signal: AbortSignal.timeout(3000),
-      });
-      if (getRes.status === 404) {
-        const createRes = await fetch(`${docUrl}?currentDocument.exists=false`, {
-          method: 'PATCH',
-          headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            fields: {
-              bucketId: { stringValue: safeBucket },
-              uid: { stringValue: uid },
-              windowStartMs: { integerValue: String(alignedWindowStart) },
-              count: { integerValue: '1' },
-              updatedAt: { timestampValue: new Date(now).toISOString() },
-            },
-          }),
+    const safeBucket = bucketName.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48);
+    const docUrl = firestoreDocUrl(`users/${encodeURIComponent(uid)}/rate_limits/${encodeURIComponent(safeBucket)}`);
+    const alignedWindowStart = Math.floor(now / windowMs) * windowMs;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const getRes = await fetchFn(docUrl, {
+          headers: { Authorization: `Bearer ${idToken}` },
           signal: AbortSignal.timeout(3000),
         });
-        if (createRes.ok) {
-          activeRateLimitMode = 'firestore_persistent';
-          return { allowed: true, mode: 'firestore_persistent' };
+        if (getRes.status === 404) {
+          const createRes = await fetchFn(`${docUrl}?currentDocument.exists=false`, {
+            method: 'PATCH',
+            headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              fields: {
+                bucketId: { stringValue: safeBucket },
+                windowStartMs: { integerValue: String(alignedWindowStart) },
+                count: { integerValue: '1' },
+                updatedAt: { timestampValue: new Date(now).toISOString() },
+              },
+            }),
+            signal: AbortSignal.timeout(3000),
+          });
+          if (createRes.ok) {
+            activeRateLimitMode = 'firestore_persistent';
+            return { allowed: true, mode: 'firestore_persistent' };
+          }
+          if (createRes.status === 409 || createRes.status === 412) {
+            continue;
+          }
+          break;
+        } else if (getRes.ok) {
+          const payload = (await getRes.json()) as {
+            updateTime?: string;
+            fields?: { windowStartMs?: { integerValue?: string }; count?: { integerValue?: string } };
+          };
+          const prevWindow = Number(payload.fields?.windowStartMs?.integerValue || 0);
+          const prevCount = Number(payload.fields?.count?.integerValue || 0);
+          const sameWindow = prevWindow >= alignedWindowStart && now - prevWindow < windowMs;
+          if (sameWindow && prevCount >= maxRequests) {
+            activeRateLimitMode = 'firestore_persistent';
+            return { allowed: false, mode: 'firestore_persistent' };
+          }
+          const nextCount = sameWindow ? prevCount + 1 : 1;
+          const nextWindow = sameWindow ? prevWindow : Math.max(alignedWindowStart, prevWindow + 10_000);
+          const precondition = payload.updateTime
+            ? `?currentDocument.updateTime=${encodeURIComponent(payload.updateTime)}`
+            : '?currentDocument.exists=true';
+          const patchRes = await fetchFn(`${docUrl}${precondition}`, {
+            method: 'PATCH',
+            headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              fields: {
+                bucketId: { stringValue: safeBucket },
+                windowStartMs: { integerValue: String(nextWindow) },
+                count: { integerValue: String(nextCount) },
+                updatedAt: { timestampValue: new Date(now).toISOString() },
+              },
+            }),
+            signal: AbortSignal.timeout(3000),
+          });
+          if (patchRes.ok) {
+            activeRateLimitMode = 'firestore_persistent';
+            return { allowed: true, mode: 'firestore_persistent' };
+          }
+          if (patchRes.status === 409 || patchRes.status === 412) {
+            continue;
+          }
+          break;
+        } else {
+          break;
         }
-      } else if (getRes.ok) {
-        const payload = (await getRes.json()) as {
-          fields?: { windowStartMs?: { integerValue?: string }; count?: { integerValue?: string } };
-        };
-        const prevWindow = Number(payload.fields?.windowStartMs?.integerValue || 0);
-        const prevCount = Number(payload.fields?.count?.integerValue || 0);
-        const sameWindow = prevWindow >= alignedWindowStart && now - prevWindow < windowMs;
-        if (sameWindow && prevCount >= maxRequests) {
-          activeRateLimitMode = 'firestore_persistent';
-          return { allowed: false, mode: 'firestore_persistent' };
-        }
-        const nextCount = sameWindow ? prevCount + 1 : 1;
-        const nextWindow = sameWindow ? prevWindow : alignedWindowStart;
-        const patchRes = await fetch(docUrl, {
-          method: 'PATCH',
-          headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            fields: {
-              bucketId: { stringValue: safeBucket },
-              uid: { stringValue: uid },
-              windowStartMs: { integerValue: String(nextWindow) },
-              count: { integerValue: String(nextCount) },
-              updatedAt: { timestampValue: new Date(now).toISOString() },
-            },
-          }),
-          signal: AbortSignal.timeout(3000),
-        });
-        if (patchRes.ok) {
-          activeRateLimitMode = 'firestore_persistent';
-          return { allowed: true, mode: 'firestore_persistent' };
-        }
+      } catch {
+        break;
       }
-    } catch {
-      // Fall back safely to local rate bucket without breaking authenticated requests on transient blip
     }
   }
 
   activeRateLimitMode = 'degraded_local_fallback';
+  if (isProductionRuntime() && process.env.BIOGUARD_ALLOW_MEMORY_RATE_LIMIT !== 'true') {
+    throw new BackendHttpError(
+      503,
+      'rate_limiter_unavailable',
+      'Distributed rate limiter backend is unavailable in production.'
+    );
+  }
   const allowed = checkLocalRateLimit(`${bucketName}:${uid || ip}`, maxRequests, windowMs);
   return { allowed, mode: 'degraded_local_fallback' };
 }
@@ -1234,7 +1446,14 @@ async function consumePersistentRateLimit(
 function rateLimit(maxRequests: number, windowMs: number, bucketName?: string) {
   return (req: AuthedRequest, res: Response, next: NextFunction) => {
     const name = bucketName || req.path.replace(/[^a-zA-Z0-9_-]/g, '_');
-    void consumePersistentRateLimit(name, maxRequests, windowMs, req.auth?.uid, req.auth?.idToken, req.ip || 'anon')
+    void consumePersistentRateLimit(
+      name,
+      maxRequests,
+      windowMs,
+      req.auth?.uid,
+      req.auth?.idToken,
+      sanitizeClientIp(req)
+    )
       .then((result) => {
         if (!result.allowed) {
           res.status(429).json({
@@ -1434,7 +1653,7 @@ async function loadWorkspacePolicy(uid: string, idToken: string): Promise<Worksp
       loaded: true,
       thresholds,
       fusionPolicy,
-      strictLiveness: f.strictLiveness?.booleanValue === true,
+      strictLiveness: f.strictLiveness?.booleanValue !== false,
       modalityWeights,
     };
   } catch {
@@ -1464,7 +1683,7 @@ function mergeAuthoritativePolicy(
     return {
       thresholds: clientThr,
       fusionPolicy: clientPolicy,
-      livenessPolicy: { strictLiveness: clientBody.strictLiveness === true },
+      livenessPolicy: { strictLiveness: true },
       modalityWeights: clientWeights,
     };
   }
@@ -1714,13 +1933,19 @@ app.post(
   requireCapability('perform_verification'),
   rateLimit(30, 60_000, 'liveness_challenge'),
   (req: AuthedRequest, res: Response) => {
-    const ch = createChallengeToken({ uid: req.auth!.uid, ttlMs: 120_000 });
+    const body = (req.body || {}) as { modalities?: ModalityName[] };
+    const ch = createChallengeToken({
+      uid: req.auth!.uid,
+      ttlMs: 120_000,
+      modalities: body.modalities,
+    });
     res.status(201).json({
       status: 'ok',
       challengeToken: ch.challengeToken,
       nonce: ch.nonce,
       faceChallenge: ch.faceChallenge,
       voicePassphrase: ch.voicePassphrase,
+      modalities: ch.modalities,
       expiresAt: ch.expiresAt,
       singleUse: true,
     });
@@ -1887,6 +2112,11 @@ app.post(
       quality?: ModalityQualityInput;
       groundTruth?: 'genuine' | 'impostor' | 'unlabeled';
       isTestProbe?: boolean;
+      benchmarkMeta?: {
+        subjectKey?: string;
+        partition?: 'train' | 'eval' | 'unassigned';
+        batchId?: string;
+      };
     };
 
     const idemKey = String(req.headers['idempotency-key'] || body.requestNonce || '').trim();
@@ -2050,8 +2280,16 @@ app.post(
       return;
     }
 
+    const expectedChallengeMods: ModalityName[] = [];
+    if (faceParsed && body.quality?.face?.isLiveCapture) expectedChallengeMods.push('face');
+
     const challengeCtx = body.challengeToken
-      ? await verifyChallengeToken({ token: body.challengeToken, uid: req.auth!.uid, consume: true })
+      ? await verifyChallengeToken({
+          token: body.challengeToken,
+          uid: req.auth!.uid,
+          expectedModalities: expectedChallengeMods,
+          consume: true,
+        })
       : undefined;
 
     const liveness = evaluateLiveness(
@@ -2128,6 +2366,58 @@ app.post(
     recordRiskEvent(req.auth!.uid, identityRef, outcome, liveness.status === 'LIVENESS FAILED');
     const processingTimeMs = Number((performance.now() - t0).toFixed(1));
 
+    // Server-controlled benchmark & dataset provenance
+    const hasSyntheticCapture =
+      body.isTestProbe === true ||
+      [body.quality?.face?.captureSource, body.quality?.voice?.captureSource, body.quality?.fingerprint?.captureSource].some(
+        (s) => s === 'test_sample' || s === 'test_impostor'
+      );
+    const roleCanBenchmark =
+      req.auth!.role === 'security_analyst' ||
+      req.auth!.role === 'administrator' ||
+      req.auth!.role === 'super_admin';
+    const rawBatchId = typeof body.benchmarkMeta?.batchId === 'string'
+      ? body.benchmarkMeta.batchId.replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 64)
+      : '';
+    const rawSubjectKey = typeof body.benchmarkMeta?.subjectKey === 'string'
+      ? body.benchmarkMeta.subjectKey.replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 64)
+      : '';
+    const rawGroundTruth = body.groundTruth === 'genuine' || body.groundTruth === 'impostor' ? body.groundTruth : 'unlabeled';
+
+    const authDatasetCategory: 'operational' | 'synthetic_qa' | 'benchmark_eval' = hasSyntheticCapture
+      ? 'synthetic_qa'
+      : roleCanBenchmark && rawGroundTruth !== 'unlabeled' && rawBatchId.length >= 3
+      ? 'benchmark_eval'
+      : 'operational';
+    const authGroundTruth: 'genuine' | 'impostor' | 'unlabeled' =
+      authDatasetCategory === 'operational' ? 'unlabeled' : rawGroundTruth;
+    const authPartition: 'eval' | 'unassigned' =
+      authDatasetCategory === 'benchmark_eval' ? 'eval' : 'unassigned';
+    const authSampleHash = computeProbeSampleHash(samples, pipeline);
+    const provenanceSignature = signBenchmarkProvenance({
+      uid: req.auth!.uid,
+      identityRef,
+      datasetCategory: authDatasetCategory,
+      groundTruth: authGroundTruth,
+      isTestProbe: hasSyntheticCapture,
+      subjectKey: rawSubjectKey || undefined,
+      partition: authPartition,
+      sampleHash: authSampleHash,
+      benchmarkBatchId: rawBatchId || undefined,
+      score: fusion.finalScore,
+      finalDecision,
+    });
+    const provenance = {
+      datasetCategory: authDatasetCategory,
+      groundTruth: authGroundTruth,
+      isTestProbe: hasSyntheticCapture,
+      partition: authPartition,
+      sampleHash: authSampleHash,
+      ...(rawSubjectKey ? { subjectKey: rawSubjectKey } : {}),
+      ...(rawBatchId && authDatasetCategory === 'benchmark_eval' ? { benchmarkBatchId: rawBatchId } : {}),
+      provenanceSignature,
+    };
+
     const details: Record<string, unknown> = {
       stage: fusion.stage,
       fusionExplanation: fusion.fusionExplanation,
@@ -2145,6 +2435,7 @@ app.post(
       rejectionReasons,
       legacyCompatibility,
       versionMismatches,
+      provenance,
     };
     if (adaptiveApplied) {
       details.adaptive = {
@@ -2164,6 +2455,8 @@ app.post(
       modalityEvaluations: fusion.modalityEvaluations,
       outcome,
       finalDecision,
+      identityMatch: fusion.identityMatch,
+      livenessVerification: fusion.livenessVerification,
       livenessStatus: liveness.status,
       livenessDecision: liveness.decision,
       challengeVerified: liveness.challengeVerified,
@@ -2185,6 +2478,7 @@ app.post(
       rejectionReasons,
       qualityScores: qualityReport.qualityScores,
       liveness,
+      provenance,
       risk: {
         score: risk.riskScore,
         level: risk.riskLevel,
@@ -2286,6 +2580,7 @@ function compareEntriesServer(
         fusionPolicy,
         thresholds,
         modalityWeights,
+        livenessPolicy: { strictLiveness: false },
         available,
         livenessPassed: true,
         livenessStatus: 'NOT SUPPORTED',

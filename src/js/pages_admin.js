@@ -649,7 +649,7 @@ export function renderSettings(container, { appState, navigate, applyTheme, setD
           </div>
 
           <label class="checkbox-row" style="margin-top:4px;">
-            <input type="checkbox" id="st-strict-liveness" ${settings.strictLiveness ? 'checked' : ''} ${isAdmin ? '' : 'disabled'} />
+            <input type="checkbox" id="st-strict-liveness" ${settings.strictLiveness !== false ? 'checked' : ''} ${isAdmin ? '' : 'disabled'} />
             <span>Strict Liveness Policy (block VERIFIED when liveness is INCONCLUSIVE or NOT SUPPORTED; returns INCONCLUSIVE unless live screening passes)</span>
           </label>
         </div>

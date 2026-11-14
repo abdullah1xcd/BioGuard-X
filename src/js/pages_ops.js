@@ -227,10 +227,10 @@ export function renderAnalytics(container, { appState }) {
             <span class="state-text ${dsBm.insufficientData ? 'state-warning' : 'state-success'}">${dsBm.totalLabeledTrials} trial(s)</span>
           </div>
           <div class="divider-list" style="font-size:12.5px;">
-            <div class="divider-row"><span>Operational vs Synthetic Labeled</span><span class="mono">${dsBm.operationalLabeledTrials} ops · ${dsBm.syntheticLabeledTrials} synth</span></div>
+            <div class="divider-row"><span>Benchmark vs Excluded (Ops / Synth)</span><span class="mono">${dsBm.totalLabeledTrials} eval · ${dsQa.totalProbes} synth · ${dsOp.totalAttempts} ops</span></div>
             <div class="divider-row"><span>Genuine / Impostor Counts</span><span class="mono">${dsBm.classification.genuineCount} / ${dsBm.classification.impostorCount}</span></div>
-            <div class="divider-row"><span>Liveness (Pass / Fail / Inc / NS)</span><span class="mono">${report.livenessBreakdown.passed} / ${report.livenessBreakdown.failed} / ${report.livenessBreakdown.inconclusive} / ${report.livenessBreakdown.notSupported}</span></div>
-            <div class="divider-row"><span>Statistical Readiness</span><span class="state-text ${dsBm.insufficientData ? 'state-warning' : 'state-success'}">${dsBm.insufficientData ? 'Insufficient validated data' : 'Ready (≥3 per class)'}</span></div>
+            <div class="divider-row"><span>Deduplicated / Subject Split</span><span class="mono">${dsBm.duplicateExcludedCount || 0} dup excl · ${dsBm.subjectOverlapDetected ? 'Overlap Detected' : 'Disjoint'}</span></div>
+            <div class="divider-row"><span>Statistical Readiness</span><span class="state-text ${dsBm.insufficientData ? 'state-warning' : 'state-success'}">${dsBm.insufficientData ? 'NOT AVAILABLE' : 'Ready (≥3 per class)'}</span></div>
           </div>
         </div>
       </div>
@@ -240,19 +240,20 @@ export function renderAnalytics(container, { appState }) {
     const drStart = report.dateRange.startMs ? new Date(report.dateRange.startMs).toLocaleDateString() : '—';
     const drEnd = report.dateRange.endMs ? new Date(report.dateRange.endMs).toLocaleDateString() : '—';
     const ciText = (ci) => (c.sampleCount > 0 ? `CI [${(ci.low * 100).toFixed(1)}%–${(ci.high * 100).toFixed(1)}%]` : '—');
+    const insufficientHeadline = dsBm.insufficientDataMessage || 'Real-world biometric accuracy has not yet been established.';
 
     container.querySelector('#an-classification-panel').innerHTML = `
       <div class="panel-header">
         <div>
           <h2 class="panel-title">Measured Classification Accuracy (Benchmark Labeled Trials)</h2>
-          <p class="panel-subtitle">Sample size: ${c.sampleCount} labeled (${c.genuineCount} genuine, ${c.impostorCount} impostor) · ${report.unlabeledAttempts} unlabeled excluded · Range: ${escapeHtml(drStart)} → ${escapeHtml(drEnd)}</p>
+          <p class="panel-subtitle">Sample size: ${c.sampleCount} labeled (${c.genuineCount} genuine, ${c.impostorCount} impostor) · ${report.unlabeledAttempts} non-benchmark/unlabeled excluded · Range: ${escapeHtml(drStart)} → ${escapeHtml(drEnd)}</p>
         </div>
-        <span class="state-text ${c.insufficientData ? 'state-warning' : 'state-success'}">${c.insufficientData ? 'Insufficient validated data' : 'Statistically Grounded'}</span>
+        <span class="state-text ${c.insufficientData ? 'state-warning' : 'state-success'}">${c.insufficientData ? 'NOT AVAILABLE' : 'Statistically Grounded'}</span>
       </div>
 
       ${
         c.insufficientData
-          ? `<div class="notice-strip warning"><div><strong>${escapeHtml(dsBm.insufficientDataMessage || 'Insufficient validated data')}</strong><div>${escapeHtml(c.insufficientReason)} Run at least 3 Genuine and 3 Impostor labeled evaluation trials to report statistically valid FAR, FRR, and EER bounds.</div></div></div>`
+          ? `<div class="notice-strip warning"><div><strong>${escapeHtml(insufficientHeadline)}</strong><div>${escapeHtml(c.insufficientReason)} Only server-labeled <span class="mono">benchmark_eval</span> records on subject-disjoint splits feed FAR, FRR, and EER estimates.</div></div></div>`
           : ''
       }
 
