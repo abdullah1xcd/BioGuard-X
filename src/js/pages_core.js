@@ -1091,7 +1091,10 @@ export function renderEnrollment(container, { appState, navigate }) {
     } catch (err) {
       const code = String(err?.code || '');
       const stage = String(err?.operationStage || '');
+      const opType = String(err?.operationType || '');
+      const opPath = String(err?.path || '');
       const status = Number(err?.status || 0);
+      const reqId = String(err?.requestId || '');
       const heading =
         stage === 'identity_enrollment'
           ? 'Identity Metadata Enrollment Failed'
@@ -1104,7 +1107,14 @@ export function renderEnrollment(container, { appState, navigate }) {
           : code === 'vault_decryption_failed'
           ? 'Existing Vault Record Decryption Mismatch'
           : 'Enrollment Quality / Validation Rejected';
-      container.querySelector('#be-result').innerHTML = `<div class="notice-strip danger"><div><strong>${escapeHtml(heading)}</strong><div>${escapeHtml(err.message)}</div></div></div>`;
+      const diagParts = [
+        stage ? `stage=${stage}` : '',
+        opType ? `op=${opType}` : '',
+        opPath ? `path=${opPath}` : '',
+        status ? `http=${status}` : '',
+        reqId ? `req=${reqId}` : '',
+      ].filter(Boolean);
+      container.querySelector('#be-result').innerHTML = `<div class="notice-strip danger"><div><strong>${escapeHtml(heading)}</strong><div>${escapeHtml(err.message)}</div>${diagParts.length ? `<div class="meta-line mono" style="margin-top:4px;">${escapeHtml(diagParts.join(' · '))}</div>` : ''}</div></div>`;
       showToast(err.message, 'danger');
     } finally {
       submitBtn.disabled = false;
@@ -2168,7 +2178,10 @@ export function renderVerification(container, { appState, navigate }) {
     } catch (err) {
       const stage = String(err?.operationStage || '');
       const code = String(err?.code || '');
+      const opType = String(err?.operationType || '');
+      const opPath = String(err?.path || '');
       const status = Number(err?.status || 0);
+      const reqId = String(err?.requestId || '');
       const heading =
         stage === 'identity_lookup'
           ? 'Identity Metadata Lookup Failed'
@@ -2183,7 +2196,14 @@ export function renderVerification(container, { appState, navigate }) {
           : status >= 500
           ? 'Backend Verification Request Failed'
           : 'Verification / Quality Gate Rejected';
-      resultEl.innerHTML = `<div class="notice-strip danger"><div><strong>${escapeHtml(heading)}</strong><div>${escapeHtml(err.message)}</div></div></div>`;
+      const diagParts = [
+        stage ? `stage=${stage}` : '',
+        opType ? `op=${opType}` : '',
+        opPath ? `path=${opPath}` : '',
+        status ? `http=${status}` : '',
+        reqId ? `req=${reqId}` : '',
+      ].filter(Boolean);
+      resultEl.innerHTML = `<div class="notice-strip danger"><div><strong>${escapeHtml(heading)}</strong><div>${escapeHtml(err.message)}</div>${diagParts.length ? `<div class="meta-line mono" style="margin-top:4px;">${escapeHtml(diagParts.join(' · '))}</div>` : ''}</div></div>`;
       showToast(err.message, 'danger');
     } finally {
       runBtn.disabled = false; runBtn.textContent = 'Verify Identity';

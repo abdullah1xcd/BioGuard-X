@@ -32,7 +32,9 @@ service cloud.firestore {
     }
 
     function isBootstrappedAdmin() {
-      return isVerifiedUser() && request.auth.token.email == 'abdullahmohamedharoon8@gmail.com';
+      return isVerifiedUser() &&
+        request.auth.token.email is string &&
+        request.auth.token.email.lower() == 'abdullahmohamedharoon8@gmail.com';
     }
 
     function isAdmin() {
@@ -79,7 +81,7 @@ service cloud.firestore {
         data.uid == userId &&
         data.role in ['super_admin', 'administrator'] &&
         data.grantedBy == request.auth.uid &&
-        data.createdAt == request.time;
+        data.createdAt is timestamp;
     }
 
     function isValidBiometricIdentity(data) {
@@ -297,6 +299,9 @@ service cloud.firestore {
             incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'theme', 'lastLoginAt']) &&
             incoming().lastLoginAt == request.time) ||
           (isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['role', 'status', 'displayName', 'photoURL', 'theme']) &&
+            incoming().lastLoginAt == existing().lastLoginAt) ||
+          (isBootstrappedAdmin() && isOwner(userId) &&
             incoming().diff(existing()).affectedKeys().hasOnly(['role', 'status', 'displayName', 'photoURL', 'theme', 'lastLoginAt']) &&
             incoming().lastLoginAt == request.time)
         );
@@ -499,8 +504,9 @@ service cloud.firestore {
     match /admins/{userId} {
       allow get: if isValidId(userId) && isVerifiedUser() && (isOwner(userId) || isAdmin());
       allow list: if isAdmin();
-      allow create: if isValidId(userId) && isVerifiedUser() && isValidAdminGrant(incoming(), userId) && (isAdmin() || (isBootstrappedAdmin() && isOwner(userId)));
-      allow update, delete: if isValidId(userId) && isAdmin() && userId != request.auth.uid;
+      allow create: if isValidId(userId) && isVerifiedUser() && isValidAdminGrant(incoming(), userId) && incoming().createdAt == request.time && (isAdmin() || (isBootstrappedAdmin() && isOwner(userId)));
+      allow update: if isValidId(userId) && isVerifiedUser() && isAdmin() && userId != request.auth.uid && isValidAdminGrant(incoming(), userId) && incoming().uid == existing().uid && incoming().createdAt == existing().createdAt && incoming().diff(existing()).affectedKeys().hasOnly(['role', 'grantedBy']);
+      allow delete: if isValidId(userId) && isVerifiedUser() && isAdmin() && userId != request.auth.uid;
     }
   }
 }

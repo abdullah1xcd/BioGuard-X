@@ -90,7 +90,11 @@ export function handleFirestoreError(error, operationType, path, operationStage 
   };
   const serialized = JSON.stringify(errInfo);
   console.error('Firestore Error:', serialized);
+  const rawCode = String(error?.code || '');
+  const httpStatus = rawCode === 'permission-denied' ? 403 : rawCode === 'unauthenticated' ? 401 : undefined;
   const wrapped = Object.assign(new Error(serialized, { cause: error }), {
+    code: rawCode ? `firestore_${rawCode.replace(/[^a-zA-Z0-9_]/g, '_')}` : 'firestore_error',
+    ...(httpStatus ? { status: httpStatus, httpStatus } : {}),
     operationStage: operationStage || error?.operationStage || operationType,
     operationType,
     path,
@@ -194,7 +198,9 @@ export async function provisionUserProfile(fbUser) {
   const userPath = `users/${fbUser.uid}`;
   const ref = doc(db, 'users', fbUser.uid);
   const adminRef = doc(db, 'admins', fbUser.uid);
-  const isBootstrap = fbUser.emailVerified === true && fbUser.email === BOOTSTRAPPED_ADMIN_EMAIL;
+  const isBootstrap =
+    fbUser.emailVerified === true &&
+    String(fbUser.email || '').trim().toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL;
 
   try {
     const snap = await getDoc(ref);

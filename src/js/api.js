@@ -14,7 +14,11 @@ async function apiFetch(url, options = {}) {
   if (!res.ok) {
     const err = new Error(data.message || `API request failed (${res.status})`);
     err.code = data.error || 'api_error';
-    err.status = res.status;
+    err.status = data.httpStatus || res.status;
+    err.requestId = data.requestId || res.headers.get('X-Request-Id') || null;
+    err.operationStage = data.authorizationStage || null;
+    err.operationType = data.operation || null;
+    err.path = data.path || null;
     err.payload = data;
     throw err;
   }

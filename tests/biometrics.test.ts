@@ -1472,8 +1472,9 @@ test('Firestore security rules stay strictly aligned with VerificationRecord wri
   // 3. Verify rules enforce active identity lookup, identityRef consistency, photoURL in admin update, and strict admin grant checks
   assert.match(rulesText, /get\(\/databases\/\$\(database\)\/documents\/users\/\$\(userId\)\/identities\/\$\(request\.resource\.data\.identityRef\)\)\.data\.status == 'active'/);
   assert.match(rulesText, /get\(\/databases\/\$\(database\)\/documents\/users\/\$\(userId\)\/identities\/\$\(request\.resource\.data\.identityRef\)\)\.data\.identityRef == request\.resource\.data\.identityRef/);
-  assert.match(rulesText, /function isValidAdminGrant\(data, userId\)[\s\S]*?data\.uid == userId[\s\S]*?data\.grantedBy == request\.auth\.uid/);
-  assert.match(rulesText, /isAdmin\(\)[\s\S]*?affectedKeys\(\)\.hasOnly\(\['role', 'status', 'displayName', 'photoURL', 'theme', 'lastLoginAt'\]\)/);
+  assert.match(rulesText, /function isValidAdminGrant\(data, userId\)[\s\S]*?data\.uid == userId[\s\S]*?data\.grantedBy == request\.auth\.uid[\s\S]*?data\.createdAt is timestamp/);
+  assert.match(rulesText, /isAdmin\(\)[\s\S]*?affectedKeys\(\)\.hasOnly\(\['role', 'status', 'displayName', 'photoURL', 'theme'\]\)[\s\S]*?incoming\(\)\.lastLoginAt == existing\(\)\.lastLoginAt/);
+  assert.match(rulesText, /match \/admins\/\{userId\}[\s\S]*?allow create:[\s\S]*?incoming\(\)\.createdAt == request\.time[\s\S]*?allow update:[\s\S]*?isValidAdminGrant\(incoming\(\), userId\)[\s\S]*?incoming\(\)\.createdAt == existing\(\)\.createdAt/);
 
   // 4. Ensure pages_core.js does not mislabel Firestore permission errors as Quality Gate rejections
   assert.doesNotMatch(pagesCoreText, /datasetCategory === 'benchmark_eval' \? 'Benchmark Eval' : datasetCategory/);
@@ -1482,4 +1483,97 @@ test('Firestore security rules stay strictly aligned with VerificationRecord wri
   assert.match(firebaseJsText, /operationStage:\s*operationStage/);
 });
 
+test('Backend Firestore permission (403) and missing-database (404) errors propagate accurate status and safe diagnostics without masking', async () => {
+  process.env.BIOGUARD_SKIP_LISTEN = '1';
+  const serverMod = await import('../server.ts');
+  const {
+    BackendHttpError,
+    fetchUserFirestoreRole,
+    loadWorkspacePolicy,
+    consumePersistentRateLimit,
+  } = serverMod;
 
+  const permDeniedFetch: typeof fetch = async () =>
+    new Response(
+      JSON.stringify({ error: { code: 403, status: 'PERMISSION_DENIED', message: 'Missing or insufficient permissions.' } }),
+      { status: 403, headers: { 'Content-Type': 'application/json' } }
+    );
+
+  // 1. Verified bootstrap email resolves case-insensitively to super_admin
+  const bootstrapRole = await fetchUserFirestoreRole(
+    'uid_boot',
+    'AbdullahMohamedHaroon8@gmail.com',
+    true,
+    'tok_boot',
+    { fetchImpl: permDeniedFetch }
+  );
+  assert.deepEqual(bootstrapRole, { role: 'super_admin', status: 'active' });
+
+  // 2. Non-bootstrap 403 during role lookup propagates HTTP 403 (never masked as 503)
+  await assert.rejects(
+    () => fetchUserFirestoreRole('uid_op', 'op@example.com', true, 'secret-id-token-never-exposed', { fetchImpl: permDeniedFetch }),
+    (err: unknown) =>
+      err instanceof BackendHttpError &&
+      err.status === 403 &&
+      err.code === 'firestore_permission_denied' &&
+      err.authorizationStage === 'role_lookup' &&
+      err.operation === 'get' &&
+      err.path === 'users/uid_op' &&
+      !err.message.includes('secret-id-token-never-exposed')
+  );
+
+  // 3. 404 for missing database during role lookup fails with 503 firestore_database_not_found rather than silently defaulting to viewer
+  const missingDbFetch: typeof fetch = async () =>
+    new Response(
+      JSON.stringify({ error: { code: 404, status: 'NOT_FOUND', message: 'Database (ai-studio-missing) does not exist.' } }),
+      { status: 404, headers: { 'Content-Type': 'application/json' } }
+    );
+  await assert.rejects(
+    () => fetchUserFirestoreRole('uid_op', 'op@example.com', true, 'tok_op', { fetchImpl: missingDbFetch }),
+    (err: unknown) =>
+      err instanceof BackendHttpError &&
+      err.status === 503 &&
+      err.code === 'firestore_database_not_found' &&
+      err.authorizationStage === 'role_lookup'
+  );
+
+  // 4. loadWorkspacePolicy propagates 403 instead of returning null, while returning null on ordinary 404 missing doc
+  const missingDocFetch: typeof fetch = async () =>
+    new Response(JSON.stringify({ error: { code: 404, status: 'NOT_FOUND', message: 'Document not found.' } }), { status: 404 });
+  assert.equal(await loadWorkspacePolicy('uid_op', 'tok_op', { fetchImpl: missingDocFetch }), null);
+
+  await assert.rejects(
+    () => loadWorkspacePolicy('uid_op', 'tok_op', { fetchImpl: permDeniedFetch }),
+    (err: unknown) =>
+      err instanceof BackendHttpError &&
+      err.status === 403 &&
+      err.code === 'firestore_permission_denied' &&
+      err.authorizationStage === 'policy_read' &&
+      err.path === 'users/uid_op/system_settings/default'
+  );
+
+  // 5. consumePersistentRateLimit propagates 403 instead of silently falling back
+  const prevUpUrl = process.env.UPSTASH_REDIS_REST_URL;
+  const prevUpTok = process.env.UPSTASH_REDIS_REST_TOKEN;
+  try {
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    await assert.rejects(
+      () =>
+        consumePersistentRateLimit('verification', 10, 60_000, 'uid_op', 'tok_op', '127.0.0.1', {
+          fetchImpl: permDeniedFetch,
+        }),
+      (err: unknown) =>
+        err instanceof BackendHttpError &&
+        err.status === 403 &&
+        err.code === 'firestore_permission_denied' &&
+        err.authorizationStage === 'rate_limit_check' &&
+        err.path === 'users/uid_op/rate_limits/verification'
+    );
+  } finally {
+    if (prevUpUrl === undefined) delete process.env.UPSTASH_REDIS_REST_URL;
+    else process.env.UPSTASH_REDIS_REST_URL = prevUpUrl;
+    if (prevUpTok === undefined) delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    else process.env.UPSTASH_REDIS_REST_TOKEN = prevUpTok;
+  }
+});

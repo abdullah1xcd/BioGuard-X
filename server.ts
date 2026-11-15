@@ -162,18 +162,40 @@ export class VaultSecretError extends Error {
   }
 }
 
+export interface BackendErrorDiagnostics {
+  authorizationStage?: string;
+  operation?: string;
+  path?: string;
+}
+
 export class BackendHttpError extends Error {
   status: number;
   code: string;
-  constructor(status: number, code: string, message: string) {
+  authorizationStage?: string;
+  operation?: string;
+  path?: string;
+  constructor(status: number, code: string, message: string, diagnostics?: BackendErrorDiagnostics) {
     super(message);
     this.name = 'BackendHttpError';
     this.status = status;
     this.code = code;
+    this.authorizationStage = diagnostics?.authorizationStage;
+    this.operation = diagnostics?.operation;
+    this.path = diagnostics?.path;
   }
 }
 
-export function mapFirestoreHttpError(op: string, statusCode: number, rawDetail: string): BackendHttpError {
+export function isFirestoreDatabaseMissingDetail(rawDetail: string): boolean {
+  const lower = String(rawDetail || '').toLowerCase();
+  return lower.includes('database') && (lower.includes('does not exist') || lower.includes('not found'));
+}
+
+export function mapFirestoreHttpError(
+  op: string,
+  statusCode: number,
+  rawDetail: string,
+  diagnostics?: BackendErrorDiagnostics
+): BackendHttpError {
   let parsedStatus = '';
   let parsedMsg = '';
   try {
@@ -184,42 +206,57 @@ export function mapFirestoreHttpError(op: string, statusCode: number, rawDetail:
     // Plain-text upstream error body
   }
   const detailHint = parsedMsg || rawDetail.slice(0, 220);
+  const diag: BackendErrorDiagnostics = {
+    authorizationStage: diagnostics?.authorizationStage,
+    operation: diagnostics?.operation || op,
+    path: diagnostics?.path,
+  };
 
   if (statusCode === 401 || parsedStatus === 'UNAUTHENTICATED') {
-    return new BackendHttpError(401, 'firestore_unauthenticated', `Firestore authentication failed during ${op}. Sign out and sign in again.`);
+    return new BackendHttpError(
+      401,
+      'firestore_unauthenticated',
+      `Firestore authentication failed during ${op}. Sign out and sign in again.`,
+      diag
+    );
   }
   if (statusCode === 403 || parsedStatus === 'PERMISSION_DENIED') {
     return new BackendHttpError(
       403,
       'firestore_permission_denied',
-      `Firestore rejected ${op} due to security rules or account permissions${detailHint ? ` (${detailHint})` : ''}. Ensure your email is verified and latest firestore.rules are deployed.`
+      `Firestore rejected ${op} due to security rules or account permissions${detailHint ? ` (${detailHint})` : ''}. Ensure your email is verified and latest firestore.rules are deployed.`,
+      diag
     );
   }
   if (statusCode === 400 || parsedStatus === 'INVALID_ARGUMENT') {
     return new BackendHttpError(
       400,
       'firestore_invalid_argument',
-      `Firestore rejected ${op} payload${detailHint ? ` (${detailHint})` : ''}.`
+      `Firestore rejected ${op} payload${detailHint ? ` (${detailHint})` : ''}.`,
+      diag
     );
   }
   if (statusCode === 429 || parsedStatus === 'RESOURCE_EXHAUSTED') {
     return new BackendHttpError(
       429,
       'firestore_quota_exceeded',
-      'Firestore free-tier quota exceeded. Retry later or check Firebase billing/usage.'
+      'Firestore free-tier quota exceeded. Retry later or check Firebase billing/usage.',
+      diag
     );
   }
   if (statusCode === 404 || parsedStatus === 'NOT_FOUND') {
     return new BackendHttpError(
       503,
       'firestore_database_not_found',
-      `Firestore database or collection path could not be resolved during ${op} (project=${firebaseConfig.projectId}, db=${firebaseConfig.firestoreDatabaseId}).`
+      `Firestore database or collection path could not be resolved during ${op} (project=${firebaseConfig.projectId}, db=${firebaseConfig.firestoreDatabaseId}).`,
+      diag
     );
   }
   return new BackendHttpError(
     503,
     'firestore_unavailable',
-    `Firestore ${op} failed with HTTP ${statusCode}${detailHint ? `: ${detailHint}` : ''}.`
+    `Firestore ${op} failed with HTTP ${statusCode}${detailHint ? `: ${detailHint}` : ''}.`,
+    diag
   );
 }
 
@@ -318,7 +355,17 @@ function firestoreDocUrl(docPath: string): string {
   return `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${dbId}/documents/${docPath}`;
 }
 
+function firestoreDocName(docPath: string): string {
+  return `projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/${docPath}`;
+}
+
+function firestoreCommitUrl(): string {
+  const dbId = encodeURIComponent(firebaseConfig.firestoreDatabaseId);
+  return `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${dbId}/documents:commit`;
+}
+
 async function loadVaultEntry(uid: string, identityRef: string, idToken: string): Promise<VaultEntry | null> {
+  const docPath = `users/${uid}/biometric_vault/${identityRef}`;
   const url = firestoreDocUrl(`users/${encodeURIComponent(uid)}/biometric_vault/${encodeURIComponent(identityRef)}`);
   let response: globalThis.Response;
   try {
@@ -330,20 +377,40 @@ async function loadVaultEntry(uid: string, identityRef: string, idToken: string)
     throw new BackendHttpError(
       503,
       'firestore_unreachable',
-      `Failed to reach Firestore while reading vault entry (${err instanceof Error ? err.message : 'network error'}).`
+      `Failed to reach Firestore while reading vault entry (${err instanceof Error ? err.message : 'network error'}).`,
+      { authorizationStage: 'vault_access', operation: 'get', path: docPath }
     );
   }
-  if (response.status === 404) return null;
+  if (response.status === 404) {
+    const detail = await response.text().catch(() => '');
+    if (isFirestoreDatabaseMissingDetail(detail)) {
+      throw mapFirestoreHttpError('vault read', 404, detail, {
+        authorizationStage: 'vault_access',
+        operation: 'get',
+        path: docPath,
+      });
+    }
+    return null;
+  }
   if (!response.ok) {
     const detail = await response.text().catch(() => '');
-    throw mapFirestoreHttpError('vault read', response.status, detail);
+    throw mapFirestoreHttpError('vault read', response.status, detail, {
+      authorizationStage: 'vault_access',
+      operation: 'get',
+      path: docPath,
+    });
   }
   const payload = (await response.json()) as {
     fields?: { encryptedPayload?: { stringValue?: string } };
   };
   const encryptedPayload = payload.fields?.encryptedPayload?.stringValue;
   if (!encryptedPayload) {
-    throw new BackendHttpError(422, 'vault_record_corrupt', 'Stored Firestore vault document is missing encryptedPayload.');
+    throw new BackendHttpError(
+      422,
+      'vault_record_corrupt',
+      'Stored Firestore vault document is missing encryptedPayload.',
+      { authorizationStage: 'vault_access', operation: 'get', path: docPath }
+    );
   }
   const decrypted = decryptVaultMap(encryptedPayload);
   return decrypted[identityRef] || null;
@@ -354,6 +421,7 @@ async function listVaultEntriesWithMeta(
   idToken: string,
   maxDocs = 500
 ): Promise<Array<{ entry: VaultEntry; needsRotation: boolean }>> {
+  const collectionPath = `users/${uid}/biometric_vault`;
   const results: Array<{ entry: VaultEntry; needsRotation: boolean }> = [];
   let pageToken = '';
   do {
@@ -361,10 +429,24 @@ async function listVaultEntriesWithMeta(
     if (pageToken) qs.set('pageToken', pageToken);
     const url = `${firestoreDocUrl(`users/${encodeURIComponent(uid)}/biometric_vault`)}?${qs.toString()}`;
     const response = await fetch(url, { headers: { Authorization: `Bearer ${idToken}` }, signal: AbortSignal.timeout(8000) });
-    if (response.status === 404) break;
+    if (response.status === 404) {
+      const detail = await response.text().catch(() => '');
+      if (isFirestoreDatabaseMissingDetail(detail)) {
+        throw mapFirestoreHttpError('vault list', 404, detail, {
+          authorizationStage: 'vault_access',
+          operation: 'list',
+          path: collectionPath,
+        });
+      }
+      break;
+    }
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
-      throw mapFirestoreHttpError('vault list', response.status, detail);
+      throw mapFirestoreHttpError('vault list', response.status, detail, {
+        authorizationStage: 'vault_access',
+        operation: 'list',
+        path: collectionPath,
+      });
     }
     const payload = (await response.json()) as {
       documents?: Array<{
@@ -401,6 +483,7 @@ async function listVaultEntries(uid: string, idToken: string, maxDocs = 500): Pr
 
 async function saveVaultEntry(uid: string, entry: VaultEntry, idToken: string): Promise<void> {
   const identityRef = entry.identityRef;
+  const docPath = `users/${uid}/biometric_vault/${identityRef}`;
   const encryptedPayload = encryptVaultMap({ [identityRef]: entry });
   const url = firestoreDocUrl(`users/${encodeURIComponent(uid)}/biometric_vault/${encodeURIComponent(identityRef)}`);
   let response: globalThis.Response;
@@ -424,16 +507,22 @@ async function saveVaultEntry(uid: string, entry: VaultEntry, idToken: string): 
     throw new BackendHttpError(
       503,
       'firestore_unreachable',
-      `Failed to reach Firestore while saving vault entry (${err instanceof Error ? err.message : 'network error'}).`
+      `Failed to reach Firestore while saving vault entry (${err instanceof Error ? err.message : 'network error'}).`,
+      { authorizationStage: 'vault_access', operation: 'write', path: docPath }
     );
   }
   if (!response.ok) {
     const detail = await response.text().catch(() => '');
-    throw mapFirestoreHttpError('vault write', response.status, detail);
+    throw mapFirestoreHttpError('vault write', response.status, detail, {
+      authorizationStage: 'vault_access',
+      operation: 'write',
+      path: docPath,
+    });
   }
 }
 
 async function deleteVaultEntry(uid: string, identityRef: string, idToken: string): Promise<void> {
+  const docPath = `users/${uid}/biometric_vault/${identityRef}`;
   const url = firestoreDocUrl(`users/${encodeURIComponent(uid)}/biometric_vault/${encodeURIComponent(identityRef)}`);
   let response: globalThis.Response;
   try {
@@ -446,12 +535,17 @@ async function deleteVaultEntry(uid: string, identityRef: string, idToken: strin
     throw new BackendHttpError(
       503,
       'firestore_unreachable',
-      `Failed to reach Firestore while deleting vault entry (${err instanceof Error ? err.message : 'network error'}).`
+      `Failed to reach Firestore while deleting vault entry (${err instanceof Error ? err.message : 'network error'}).`,
+      { authorizationStage: 'vault_access', operation: 'delete', path: docPath }
     );
   }
   if (!response.ok && response.status !== 404) {
     const detail = await response.text().catch(() => '');
-    throw mapFirestoreHttpError('vault delete', response.status, detail);
+    throw mapFirestoreHttpError('vault delete', response.status, detail, {
+      authorizationStage: 'vault_access',
+      operation: 'delete',
+      path: docPath,
+    });
   }
 }
 
@@ -1227,29 +1321,43 @@ function recordRiskEvent(uid: string, identityRef: string, outcome: string, spoo
   verificationHistory.set(historyKey, recent);
 }
 
-async function fetchUserFirestoreRole(
+export async function fetchUserFirestoreRole(
   uid: string,
   email: string | undefined,
   emailVerified: boolean,
-  idToken: string
+  idToken: string,
+  opts?: { fetchImpl?: typeof fetch }
 ): Promise<{ role: Role; status: string }> {
-  if (emailVerified && email === BOOTSTRAPPED_ADMIN_EMAIL) {
+  const normalizedEmail = (email || '').trim().toLowerCase();
+  if (emailVerified && normalizedEmail === BOOTSTRAPPED_ADMIN_EMAIL) {
     return { role: 'super_admin', status: 'active' };
   }
+  const fetchFn = opts?.fetchImpl || fetch;
+  const docPath = `users/${uid}`;
   try {
-    const res = await fetch(firestoreDocUrl(`users/${encodeURIComponent(uid)}`), {
+    const res = await fetchFn(firestoreDocUrl(`users/${encodeURIComponent(uid)}`), {
       headers: { Authorization: `Bearer ${idToken}` },
       signal: AbortSignal.timeout(5000),
     });
     if (res.status === 404) {
+      const detail = await res.text().catch(() => '');
+      if (isFirestoreDatabaseMissingDetail(detail)) {
+        throw mapFirestoreHttpError('role lookup', 404, detail, {
+          authorizationStage: 'role_lookup',
+          operation: 'get',
+          path: docPath,
+        });
+      }
       // New or unprovisioned user defaults fail-closed to read-only viewer until profile creation
       return { role: 'viewer', status: 'active' };
     }
     if (!res.ok) {
-      const err = new Error(`Authorization service returned ${res.status}.`) as Error & { status?: number; code?: string };
-      err.status = 503;
-      err.code = 'authorization_unavailable';
-      throw err;
+      const detail = await res.text().catch(() => '');
+      throw mapFirestoreHttpError('role lookup', res.status, detail, {
+        authorizationStage: 'role_lookup',
+        operation: 'get',
+        path: docPath,
+      });
     }
     const docJson = (await res.json()) as {
       fields?: {
@@ -1260,21 +1368,33 @@ async function fetchUserFirestoreRole(
     const rawRole = docJson.fields?.role?.stringValue;
     const rawStatus = docJson.fields?.status?.stringValue || 'active';
     if (rawRole && !(rawRole in ROLE_CAPABILITIES)) {
-      const err = new Error(`Unrecognized account role "${rawRole}".`) as Error & { status?: number; code?: string };
-      err.status = 403;
-      err.code = 'invalid_role_record';
-      throw err;
+      throw new BackendHttpError(
+        403,
+        'invalid_role_record',
+        `Unrecognized account role "${rawRole}".`,
+        {
+          authorizationStage: 'role_lookup',
+          operation: 'get',
+          path: docPath,
+        }
+      );
     }
     const validRole: Role = (rawRole as Role) || 'viewer';
     return { role: validRole, status: rawStatus };
   } catch (err) {
-    if (err instanceof Error && typeof (err as Error & { status?: number }).status === 'number') {
+    if (err instanceof BackendHttpError || (err instanceof Error && typeof (err as Error & { status?: number }).status === 'number')) {
       throw err;
     }
-    const unavailable = new Error('Unable to verify RBAC authorization against Firestore.') as Error & { status?: number; code?: string };
-    unavailable.status = 503;
-    unavailable.code = 'authorization_unavailable';
-    throw unavailable;
+    throw new BackendHttpError(
+      503,
+      'authorization_unavailable',
+      'Unable to verify RBAC authorization against Firestore.',
+      {
+        authorizationStage: 'role_lookup',
+        operation: 'get',
+        path: docPath,
+      }
+    );
   }
 }
 
@@ -1353,6 +1473,7 @@ export async function consumePersistentRateLimit(
 
   if (uid && idToken) {
     const safeBucket = bucketName.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48);
+    const docPath = `users/${uid}/rate_limits/${safeBucket}`;
     const docUrl = firestoreDocUrl(`users/${encodeURIComponent(uid)}/rate_limits/${encodeURIComponent(safeBucket)}`);
     const alignedWindowStart = Math.floor(now / windowMs) * windowMs;
 
@@ -1363,6 +1484,14 @@ export async function consumePersistentRateLimit(
           signal: AbortSignal.timeout(3000),
         });
         if (getRes.status === 404) {
+          const getDetail = await getRes.text().catch(() => '');
+          if (isFirestoreDatabaseMissingDetail(getDetail)) {
+            throw mapFirestoreHttpError('rate limit lookup', 404, getDetail, {
+              authorizationStage: 'rate_limit_check',
+              operation: 'get',
+              path: docPath,
+            });
+          }
           const createRes = await fetchFn(`${docUrl}?currentDocument.exists=false`, {
             method: 'PATCH',
             headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
@@ -1382,6 +1511,14 @@ export async function consumePersistentRateLimit(
           }
           if (createRes.status === 409 || createRes.status === 412) {
             continue;
+          }
+          if (createRes.status === 401 || createRes.status === 403 || createRes.status === 400 || createRes.status === 429) {
+            const createDetail = await createRes.text().catch(() => '');
+            throw mapFirestoreHttpError('rate limit create', createRes.status, createDetail, {
+              authorizationStage: 'rate_limit_check',
+              operation: 'create',
+              path: docPath,
+            });
           }
           break;
         } else if (getRes.ok) {
@@ -1421,11 +1558,29 @@ export async function consumePersistentRateLimit(
           if (patchRes.status === 409 || patchRes.status === 412) {
             continue;
           }
+          if (patchRes.status === 401 || patchRes.status === 403 || patchRes.status === 400 || patchRes.status === 429) {
+            const patchDetail = await patchRes.text().catch(() => '');
+            throw mapFirestoreHttpError('rate limit update', patchRes.status, patchDetail, {
+              authorizationStage: 'rate_limit_check',
+              operation: 'update',
+              path: docPath,
+            });
+          }
           break;
+        } else if (getRes.status === 401 || getRes.status === 403 || getRes.status === 400 || getRes.status === 429) {
+          const getDetail = await getRes.text().catch(() => '');
+          throw mapFirestoreHttpError('rate limit lookup', getRes.status, getDetail, {
+            authorizationStage: 'rate_limit_check',
+            operation: 'get',
+            path: docPath,
+          });
         } else {
           break;
         }
-      } catch {
+      } catch (err) {
+        if (err instanceof BackendHttpError) {
+          throw err;
+        }
         break;
       }
     }
@@ -1436,11 +1591,16 @@ export async function consumePersistentRateLimit(
     throw new BackendHttpError(
       503,
       'rate_limiter_unavailable',
-      'Distributed rate limiter backend is unavailable in production.'
+      'Distributed rate limiter backend is unavailable in production.',
+      { authorizationStage: 'rate_limit_check', operation: 'rate_limit' }
     );
   }
   const allowed = checkLocalRateLimit(`${bucketName}:${uid || ip}`, maxRequests, windowMs);
   return { allowed, mode: 'degraded_local_fallback' };
+}
+
+function getRequestId(res: Response): string | undefined {
+  return typeof res.locals?.requestId === 'string' ? res.locals.requestId : undefined;
 }
 
 function rateLimit(maxRequests: number, windowMs: number, bucketName?: string) {
@@ -1459,6 +1619,9 @@ function rateLimit(maxRequests: number, windowMs: number, bucketName?: string) {
           res.status(429).json({
             error: 'rate_limit_exceeded',
             message: 'Too many requests in the current window. Please wait briefly and retry.',
+            httpStatus: 429,
+            authorizationStage: 'rate_limit_check',
+            requestId: getRequestId(res),
           });
           return;
         }
@@ -1469,14 +1632,27 @@ function rateLimit(maxRequests: number, windowMs: number, bucketName?: string) {
 }
 
 async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
+  const requestId = getRequestId(res);
   const header = req.headers.authorization || '';
   if (!header.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'missing_token', message: 'Authorization Bearer token is required.' });
+    res.status(401).json({
+      error: 'missing_token',
+      message: 'Authorization Bearer token is required.',
+      httpStatus: 401,
+      authorizationStage: 'firebase_id_token_lookup',
+      requestId,
+    });
     return;
   }
   const idToken = header.slice(7).trim();
   if (!idToken) {
-    res.status(401).json({ error: 'invalid_token', message: 'Empty Bearer token.' });
+    res.status(401).json({
+      error: 'invalid_token',
+      message: 'Empty Bearer token.',
+      httpStatus: 401,
+      authorizationStage: 'firebase_id_token_lookup',
+      requestId,
+    });
     return;
   }
   try {
@@ -1489,12 +1665,34 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
         signal: AbortSignal.timeout(6000),
       }
     );
-    if (!lookup.ok) throw new Error('Firebase rejected the ID token.');
+    if (!lookup.ok) {
+      if (lookup.status >= 500) {
+        throw new BackendHttpError(
+          503,
+          'auth_service_unavailable',
+          `Firebase Identity Toolkit returned HTTP ${lookup.status}.`,
+          { authorizationStage: 'firebase_id_token_lookup', operation: 'accounts:lookup' }
+        );
+      }
+      throw new BackendHttpError(
+        401,
+        'invalid_credentials',
+        'Firebase rejected the ID token. Sign out and sign back in.',
+        { authorizationStage: 'firebase_id_token_lookup', operation: 'accounts:lookup' }
+      );
+    }
     const lookupPayload = (await lookup.json()) as {
       users?: Array<{ localId: string; email?: string; emailVerified?: boolean }>;
     };
     const firebaseUser = lookupPayload.users?.[0];
-    if (!firebaseUser?.localId) throw new Error('Firebase user was not found for this ID token.');
+    if (!firebaseUser?.localId) {
+      throw new BackendHttpError(
+        401,
+        'invalid_credentials',
+        'Firebase user was not found for this ID token.',
+        { authorizationStage: 'firebase_id_token_lookup', operation: 'accounts:lookup' }
+      );
+    }
     const decoded = {
       uid: firebaseUser.localId,
       email: firebaseUser.email,
@@ -1504,6 +1702,9 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
       res.status(403).json({
         error: 'email_not_verified',
         message: 'A verified Google/Firebase email address is required to access BioGuard X.',
+        httpStatus: 403,
+        authorizationStage: 'email_verification',
+        requestId,
       });
       return;
     }
@@ -1514,7 +1715,14 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
       idToken
     );
     if (status === 'suspended') {
-      res.status(403).json({ error: 'account_suspended', message: 'Your BioGuard X operator account is suspended.' });
+      res.status(403).json({
+        error: 'account_suspended',
+        message: 'Your BioGuard X operator account is suspended.',
+        httpStatus: 403,
+        authorizationStage: 'account_status',
+        path: `users/${decoded.uid}`,
+        requestId,
+      });
       return;
     }
     req.auth = {
@@ -1528,16 +1736,34 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
     };
     next();
   } catch (err) {
-    const status = typeof (err as Error & { status?: number })?.status === 'number'
-      ? (err as Error & { status: number }).status
-      : 401;
-    const code = typeof (err as Error & { code?: string })?.code === 'string'
-      ? (err as Error & { code: string }).code
+    const errMeta = err as Error & {
+      status?: number;
+      code?: string;
+      authorizationStage?: string;
+      operation?: string;
+      path?: string;
+    };
+    const isNetworkAbort =
+      !(err instanceof BackendHttpError) &&
+      typeof errMeta?.status !== 'number' &&
+      err instanceof Error &&
+      (err.name === 'TimeoutError' || err.name === 'AbortError' || err.name === 'TypeError');
+    const status = typeof errMeta?.status === 'number' ? errMeta.status : isNetworkAbort ? 503 : 401;
+    const code = typeof errMeta?.code === 'string'
+      ? errMeta.code
       : status === 503
       ? 'authorization_unavailable'
       : 'invalid_credentials';
     const message = err instanceof Error ? err.message : 'Token verification failed.';
-    res.status(status).json({ error: code, message });
+    res.status(status).json({
+      error: code,
+      message,
+      httpStatus: status,
+      authorizationStage: errMeta?.authorizationStage || 'firebase_id_token_lookup',
+      ...(errMeta?.operation ? { operation: errMeta.operation } : {}),
+      ...(errMeta?.path ? { path: errMeta.path } : {}),
+      requestId,
+    });
   }
 }
 
@@ -1549,6 +1775,11 @@ function requireCapability(capability: string) {
       res.status(403).json({
         error: 'forbidden',
         message: `Role "${role}" does not have permission "${capability}".`,
+        httpStatus: 403,
+        authorizationStage: 'capability_check',
+        operation: capability,
+        path: req.auth?.uid ? `users/${req.auth.uid}` : undefined,
+        requestId: getRequestId(res),
       });
       return;
     }
@@ -1605,14 +1836,38 @@ function parseFirestoreNumberField(field: { doubleValue?: number; integerValue?:
   return undefined;
 }
 
-async function loadWorkspacePolicy(uid: string, idToken: string): Promise<WorkspacePolicySnapshot | null> {
+export async function loadWorkspacePolicy(
+  uid: string,
+  idToken: string,
+  opts?: { fetchImpl?: typeof fetch }
+): Promise<WorkspacePolicySnapshot | null> {
+  const fetchFn = opts?.fetchImpl || fetch;
+  const docPath = `users/${uid}/system_settings/default`;
   try {
     const url = firestoreDocUrl(`users/${encodeURIComponent(uid)}/system_settings/default`);
-    const res = await fetch(url, {
+    const res = await fetchFn(url, {
       headers: { Authorization: `Bearer ${idToken}` },
       signal: AbortSignal.timeout(4000),
     });
-    if (res.status === 404 || !res.ok) return null;
+    if (res.status === 404) {
+      const detail = await res.text().catch(() => '');
+      if (isFirestoreDatabaseMissingDetail(detail)) {
+        throw mapFirestoreHttpError('workspace policy read', 404, detail, {
+          authorizationStage: 'policy_read',
+          operation: 'get',
+          path: docPath,
+        });
+      }
+      return null;
+    }
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      throw mapFirestoreHttpError('workspace policy read', res.status, detail, {
+        authorizationStage: 'policy_read',
+        operation: 'get',
+        path: docPath,
+      });
+    }
     const payload = (await res.json()) as {
       fields?: {
         faceThreshold?: { doubleValue?: number; integerValue?: string };
@@ -1656,7 +1911,10 @@ async function loadWorkspacePolicy(uid: string, idToken: string): Promise<Worksp
       strictLiveness: f.strictLiveness?.booleanValue !== false,
       modalityWeights,
     };
-  } catch {
+  } catch (err) {
+    if (err instanceof BackendHttpError) {
+      throw err;
+    }
     return null;
   }
 }
@@ -1774,6 +2032,16 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 });
 
 app.use(express.json({ limit: '2mb' }));
+
+app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+  const incomingId = String(req.headers['x-request-id'] || '').trim();
+  const requestId = /^[a-zA-Z0-9_-]{4,64}$/.test(incomingId)
+    ? incomingId
+    : `req_${crypto.randomUUID().slice(0, 12)}`;
+  res.locals.requestId = requestId;
+  res.setHeader('X-Request-Id', requestId);
+  next();
+});
 
 const asyncHandler = (
   handler: (req: AuthedRequest, res: Response) => Promise<void>
@@ -2856,19 +3124,20 @@ app.post(
   requireAuth,
   requireCapability('manage_roles'),
   rateLimit(20, 60_000),
-  async (req: AuthedRequest, res: Response) => {
+  asyncHandler(async (req: AuthedRequest, res: Response) => {
+    const requestId = getRequestId(res);
     const targetUid = String(req.params.uid || '').trim();
     const body = req.body as { role?: Role; status?: 'active' | 'suspended' };
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(targetUid)) {
-      res.status(400).json({ error: 'invalid_uid', message: 'Invalid target user UID.' });
+      res.status(400).json({ error: 'invalid_uid', message: 'Invalid target user UID.', httpStatus: 400, requestId });
       return;
     }
     if (body.role && !(body.role in ROLE_CAPABILITIES)) {
-      res.status(400).json({ error: 'invalid_role', message: 'Unsupported role specified.' });
+      res.status(400).json({ error: 'invalid_role', message: 'Unsupported role specified.', httpStatus: 400, requestId });
       return;
     }
     if (targetUid === req.auth!.uid && body.status === 'suspended') {
-      res.status(400).json({ error: 'self_suspend_blocked', message: 'Administrators cannot suspend their own account.' });
+      res.status(400).json({ error: 'self_suspend_blocked', message: 'Administrators cannot suspend their own account.', httpStatus: 400, requestId });
       return;
     }
 
@@ -2883,58 +3152,125 @@ app.post(
       fields.status = { stringValue: body.status };
     }
     if (!updateMask.length) {
-      res.status(400).json({ error: 'empty_update', message: 'Provide role or status to update.' });
+      res.status(400).json({ error: 'empty_update', message: 'Provide role or status to update.', httpStatus: 400, requestId });
       return;
     }
 
-    try {
-      const maskQuery = updateMask.map((f) => `updateMask.fieldPaths=${encodeURIComponent(f)}`).join('&');
-      const patchRes = await fetch(`${firestoreDocUrl(`users/${encodeURIComponent(targetUid)}`)}?${maskQuery}`, {
-        method: 'PATCH',
-        headers: {
-          Authorization: `Bearer ${req.auth!.idToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ fields }),
+    const userPath = `users/${targetUid}`;
+    const maskQuery = updateMask.map((f) => `updateMask.fieldPaths=${encodeURIComponent(f)}`).join('&');
+    const patchRes = await fetch(`${firestoreDocUrl(`users/${encodeURIComponent(targetUid)}`)}?${maskQuery}`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${req.auth!.idToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ fields }),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!patchRes.ok) {
+      const errText = await patchRes.text().catch(() => '');
+      throw mapFirestoreHttpError('user role update', patchRes.status, errText, {
+        authorizationStage: 'admin_role_management',
+        operation: 'update',
+        path: userPath,
       });
-      if (!patchRes.ok) {
-        const errText = await patchRes.text();
-        res.status(patchRes.status).json({ error: 'firestore_update_failed', message: errText });
-        return;
-      }
+    }
 
-      if (body.role) {
-        const isTargetAdmin = body.role === 'super_admin' || body.role === 'administrator';
-        const adminUrl = firestoreDocUrl(`admins/${encodeURIComponent(targetUid)}`);
-        if (isTargetAdmin) {
-          await fetch(adminUrl, {
-            method: 'PATCH',
+    if (body.role) {
+      const isTargetAdmin = body.role === 'super_admin' || body.role === 'administrator';
+      const adminPath = `admins/${targetUid}`;
+      const adminUrl = firestoreDocUrl(`admins/${encodeURIComponent(targetUid)}`);
+      if (isTargetAdmin) {
+        const existingAdminRes = await fetch(adminUrl, {
+          headers: { Authorization: `Bearer ${req.auth!.idToken}` },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (existingAdminRes.ok) {
+          const updateAdminRes = await fetch(
+            `${adminUrl}?updateMask.fieldPaths=role&updateMask.fieldPaths=grantedBy`,
+            {
+              method: 'PATCH',
+              headers: {
+                Authorization: `Bearer ${req.auth!.idToken}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                fields: {
+                  role: { stringValue: body.role },
+                  grantedBy: { stringValue: req.auth!.uid },
+                },
+              }),
+              signal: AbortSignal.timeout(6000),
+            }
+          );
+          if (!updateAdminRes.ok) {
+            const errText = await updateAdminRes.text().catch(() => '');
+            throw mapFirestoreHttpError('admin registry update', updateAdminRes.status, errText, {
+              authorizationStage: 'admin_role_management',
+              operation: 'update',
+              path: adminPath,
+            });
+          }
+        } else if (existingAdminRes.status === 404) {
+          const commitRes = await fetch(firestoreCommitUrl(), {
+            method: 'POST',
             headers: {
               Authorization: `Bearer ${req.auth!.idToken}`,
               'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-              fields: {
-                uid: { stringValue: targetUid },
-                role: { stringValue: body.role },
-                grantedBy: { stringValue: req.auth!.uid },
-                createdAt: { timestampValue: new Date().toISOString() },
-              },
+              writes: [
+                {
+                  currentDocument: { exists: false },
+                  update: {
+                    name: firestoreDocName(adminPath),
+                    fields: {
+                      uid: { stringValue: targetUid },
+                      role: { stringValue: body.role },
+                      grantedBy: { stringValue: req.auth!.uid },
+                    },
+                  },
+                  updateTransforms: [{ fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' }],
+                },
+              ],
             }),
+            signal: AbortSignal.timeout(6000),
           });
+          if (!commitRes.ok) {
+            const errText = await commitRes.text().catch(() => '');
+            throw mapFirestoreHttpError('admin registry create', commitRes.status, errText, {
+              authorizationStage: 'admin_role_management',
+              operation: 'create',
+              path: adminPath,
+            });
+          }
         } else {
-          await fetch(adminUrl, {
-            method: 'DELETE',
-            headers: { Authorization: `Bearer ${req.auth!.idToken}` },
+          const errText = await existingAdminRes.text().catch(() => '');
+          throw mapFirestoreHttpError('admin registry lookup', existingAdminRes.status, errText, {
+            authorizationStage: 'admin_role_management',
+            operation: 'get',
+            path: adminPath,
+          });
+        }
+      } else {
+        const delRes = await fetch(adminUrl, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${req.auth!.idToken}` },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!delRes.ok && delRes.status !== 404) {
+          const errText = await delRes.text().catch(() => '');
+          throw mapFirestoreHttpError('admin registry delete', delRes.status, errText, {
+            authorizationStage: 'admin_role_management',
+            operation: 'delete',
+            path: adminPath,
           });
         }
       }
-
-      res.json({ status: 'updated', uid: targetUid, role: body.role, accountStatus: body.status });
-    } catch (err) {
-      res.status(500).json({ error: 'server_error', message: err instanceof Error ? err.message : 'Failed to update role.' });
     }
-  }
+
+    res.json({ status: 'updated', uid: targetUid, role: body.role, accountStatus: body.status, requestId });
+  })
 );
 
 // 9. AI Security Analyst (Server-Side Gemini API Only)
@@ -3035,11 +3371,21 @@ app.post(
 );
 
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-  const errObj = err as Error & { status?: number; code?: string };
+  const requestId = getRequestId(res);
+  const errObj = err as Error & {
+    status?: number;
+    code?: string;
+    authorizationStage?: string;
+    operation?: string;
+    path?: string;
+  };
   if (err instanceof VaultSecretError || errObj?.code === 'vault_secret_not_configured') {
     res.status(503).json({
       error: 'vault_secret_not_configured',
       message: 'BIOGUARD_VAULT_SECRET (>=32 chars) is missing or too short on the backend. Add it in Vercel Environment Variables / .env and redeploy.',
+      httpStatus: 503,
+      authorizationStage: 'vault_configuration',
+      requestId,
     });
     return;
   }
@@ -3048,6 +3394,11 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     res.status(err.status).json({
       error: err.code,
       message: err.message,
+      httpStatus: err.status,
+      ...(err.authorizationStage ? { authorizationStage: err.authorizationStage } : {}),
+      ...(err.operation ? { operation: err.operation } : {}),
+      ...(err.path ? { path: err.path } : {}),
+      requestId,
     });
     return;
   }
@@ -3055,6 +3406,8 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     res.status(400).json({
       error: 'invalid_biometric_parameters',
       message: err.message || 'Invalid biometric parameters supplied.',
+      httpStatus: 400,
+      requestId,
     });
     return;
   }
@@ -3068,6 +3421,11 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
       status === 503
         ? `The backend could not complete this request (${code}: ${rawMsg}). Check the Vercel function, BIOGUARD_VAULT_SECRET, and Firestore configuration.`
         : rawMsg,
+    httpStatus: status,
+    ...(errObj?.authorizationStage ? { authorizationStage: errObj.authorizationStage } : {}),
+    ...(errObj?.operation ? { operation: errObj.operation } : {}),
+    ...(errObj?.path ? { path: errObj.path } : {}),
+    requestId,
   });
 });
 
