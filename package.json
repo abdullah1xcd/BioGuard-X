@@ -11,6 +11,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/biometrics.test.ts",
+    "deploy:rules": "firebase deploy --only firestore:rules",
     "clean": "rm -rf dist dev-dist server.js"
   },
   "dependencies": {

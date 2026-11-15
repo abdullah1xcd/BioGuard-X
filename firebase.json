@@ -1,0 +1,6 @@
+{
+  "firestore": {
+    "database": "ai-studio-bioguardx-e1593f08-43df-4912-a9e0-6922af3760d4",
+    "rules": "firestore.rules"
+  }
+}
