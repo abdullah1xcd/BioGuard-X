@@ -1,0 +1,83 @@
+name: Deploy Firestore Rules
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'firestore.rules'
+      - 'firebase.json'
+      - '.firebaserc'
+      - '.github/workflows/deploy-firestore-rules.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-firestore-rules-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy_firestore_rules:
+    name: Validate & Deploy Firestore Rules
+    runs-on: ubuntu-latest
+    env:
+      FIREBASE_PROJECT_ID: basic-climber-rmbw7
+      FIRESTORE_DATABASE_ID: ai-studio-bioguardx-e1593f08-43df-4912-a9e0-6922af3760d4
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify Firebase project and named database config
+        run: |
+          node -e "
+            const fs = require('node:fs');
+            const rc = JSON.parse(fs.readFileSync('.firebaserc', 'utf8'));
+            const cfg = JSON.parse(fs.readFileSync('firebase.json', 'utf8'));
+            if (rc?.projects?.default !== process.env.FIREBASE_PROJECT_ID) {
+              throw new Error('Unexpected default project in .firebaserc: ' + rc?.projects?.default);
+            }
+            if (cfg?.firestore?.database !== process.env.FIRESTORE_DATABASE_ID) {
+              throw new Error('Unexpected Firestore database in firebase.json: ' + cfg?.firestore?.database);
+            }
+            if (cfg?.firestore?.rules !== 'firestore.rules') {
+              throw new Error('Unexpected Firestore rules path in firebase.json: ' + cfg?.firestore?.rules);
+            }
+            console.log('Verified target:', rc.projects.default, cfg.firestore.database, cfg.firestore.rules);
+          "
+
+      - name: Lint and validate Firestore security rules
+        run: npm run validate:rules
+
+      - name: Run Firestore rules alignment and regression tests
+        run: npm test
+
+      - name: Ensure Firebase deployment secret is configured
+        env:
+          HAS_FIREBASE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT != '' }}
+        run: |
+          if [ "$HAS_FIREBASE_SA" != "true" ]; then
+            echo "::error::Missing required GitHub Actions secret FIREBASE_SERVICE_ACCOUNT (JSON service account key with Cloud Firestore Rules deployment permissions)."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud / Firebase
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+      - name: Dry-run Firestore rules compilation
+        run: npx firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}" --non-interactive --dry-run
+
+      - name: Deploy Firestore rules ONLY to named database
+        run: npm run deploy:rules -- --project "${FIREBASE_PROJECT_ID}" --non-interactive

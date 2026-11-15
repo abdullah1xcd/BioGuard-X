@@ -11,6 +11,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/biometrics.test.ts",
+    "validate:rules": "eslint firestore.rules",
     "deploy:rules": "firebase deploy --only firestore:rules",
     "clean": "rm -rf dist dev-dist server.js"
   },
@@ -32,6 +33,7 @@
     "@eslint/js": "^10.0.1",
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.28.2",
+    "firebase-tools": "15.36.0",
     "globals": "^17.14.0",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",

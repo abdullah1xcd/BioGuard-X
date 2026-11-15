@@ -1577,3 +1577,35 @@ test('Backend Firestore permission (403) and missing-database (404) errors propa
     else process.env.UPSTASH_REDIS_REST_TOKEN = prevUpTok;
   }
 });
+
+test('Firebase CLI and GitHub Actions rules workflow pin firebase-tools, target named database, and validate rules prior to deploy', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')) as {
+    scripts: Record<string, string>;
+    devDependencies: Record<string, string>;
+  };
+  const fbJson = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'firebase.json'), 'utf8')) as {
+    firestore?: { database?: string; rules?: string };
+  };
+  const fbRc = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.firebaserc'), 'utf8')) as {
+    projects?: { default?: string };
+  };
+  const workflowText = fs.readFileSync(
+    path.join(process.cwd(), '.github/workflows/deploy-firestore-rules.yml'),
+    'utf8'
+  );
+  const rulesText = fs.readFileSync(path.join(process.cwd(), 'firestore.rules'), 'utf8');
+
+  assert.equal(fbRc.projects?.default, 'basic-climber-rmbw7');
+  assert.equal(fbJson.firestore?.database, 'ai-studio-bioguardx-e1593f08-43df-4912-a9e0-6922af3760d4');
+  assert.equal(fbJson.firestore?.rules, 'firestore.rules');
+  assert.equal(pkg.scripts['deploy:rules'], 'firebase deploy --only firestore:rules');
+  assert.equal(pkg.scripts['validate:rules'], 'eslint firestore.rules');
+  assert.ok(/^\d+\.\d+\.\d+$/.test(pkg.devDependencies['firebase-tools'] || ''), 'Expected exact pinned firebase-tools version');
+
+  assert.match(workflowText, /branches:\s*\[main\]/);
+  assert.match(workflowText, /secrets\.FIREBASE_SERVICE_ACCOUNT/);
+  assert.match(workflowText, /npm run validate:rules/);
+  assert.match(workflowText, /--only firestore:rules/);
+  assert.match(workflowText, /--dry-run/);
+  assert.match(rulesText, /match \/\{document=\*\*\}\s*\{\s*allow read, write: if false;/);
+});
