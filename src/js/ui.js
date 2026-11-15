@@ -323,7 +323,7 @@ export async function recordMicrophonePCM(durationMs = 2400, onProgress) {
   const processor = ctx.createScriptProcessor(4096, 1, 1);
   const chunks = [];
   const startedAt = performance.now();
-  let sampleRate = ctx.sampleRate;
+  let sampleRate;
 
   try {
     processor.onaudioprocess = (e) => {

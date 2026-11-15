@@ -401,7 +401,6 @@ export function buildBiometricAnalyticsReport(
     (r) => r.datasetCategory !== 'benchmark_eval' || (r.groundTruth !== 'genuine' && r.groundTruth !== 'impostor')
   );
 
-  const evaluatedAll = records.filter((r) => r.outcome === 'match' || r.outcome === 'no_match');
   const successful = records.filter((r) => r.outcome === 'match').length;
   const rejected = records.filter((r) => r.outcome === 'no_match').length;
   const notEvaluated = records.filter((r) => r.outcome === 'not_evaluated' || r.finalDecision === 'INCONCLUSIVE').length;

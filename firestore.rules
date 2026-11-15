@@ -72,12 +72,13 @@ service cloud.firestore {
         data.lastLoginAt is timestamp;
     }
 
-    function isValidAdminGrant(data) {
+    function isValidAdminGrant(data, userId) {
       return data.keys().hasAll(['uid', 'role', 'grantedBy', 'createdAt']) &&
         data.keys().hasOnly(['uid', 'role', 'grantedBy', 'createdAt']) &&
         isValidId(data.uid) &&
+        data.uid == userId &&
         data.role in ['super_admin', 'administrator'] &&
-        data.grantedBy is string && data.grantedBy.size() >= 1 && data.grantedBy.size() <= 128 &&
+        data.grantedBy == request.auth.uid &&
         data.createdAt == request.time;
     }
 
@@ -86,9 +87,11 @@ service cloud.firestore {
         data.keys().hasOnly(['identityId', 'identityRef', 'displayName', 'status', 'registeredModalities', 'featureVersion', 'consentRecorded', 'createdBy', 'createdAt', 'updatedAt']) &&
         isValidId(data.identityId) &&
         data.identityRef is string && data.identityRef.size() >= 2 && data.identityRef.size() <= 64 && data.identityRef.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.identityId == data.identityRef &&
         data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
         data.status in ['active', 'inactive'] &&
         data.registeredModalities is list && data.registeredModalities.size() >= 1 && data.registeredModalities.size() <= 3 &&
+        data.registeredModalities.hasOnly(['face', 'voice', 'fingerprint']) &&
         data.registeredModalities[0] is string &&
         (!('featureVersion' in data) || (data.featureVersion is string && data.featureVersion.size() >= 1 && data.featureVersion.size() <= 32)) &&
         data.consentRecorded == true &&
@@ -120,8 +123,9 @@ service cloud.firestore {
         isValidId(data.verificationId) &&
         data.identityRef is string && data.identityRef.size() >= 2 && data.identityRef.size() <= 64 && data.identityRef.matches('^[a-zA-Z0-9_\\-]+$') &&
         data.modalities is list && data.modalities.size() >= 1 && data.modalities.size() <= 3 &&
+        data.modalities.hasOnly(['face', 'voice', 'fingerprint']) &&
         data.modalities[0] is string &&
-        (!('pipeline' in data) || (data.pipeline is string && data.pipeline.size() <= 64)) &&
+        (!('pipeline' in data) || (data.pipeline is string && data.pipeline.size() >= 1 && data.pipeline.size() <= 64)) &&
         data.outcome in ['match', 'no_match', 'not_evaluated'] &&
         (!('finalDecision' in data) || data.finalDecision in ['VERIFIED', 'REJECTED', 'INCONCLUSIVE']) &&
         data.policyDecision == 'pending' &&
@@ -146,7 +150,7 @@ service cloud.firestore {
         (!('livenessConfidence' in data) || (data.livenessConfidence is number && data.livenessConfidence >= 0 && data.livenessConfidence <= 1)) &&
         (!('confidenceBand' in data) || data.confidenceBand in ['high', 'moderate', 'low']) &&
         (!('conflictDetected' in data) || data.conflictDetected is bool) &&
-        (!('featureVersion' in data) || (data.featureVersion is string && data.featureVersion.size() <= 32)) &&
+        (!('featureVersion' in data) || (data.featureVersion is string && data.featureVersion.size() >= 1 && data.featureVersion.size() <= 32)) &&
         (!('faceScore' in data) || (data.faceScore is number && data.faceScore >= 0 && data.faceScore <= 1)) &&
         (!('voiceScore' in data) || (data.voiceScore is number && data.voiceScore >= 0 && data.voiceScore <= 1)) &&
         (!('fingerprintScore' in data) || (data.fingerprintScore is number && data.fingerprintScore >= 0 && data.fingerprintScore <= 1)) &&
@@ -158,11 +162,11 @@ service cloud.firestore {
         (!('fingerprintStatus' in data) || data.fingerprintStatus in ['MATCH', 'NO MATCH', 'INCONCLUSIVE', 'NOT EVALUATED']) &&
         (!('matchedMinutiae' in data) || (data.matchedMinutiae is number && data.matchedMinutiae >= 0)) &&
         (!('probeMinutiae' in data) || (data.probeMinutiae is number && data.probeMinutiae >= 0)) &&
-        (!('subjectKey' in data) || (data.subjectKey is string && data.subjectKey.size() <= 80)) &&
+        (!('subjectKey' in data) || (data.subjectKey is string && data.subjectKey.size() >= 1 && data.subjectKey.size() <= 80)) &&
         (!('partition' in data) || data.partition in ['eval', 'unassigned']) &&
-        (!('sampleHash' in data) || (data.sampleHash is string && data.sampleHash.size() <= 128)) &&
-        (!('benchmarkBatchId' in data) || (data.benchmarkBatchId is string && data.benchmarkBatchId.size() <= 80)) &&
-        (!('provenanceSignature' in data) || (data.provenanceSignature is string && data.provenanceSignature.size() <= 160)) &&
+        (!('sampleHash' in data) || (data.sampleHash is string && data.sampleHash.size() >= 1 && data.sampleHash.size() <= 128)) &&
+        (!('benchmarkBatchId' in data) || (data.benchmarkBatchId is string && data.benchmarkBatchId.size() >= 1 && data.benchmarkBatchId.size() <= 80)) &&
+        (!('provenanceSignature' in data) || (data.provenanceSignature is string && data.provenanceSignature.size() >= 1 && data.provenanceSignature.size() <= 160)) &&
         data.operatorUid == request.auth.uid &&
         data.createdAt == request.time;
     }
@@ -292,7 +296,9 @@ service cloud.firestore {
           (isOwner(userId) && existing().status == 'active' &&
             incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'theme', 'lastLoginAt']) &&
             incoming().lastLoginAt == request.time) ||
-          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['role', 'status', 'displayName', 'theme', 'lastLoginAt']))
+          (isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['role', 'status', 'displayName', 'photoURL', 'theme', 'lastLoginAt']) &&
+            incoming().lastLoginAt == request.time)
         );
       allow delete: if false;
 
@@ -323,6 +329,7 @@ service cloud.firestore {
         allow create: if isValidId(userId) && isValidId(identityId) && isVerifiedUser() && isOwner(userId) &&
           isValidBiometricIdentity(incoming()) &&
           incoming().identityId == identityId &&
+          incoming().identityRef == identityId &&
           incoming().createdBy == request.auth.uid &&
           incoming().createdAt == request.time &&
           incoming().updatedAt == request.time &&
@@ -362,7 +369,9 @@ service cloud.firestore {
           isValidVerificationRecord(incoming()) &&
           incoming().verificationId == verificationId &&
           canWriteOwnWorkspace(userId) &&
-          exists(/databases/$(database)/documents/users/$(userId)/identities/$(incoming().identityRef));
+          exists(/databases/$(database)/documents/users/$(userId)/identities/$(request.resource.data.identityRef)) &&
+          get(/databases/$(database)/documents/users/$(userId)/identities/$(request.resource.data.identityRef)).data.status == 'active' &&
+          get(/databases/$(database)/documents/users/$(userId)/identities/$(request.resource.data.identityRef)).data.identityRef == request.resource.data.identityRef;
         allow update, delete: if false;
       }
 
@@ -468,7 +477,7 @@ service cloud.firestore {
           incoming().updatedAt == request.time &&
           !('reviewedBy' in incoming()) &&
           canWriteOwnWorkspace(userId) &&
-          exists(/databases/$(database)/documents/users/$(userId)/identities/$(incoming().targetIdentityRef));
+          exists(/databases/$(database)/documents/users/$(userId)/identities/$(request.resource.data.targetIdentityRef));
         allow update: if isValidId(userId) && isValidId(requestId) && isVerifiedUser() && isOwner(userId) &&
           isValidApprovalRequest(incoming()) &&
           existing().status == 'pending' &&
@@ -488,9 +497,9 @@ service cloud.firestore {
     }
 
     match /admins/{userId} {
-      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow get: if isValidId(userId) && isVerifiedUser() && (isOwner(userId) || isAdmin());
       allow list: if isAdmin();
-      allow create: if isValidId(userId) && isValidAdminGrant(incoming()) && (isAdmin() || (isBootstrappedAdmin() && isOwner(userId)));
+      allow create: if isValidId(userId) && isVerifiedUser() && isValidAdminGrant(incoming(), userId) && (isAdmin() || (isBootstrappedAdmin() && isOwner(userId)));
       allow update, delete: if isValidId(userId) && isAdmin() && userId != request.auth.uid;
     }
   }

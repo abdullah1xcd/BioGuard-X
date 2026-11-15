@@ -1090,9 +1090,12 @@ export function renderEnrollment(container, { appState, navigate }) {
       haltCameraUI();
     } catch (err) {
       const code = String(err?.code || '');
+      const stage = String(err?.operationStage || '');
       const status = Number(err?.status || 0);
       const heading =
-        code === 'vault_secret_not_configured'
+        stage === 'identity_enrollment'
+          ? 'Identity Metadata Enrollment Failed'
+          : code === 'vault_secret_not_configured'
           ? 'Vault Encryption Secret Not Configured'
           : code.startsWith('firestore_')
           ? 'Firestore Configuration / Permission Error'
@@ -2115,9 +2118,9 @@ export function renderVerification(container, { appState, navigate }) {
                 <span aria-hidden="true">·</span>
                 <span>Threshold: <strong class="mono">${fmtPct(res.threshold)}</strong>${res.adaptiveApplied ? ` (base ${fmtPct(res.baseThreshold)})` : ''}</span>
                 <span aria-hidden="true">·</span>
-                <span>Trial: <strong class="mono">${escapeHtml(groundTruth)}</strong></span>
+                <span>Trial: <strong class="mono">${escapeHtml(authGroundTruth)}</strong></span>
                 <span aria-hidden="true">·</span>
-                <span>Dataset: <strong class="mono">${escapeHtml(datasetCategory)}</strong></span>
+                <span>Dataset: <strong class="mono">${escapeHtml(authDatasetCategory)}</strong></span>
               </div>
 
               ${
@@ -2163,7 +2166,24 @@ export function renderVerification(container, { appState, navigate }) {
         });
       });
     } catch (err) {
-      resultEl.innerHTML = `<div class="notice-strip danger"><div><strong>Verification / Quality Gate Rejected</strong><div>${escapeHtml(err.message)}</div></div></div>`;
+      const stage = String(err?.operationStage || '');
+      const code = String(err?.code || '');
+      const status = Number(err?.status || 0);
+      const heading =
+        stage === 'identity_lookup'
+          ? 'Identity Metadata Lookup Failed'
+          : stage === 'verification_record_validation'
+          ? 'Verification Record Validation Error'
+          : stage === 'verification_record_creation'
+          ? 'Firestore Verification Record Permission / Write Error'
+          : stage === 'audit_logging'
+          ? 'Audit Log Persistence Error'
+          : code.startsWith('firestore_')
+          ? 'Firestore Permission / Configuration Error'
+          : status >= 500
+          ? 'Backend Verification Request Failed'
+          : 'Verification / Quality Gate Rejected';
+      resultEl.innerHTML = `<div class="notice-strip danger"><div><strong>${escapeHtml(heading)}</strong><div>${escapeHtml(err.message)}</div></div></div>`;
       showToast(err.message, 'danger');
     } finally {
       runBtn.disabled = false; runBtn.textContent = 'Verify Identity';

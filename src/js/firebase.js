@@ -70,7 +70,7 @@ export function getFirestoreTelemetry() {
   };
 }
 
-export function handleFirestoreError(error, operationType, path) {
+export function handleFirestoreError(error, operationType, path, operationStage = null) {
   const errInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
@@ -88,8 +88,15 @@ export function handleFirestoreError(error, operationType, path) {
     operationType,
     path,
   };
-  console.error('Firestore Error:', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
+  const serialized = JSON.stringify(errInfo);
+  console.error('Firestore Error:', serialized);
+  const wrapped = Object.assign(new Error(serialized, { cause: error }), {
+    operationStage: operationStage || error?.operationStage || operationType,
+    operationType,
+    path,
+    isFirestoreError: true,
+  });
+  throw wrapped;
 }
 
 // Connection check on boot
@@ -161,15 +168,37 @@ function makeId(prefix) {
 }
 
 const BOOTSTRAPPED_ADMIN_EMAIL = 'abdullahmohamedharoon8@gmail.com';
+const VALID_IDENTITY_RE = /^[a-zA-Z0-9_-]{2,64}$/;
+const SUPPORTED_MODALITIES = new Set(['face', 'voice', 'fingerprint']);
 
-// Provision or refresh user profile in /users/{uid}
+function makeDiagnosticError(message, operationStage, code) {
+  const err = new Error(message);
+  err.operationStage = operationStage;
+  err.code = code || operationStage;
+  return err;
+}
+
+// Idempotent user provisioning & bootstrap admin self-healing in /users/{uid} and /admins/{uid}
 export async function provisionUserProfile(fbUser) {
+  if (!fbUser?.uid) {
+    throw makeDiagnosticError('Authenticated user UID is missing.', 'user_profile_provisioning', 'missing_uid');
+  }
+  if (!fbUser.emailVerified) {
+    throw makeDiagnosticError(
+      'Verified Google email address is required before provisioning profile.',
+      'user_profile_provisioning',
+      'email_not_verified'
+    );
+  }
+
   const userPath = `users/${fbUser.uid}`;
   const ref = doc(db, 'users', fbUser.uid);
+  const adminRef = doc(db, 'admins', fbUser.uid);
+  const isBootstrap = fbUser.emailVerified === true && fbUser.email === BOOTSTRAPPED_ADMIN_EMAIL;
+
   try {
     const snap = await getDoc(ref);
     if (!snap.exists()) {
-      const isBootstrap = fbUser.emailVerified && fbUser.email === BOOTSTRAPPED_ADMIN_EMAIL;
       const initialRole = isBootstrap ? 'super_admin' : 'operator';
       const fallbackEmail = `${fbUser.uid}@users.local`;
       const payload = {
@@ -185,12 +214,15 @@ export async function provisionUserProfile(fbUser) {
       };
       await setDoc(ref, payload);
       if (isBootstrap) {
-        await setDoc(doc(db, 'admins', fbUser.uid), {
-          uid: fbUser.uid,
-          role: 'super_admin',
-          grantedBy: fbUser.uid,
-          createdAt: serverTimestamp(),
-        });
+        const adminSnap = await getDoc(adminRef);
+        if (!adminSnap.exists()) {
+          await setDoc(adminRef, {
+            uid: fbUser.uid,
+            role: 'super_admin',
+            grantedBy: fbUser.uid,
+            createdAt: serverTimestamp(),
+          });
+        }
       }
       const created = await getDoc(ref);
       return created.data();
@@ -201,12 +233,29 @@ export async function provisionUserProfile(fbUser) {
         photoURL: (fbUser.photoURL || existingData.photoURL || '').slice(0, 500),
         lastLoginAt: serverTimestamp(),
       };
+      // Never downgrade existing admin privileges; heal bootstrap admin only if role/status is incomplete
+      if (isBootstrap) {
+        if (existingData.role !== 'super_admin') updates.role = 'super_admin';
+        if (existingData.status !== 'active') updates.status = 'active';
+      }
       await updateDoc(ref, updates);
+      if (isBootstrap) {
+        const adminSnap = await getDoc(adminRef);
+        if (!adminSnap.exists()) {
+          await setDoc(adminRef, {
+            uid: fbUser.uid,
+            role: 'super_admin',
+            grantedBy: fbUser.uid,
+            createdAt: serverTimestamp(),
+          });
+        }
+      }
       const updated = await getDoc(ref);
       return updated.data();
     }
   } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, userPath);
+    if (err?.operationStage) throw err;
+    handleFirestoreError(err, OperationType.WRITE, userPath, 'user_profile_provisioning');
   }
 }
 
@@ -236,19 +285,42 @@ export async function listUsersForAdmin() {
 // Identities Metadata (NO vectors stored here; isolated per Google UID)
 export async function saveIdentityMetadata({ identityRef, displayName, registeredModalities, featureVersion }) {
   const uid = auth.currentUser?.uid;
-  if (!uid) throw new Error('Not signed in');
-  const path = `users/${uid}/identities/${identityRef}`;
+  if (!uid) throw makeDiagnosticError('Not signed in.', 'identity_enrollment', 'unauthenticated');
+  const cleanRef = String(identityRef || '').trim();
+  if (!VALID_IDENTITY_RE.test(cleanRef)) {
+    throw makeDiagnosticError(
+      'Invalid identity reference ID (must be 2-64 alphanumeric, underscore, or hyphen characters).',
+      'identity_enrollment',
+      'invalid_identity_ref'
+    );
+  }
+  const cleanName = String(displayName || '').trim().slice(0, 120);
+  if (!cleanName) {
+    throw makeDiagnosticError('Identity display name is required.', 'identity_enrollment', 'invalid_display_name');
+  }
+  const cleanModalities = Array.isArray(registeredModalities)
+    ? [...new Set(registeredModalities.filter((m) => SUPPORTED_MODALITIES.has(m)))].slice(0, 3)
+    : [];
+  if (cleanModalities.length === 0) {
+    throw makeDiagnosticError(
+      'At least one supported biometric modality (face, voice, fingerprint) is required for enrollment.',
+      'identity_enrollment',
+      'invalid_modalities'
+    );
+  }
+
+  const path = `users/${uid}/identities/${cleanRef}`;
   try {
-    const ref = doc(db, 'users', uid, 'identities', identityRef);
+    const ref = doc(db, 'users', uid, 'identities', cleanRef);
     const snap = await getDoc(ref);
     if (!snap.exists()) {
       await setDoc(ref, {
-        identityId: identityRef,
-        identityRef,
-        displayName: displayName.slice(0, 120),
+        identityId: cleanRef,
+        identityRef: cleanRef,
+        displayName: cleanName,
         status: 'active',
-        registeredModalities: registeredModalities.slice(0, 3),
-        featureVersion: featureVersion || 'v1.0-classical',
+        registeredModalities: cleanModalities,
+        featureVersion: String(featureVersion || 'v2.0-multimodal').slice(0, 32),
         consentRecorded: true,
         createdBy: uid,
         createdAt: serverTimestamp(),
@@ -256,14 +328,15 @@ export async function saveIdentityMetadata({ identityRef, displayName, registere
       });
     } else {
       await updateDoc(ref, {
-        displayName: displayName.slice(0, 120),
-        registeredModalities: registeredModalities.slice(0, 3),
-        featureVersion: featureVersion || 'v1.0-classical',
+        displayName: cleanName,
+        registeredModalities: cleanModalities,
+        featureVersion: String(featureVersion || 'v2.0-multimodal').slice(0, 32),
         updatedAt: serverTimestamp(),
       });
     }
   } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, path);
+    if (err?.operationStage) throw err;
+    handleFirestoreError(err, OperationType.WRITE, path, 'identity_enrollment');
   }
 }
 
@@ -297,7 +370,7 @@ export function subscribeIdentities(_role, uid, onData, onErr) {
   const q = query(collection(db, 'users', uid, 'identities'), orderBy('updatedAt', 'desc'), limit(150));
   return onSnapshot(
     q,
-    (snap) => onData(snap.docs.map((d) => d.data())),
+    (snap) => onData(snap.docs.map((d) => ({ ...d.data(), _docId: d.id }))),
     (err) => {
       if (onErr) onErr(err);
       else handleFirestoreError(err, OperationType.LIST, path);
@@ -342,40 +415,96 @@ export async function recordVerificationMetadata({
   provenanceSignature,
 }) {
   const uid = auth.currentUser?.uid;
-  if (!uid) throw new Error('Not signed in');
+  if (!uid) throw makeDiagnosticError('Not signed in.', 'verification_record_validation', 'unauthenticated');
+
+  const cleanIdentityRef = String(identityRef || '').trim();
+  if (!VALID_IDENTITY_RE.test(cleanIdentityRef)) {
+    throw makeDiagnosticError(
+      'Verification record rejected: invalid identity reference (must be 2-64 alphanumeric, underscore, or hyphen characters).',
+      'verification_record_validation',
+      'invalid_identity_ref'
+    );
+  }
+
+  const safeModalities = Array.isArray(modalities)
+    ? [...new Set(modalities.filter((item) => SUPPORTED_MODALITIES.has(item)))].slice(0, 3)
+    : [];
+  if (safeModalities.length === 0) {
+    throw makeDiagnosticError(
+      'Verification record rejected: at least one supported modality (face, voice, or fingerprint) is required.',
+      'verification_record_validation',
+      'invalid_modalities'
+    );
+  }
+
+  if (!['match', 'no_match', 'not_evaluated'].includes(outcome)) {
+    throw makeDiagnosticError(
+      `Verification record rejected: invalid outcome "${String(outcome)}".`,
+      'verification_record_validation',
+      'invalid_outcome'
+    );
+  }
+
+  // Verify the referenced identity metadata exists, belongs to this workspace, and is active before creating a record
+  const identityPath = `users/${uid}/identities/${cleanIdentityRef}`;
+  try {
+    const idSnap = await getDoc(doc(db, 'users', uid, 'identities', cleanIdentityRef));
+    if (!idSnap.exists()) {
+      throw makeDiagnosticError(
+        `Identity metadata not found at "${identityPath}". Re-enroll identity metadata before verifying.`,
+        'identity_lookup',
+        'identity_metadata_missing'
+      );
+    }
+    const idData = idSnap.data();
+    if (idData.status !== 'active') {
+      throw makeDiagnosticError(
+        `Identity "${cleanIdentityRef}" is currently "${idData.status}" and cannot accept new verification records.`,
+        'identity_lookup',
+        'identity_inactive'
+      );
+    }
+    if (idData.identityRef !== cleanIdentityRef) {
+      throw makeDiagnosticError(
+        `Identity metadata integrity mismatch at "${identityPath}" (document identityRef="${idData.identityRef}").`,
+        'identity_lookup',
+        'identity_ref_mismatch'
+      );
+    }
+  } catch (err) {
+    if (err?.operationStage) throw err;
+    handleFirestoreError(err, OperationType.GET, identityPath, 'identity_lookup');
+  }
+
   const verificationId = makeId('ver');
   const path = `users/${uid}/verification_records/${verificationId}`;
   const t0 = performance.now();
+  let debugSummary = null;
   try {
     // Build a Firestore-rules-safe record. Matcher telemetry can contain NaN/Infinity
     // when a modality is unavailable; those values must never be sent to Firestore.
-    const safeModalities = Array.isArray(modalities)
-      ? modalities.filter((item) => typeof item === 'string' && item.length > 0).slice(0, 3)
-      : [];
-    if (!identityRef || typeof identityRef !== 'string' || identityRef.length > 64) {
-      throw new Error('Verification record rejected: invalid identity reference.');
-    }
-    if (safeModalities.length === 0) {
-      throw new Error('Verification record rejected: no valid modalities were evaluated.');
-    }
-    const safeOutcome = ['match', 'no_match', 'not_evaluated'].includes(outcome) ? outcome : 'not_evaluated';
+    const safeOutcome = outcome;
     const safeGroundTruth = ['genuine', 'impostor', 'unlabeled'].includes(groundTruth) ? groundTruth : 'unlabeled';
     const derivedDatasetCategory = ['operational', 'synthetic_qa', 'benchmark_eval'].includes(datasetCategory)
       ? datasetCategory
-      : (isTestProbe ? 'synthetic_qa' : safeGroundTruth !== 'unlabeled' ? 'benchmark_eval' : 'operational');
+      : isTestProbe
+      ? 'synthetic_qa'
+      : 'operational';
     const finiteClamp = (value, min, max, digits = 3) =>
       typeof value === 'number' && Number.isFinite(value)
         ? Number(Math.min(max, Math.max(min, value)).toFixed(digits))
         : null;
     const safeScore = finiteClamp(score, 0, 1, 4);
+    const cleanPipeline = String(pipeline || 'hierarchical').trim().slice(0, 64) || 'hierarchical';
+    const cleanReasonCode = String(reasonCode || 'evaluated').trim().slice(0, 80) || 'evaluated';
     const docData = {
       verificationId,
-      identityRef,
+      identityRef: cleanIdentityRef,
       modalities: safeModalities,
-      pipeline: String(pipeline || 'hierarchical').slice(0, 64),
+      pipeline: cleanPipeline,
       outcome: safeOutcome,
       policyDecision: 'pending',
-      reasonCode: String(reasonCode || 'evaluated').slice(0, 80),
+      reasonCode: cleanReasonCode,
       score: safeScore ?? 0,
       operatorUid: uid,
       datasetCategory: derivedDatasetCategory,
@@ -399,7 +528,7 @@ export async function recordVerificationMetadata({
     if (typeof livenessPassed === 'boolean') docData.livenessPassed = livenessPassed;
     { const value = finiteClamp(livenessScore, 0, 1, 2); if (value !== null) docData.livenessScore = value; }
     if (typeof adaptiveApplied === 'boolean') docData.adaptiveApplied = adaptiveApplied;
-    if (['genuine', 'impostor', 'unlabeled'].includes(groundTruth)) docData.groundTruth = groundTruth;
+    docData.groundTruth = safeGroundTruth;
     if (typeof isTestProbe === 'boolean') docData.isTestProbe = isTestProbe;
     if (typeof processingTimeMs === 'number' && Number.isFinite(processingTimeMs)) {
       docData.processingTimeMs = Math.min(120000, Math.max(0, Number(processingTimeMs.toFixed(1))));
@@ -418,43 +547,43 @@ export async function recordVerificationMetadata({
     }
     if (['high', 'moderate', 'low'].includes(confidenceBand)) docData.confidenceBand = confidenceBand;
     if (typeof conflictDetected === 'boolean') docData.conflictDetected = conflictDetected;
-    if (typeof featureVersion === 'string' && featureVersion.length > 0) {
-      docData.featureVersion = featureVersion.slice(0, 32);
+    if (typeof featureVersion === 'string' && featureVersion.trim().length > 0) {
+      docData.featureVersion = featureVersion.trim().slice(0, 32);
     }
-    if (typeof subjectKey === 'string' && subjectKey.length > 0) {
-      docData.subjectKey = subjectKey.slice(0, 80);
+    if (typeof subjectKey === 'string' && subjectKey.trim().length > 0) {
+      docData.subjectKey = subjectKey.trim().slice(0, 80);
     }
     if (partition === 'eval' || partition === 'unassigned') {
       docData.partition = partition;
     }
-    if (typeof sampleHash === 'string' && sampleHash.length > 0) {
-      docData.sampleHash = sampleHash.slice(0, 128);
+    if (typeof sampleHash === 'string' && sampleHash.trim().length > 0) {
+      docData.sampleHash = sampleHash.trim().slice(0, 128);
     }
-    if (typeof benchmarkBatchId === 'string' && benchmarkBatchId.length > 0) {
-      docData.benchmarkBatchId = benchmarkBatchId.slice(0, 80);
+    if (typeof benchmarkBatchId === 'string' && benchmarkBatchId.trim().length > 0) {
+      docData.benchmarkBatchId = benchmarkBatchId.trim().slice(0, 80);
     }
-    if (typeof provenanceSignature === 'string' && provenanceSignature.length > 0) {
-      docData.provenanceSignature = provenanceSignature.slice(0, 160);
+    if (typeof provenanceSignature === 'string' && provenanceSignature.trim().length > 0) {
+      docData.provenanceSignature = provenanceSignature.trim().slice(0, 160);
     }
 
     if (modalityEvaluations?.face) {
       { const value = finiteClamp(modalityEvaluations.face.score, 0, 1, 4); if (value !== null) docData.faceScore = value; }
       { const value = finiteClamp(modalityEvaluations.face.qualityScore, 0, 100, 0); if (value !== null) docData.faceQuality = value; }
-      if (['MATCH', 'NO MATCH', 'INCONCLUSIVE'].includes(modalityEvaluations.face.status)) {
+      if (['MATCH', 'NO MATCH', 'INCONCLUSIVE', 'NOT EVALUATED'].includes(modalityEvaluations.face.status)) {
         docData.faceStatus = modalityEvaluations.face.status;
       }
     }
     if (modalityEvaluations?.voice) {
       { const value = finiteClamp(modalityEvaluations.voice.score, 0, 1, 4); if (value !== null) docData.voiceScore = value; }
       { const value = finiteClamp(modalityEvaluations.voice.qualityScore, 0, 100, 0); if (value !== null) docData.voiceQuality = value; }
-      if (['MATCH', 'NO MATCH', 'INCONCLUSIVE'].includes(modalityEvaluations.voice.status)) {
+      if (['MATCH', 'NO MATCH', 'INCONCLUSIVE', 'NOT EVALUATED'].includes(modalityEvaluations.voice.status)) {
         docData.voiceStatus = modalityEvaluations.voice.status;
       }
     }
     if (modalityEvaluations?.fingerprint) {
       { const value = finiteClamp(modalityEvaluations.fingerprint.score, 0, 1, 4); if (value !== null) docData.fingerprintScore = value; }
       { const value = finiteClamp(modalityEvaluations.fingerprint.qualityScore, 0, 100, 0); if (value !== null) docData.fingerprintQuality = value; }
-      if (['MATCH', 'NO MATCH', 'INCONCLUSIVE'].includes(modalityEvaluations.fingerprint.status)) {
+      if (['MATCH', 'NO MATCH', 'INCONCLUSIVE', 'NOT EVALUATED'].includes(modalityEvaluations.fingerprint.status)) {
         docData.fingerprintStatus = modalityEvaluations.fingerprint.status;
       }
       const fpDet = modalityEvaluations.fingerprint.details || {};
@@ -466,12 +595,25 @@ export async function recordVerificationMetadata({
       }
     }
 
+    debugSummary = {
+      identityRef: cleanIdentityRef,
+      modalities: safeModalities,
+      pipeline: cleanPipeline,
+      outcome: safeOutcome,
+      finalDecision: docData.finalDecision,
+      livenessStatus: docData.livenessStatus,
+      reasonCode: cleanReasonCode,
+      datasetCategory: derivedDatasetCategory,
+      fieldKeys: Object.keys(docData),
+    };
     await setDoc(doc(db, 'users', uid, 'verification_records', verificationId), docData);
     trackFsOp('write', t0, true);
     return verificationId;
   } catch (err) {
     trackFsOp('write', t0, false);
-    handleFirestoreError(err, OperationType.CREATE, path);
+    if (err?.operationStage) throw err;
+    console.error('Verification record write failed; safe payload summary:', debugSummary);
+    handleFirestoreError(err, OperationType.CREATE, path, 'verification_record_creation');
   }
 }
 
@@ -481,7 +623,7 @@ export function subscribeVerificationRecords(_role, uid, onData) {
   return onSnapshot(
     q,
     (snap) => onData(snap.docs.map((d) => d.data())),
-    (err) => handleFirestoreError(err, OperationType.LIST, path)
+    (err) => handleFirestoreError(err, OperationType.LIST, path, 'verification_record_read')
   );
 }
 
@@ -495,16 +637,16 @@ export async function appendAuditLog({ action, resourceType, resourceId, result,
     await setDoc(doc(db, 'users', uid, 'audit_logs', eventId), {
       eventId,
       actorUid: uid,
-      action: String(action).slice(0, 80),
-      resourceType: String(resourceType).slice(0, 64),
-      resourceId: String(resourceId).slice(0, 128),
-      result: String(result).slice(0, 240),
-      requestId: String(requestId || makeId('req')).slice(0, 128),
+      action: String(action || 'event').trim().slice(0, 80) || 'event',
+      resourceType: String(resourceType || 'system').trim().slice(0, 64) || 'system',
+      resourceId: String(resourceId || uid).trim().slice(0, 128) || uid,
+      result: String(result || 'recorded').trim().slice(0, 240) || 'recorded',
+      requestId: String(requestId || makeId('req')).trim().slice(0, 128) || makeId('req'),
       timestamp: serverTimestamp(),
     });
     return eventId;
   } catch (err) {
-    handleFirestoreError(err, OperationType.CREATE, path);
+    handleFirestoreError(err, OperationType.CREATE, path, 'audit_logging');
   }
 }
 

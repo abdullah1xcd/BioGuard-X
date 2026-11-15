@@ -291,7 +291,7 @@ export function fuseMultimodalScores(params: {
   }
 
   const livenessDecision: LivenessDecision =
-    livenessStatus === 'LIVENESS FAILED' || livenessPassed === false
+    livenessStatus === 'LIVENESS FAILED'
       ? 'FAILED'
       : livenessStatus === 'LIVENESS PASSED'
       ? 'PASSED'

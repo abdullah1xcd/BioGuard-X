@@ -151,18 +151,46 @@ function syncOfflineBanner() {
 
 export function initPwaUI() {
   if ('serviceWorker' in navigator) {
-    try {
-      registerSW({
-        immediate: true,
-        onRegisteredSW() {
-          swRegistered = true;
-        },
-        onNeedRefresh() {
-          showToast('A newer BioGuard X build is ready; reload to apply the update.', 'neutral');
-        },
-      });
-    } catch {
-      // Ignore SW registration failures on restricted contexts
+    if (import.meta.env.DEV) {
+      const hadController = Boolean(navigator.serviceWorker.controller);
+      navigator.serviceWorker
+        .getRegistrations()
+        .then((regs) => Promise.all(regs.map((r) => r.unregister())))
+        .then(async (results) => {
+          if ('caches' in window) {
+            const keys = await caches.keys();
+            await Promise.all(
+              keys
+                .filter((k) => k.startsWith('workbox-') || k.includes('precache'))
+                .map((k) => caches.delete(k))
+            );
+          }
+          if (hadController && results.some(Boolean)) {
+            window.location.reload();
+          }
+        })
+        .catch(() => null);
+    } else {
+      try {
+        let refreshing = false;
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+          if (refreshing) return;
+          refreshing = true;
+          window.location.reload();
+        });
+        registerSW({
+          immediate: true,
+          onRegisteredSW(_swUrl, registration) {
+            swRegistered = true;
+            registration?.update().catch(() => null);
+          },
+          onNeedRefresh() {
+            showToast('Updating BioGuard X to the latest build...', 'neutral');
+          },
+        });
+      } catch {
+        // Ignore SW registration failures on restricted contexts
+      }
     }
   }
 

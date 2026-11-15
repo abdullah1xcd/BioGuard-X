@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 
 process.env.BIOGUARD_SKIP_LISTEN = '1';
@@ -1359,18 +1361,25 @@ test('Production fail-closed signing keys, Firestore CAS rate limiter retries & 
 });
 
 test('Benchmark provenance enforces benchmark_eval isolation, sampleHash deduplication & subject-disjoint splits', () => {
-  const mkEval = (id: string, subjectKey: string, genuine: boolean, score: number, sampleHash: string, partition = 'eval') => ({
+  const mkEval = (
+    id: string,
+    subjectKey: string,
+    genuine: boolean,
+    score: number,
+    sampleHash: string,
+    partition: 'train' | 'eval' = 'eval'
+  ) => ({
     identityRef: id,
     subjectKey,
-    datasetCategory: 'benchmark_eval',
+    datasetCategory: 'benchmark_eval' as const,
     partition,
     sampleHash,
-    groundTruth: genuine ? 'genuine' : 'impostor',
+    groundTruth: (genuine ? 'genuine' : 'impostor') as 'genuine' | 'impostor',
     isTestProbe: false,
     score,
-    outcome: score >= 0.72 ? 'match' : 'no_match',
-    finalDecision: score >= 0.72 ? 'VERIFIED' : 'REJECTED',
-    livenessStatus: 'LIVENESS PASSED',
+    outcome: (score >= 0.72 ? 'match' : 'no_match') as 'match' | 'no_match',
+    finalDecision: (score >= 0.72 ? 'VERIFIED' : 'REJECTED') as 'VERIFIED' | 'REJECTED',
+    livenessStatus: 'LIVENESS PASSED' as const,
   });
 
   // 1. Repeated sampleHash deduplicated + synthetic_qa / train partition excluded
@@ -1409,7 +1418,68 @@ test('Benchmark provenance enforces benchmark_eval isolation, sampleHash dedupli
     6
   );
   assert.equal(leakyReport.datasets.benchmark.subjectOverlapDetected, true);
-  assert.equal(leakyReport.classification.subjectOverlapDetected, true);
   assert.equal(leakyReport.classification.insufficientData, true);
+  assert.match(leakyReport.classification.insufficientReason, /overlapping subjectKey/);
 });
+
+test('Firestore security rules stay strictly aligned with VerificationRecord writes, active identity enforcement, and admin/user updates', () => {
+  const rulesText = fs.readFileSync(path.join(process.cwd(), 'firestore.rules'), 'utf8');
+  const firebaseJsText = fs.readFileSync(path.join(process.cwd(), 'src/js/firebase.js'), 'utf8');
+  const pagesCoreText = fs.readFileSync(path.join(process.cwd(), 'src/js/pages_core.js'), 'utf8');
+  const blueprint = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'firebase-blueprint.json'), 'utf8')) as {
+    entities: { VerificationRecord: { properties: Record<string, unknown>; required: string[] } };
+  };
+
+  // 1. Extract allowlist keys from isValidVerificationRecord(data) in firestore.rules
+  const vrFnMatch = rulesText.match(/function isValidVerificationRecord\(data\)\s*\{[\s\S]*?data\.keys\(\)\.hasOnly\(\[([\s\S]*?)\]\)/);
+  assert.ok(vrFnMatch, 'Expected data.keys().hasOnly([...]) inside isValidVerificationRecord');
+  const allowedVrKeys = new Set(
+    [...vrFnMatch[1].matchAll(/'([^']+)'/g)].map((m) => m[1])
+  );
+
+  // Extract every key assigned to docData inside recordVerificationMetadata in src/js/firebase.js
+  const recordFnMatch = firebaseJsText.match(/export async function recordVerificationMetadata\([\s\S]*?await setDoc\(doc\(db, 'users', uid, 'verification_records', verificationId\), docData\);/);
+  assert.ok(recordFnMatch, 'Expected recordVerificationMetadata body in src/js/firebase.js');
+  const writtenKeys = new Set<string>();
+  for (const m of recordFnMatch[0].matchAll(/docData\.([a-zA-Z0-9_]+)\s*=/g)) {
+    writtenKeys.add(m[1]);
+  }
+  const baseObjMatch = recordFnMatch[0].match(/const docData = \{([\s\S]*?)\};/);
+  assert.ok(baseObjMatch, 'Expected const docData = {...} in recordVerificationMetadata');
+  for (const m of baseObjMatch[1].matchAll(/^\s*([a-zA-Z0-9_]+)(?:\s*:|\s*,)/gm)) {
+    writtenKeys.add(m[1]);
+  }
+
+  for (const key of writtenKeys) {
+    assert.ok(allowedVrKeys.has(key), `Key "${key}" written by recordVerificationMetadata must be allowed in firestore.rules isValidVerificationRecord`);
+    assert.ok(
+      key in blueprint.entities.VerificationRecord.properties,
+      `Key "${key}" written by recordVerificationMetadata must exist in firebase-blueprint.json VerificationRecord.properties`
+    );
+  }
+  for (const key of allowedVrKeys) {
+    assert.ok(
+      key in blueprint.entities.VerificationRecord.properties,
+      `Allowed key "${key}" in firestore.rules must exist in firebase-blueprint.json`
+    );
+  }
+
+  // 2. Verify provenance fields specifically present so benchmark/operational writes are never rejected
+  for (const reqProvenanceKey of ['subjectKey', 'partition', 'sampleHash', 'benchmarkBatchId', 'provenanceSignature']) {
+    assert.ok(allowedVrKeys.has(reqProvenanceKey), `Expected "${reqProvenanceKey}" in isValidVerificationRecord allowlist`);
+  }
+
+  // 3. Verify rules enforce active identity lookup, identityRef consistency, photoURL in admin update, and strict admin grant checks
+  assert.match(rulesText, /get\(\/databases\/\$\(database\)\/documents\/users\/\$\(userId\)\/identities\/\$\(request\.resource\.data\.identityRef\)\)\.data\.status == 'active'/);
+  assert.match(rulesText, /get\(\/databases\/\$\(database\)\/documents\/users\/\$\(userId\)\/identities\/\$\(request\.resource\.data\.identityRef\)\)\.data\.identityRef == request\.resource\.data\.identityRef/);
+  assert.match(rulesText, /function isValidAdminGrant\(data, userId\)[\s\S]*?data\.uid == userId[\s\S]*?data\.grantedBy == request\.auth\.uid/);
+  assert.match(rulesText, /isAdmin\(\)[\s\S]*?affectedKeys\(\)\.hasOnly\(\['role', 'status', 'displayName', 'photoURL', 'theme', 'lastLoginAt'\]\)/);
+
+  // 4. Ensure pages_core.js does not mislabel Firestore permission errors as Quality Gate rejections
+  assert.doesNotMatch(pagesCoreText, /datasetCategory === 'benchmark_eval' \? 'Benchmark Eval' : datasetCategory/);
+  assert.match(pagesCoreText, /Firestore Verification Record Permission \/ Write Error/);
+  assert.match(pagesCoreText, /Identity Metadata Lookup Failed/);
+  assert.match(firebaseJsText, /operationStage:\s*operationStage/);
+});
+
 
