@@ -3073,15 +3073,53 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 function registerProductionFrontend() {
   const publicDir = path.join(rootDir, 'public');
-  app.use(express.static(publicDir));
+  app.use(
+    express.static(publicDir, {
+      setHeaders(res, filePath) {
+        if (
+          filePath.endsWith(`${path.sep}index.html`) ||
+          filePath.endsWith(`${path.sep}sw.js`) ||
+          filePath.endsWith(`${path.sep}manifest.webmanifest`)
+        ) {
+          res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+        }
+      },
+    })
+  );
   app.get('*', (_req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     res.sendFile(path.join(publicDir, 'index.html'));
   });
 }
 
+const DEV_SW_UNREGISTER_SCRIPT = `
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => {
+  event.waitUntil((async () => {
+    try {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+    } catch {}
+    await self.registration.unregister();
+    const clientsList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    for (const client of clientsList) {
+      if ('navigate' in client) client.navigate(client.url);
+    }
+  })());
+});
+`.trim();
+
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const publicDir = path.join(rootDir, 'public');
+    // Force any legacy/dev Service Worker on ais-dev to unregister & purge Workbox caches cleanly
+    for (const swPath of ['/sw.js', '/dev-sw.js']) {
+      app.get(swPath, (_req: Request, res: Response) => {
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+        res.send(DEV_SW_UNREGISTER_SCRIPT);
+      });
+    }
     // Serve local ML model weights & PWA icon assets during Vite dev middleware mode
     app.use('/models', express.static(path.join(publicDir, 'models'), { index: false }));
     for (const iconFile of [
