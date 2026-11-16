@@ -25,6 +25,10 @@ import {
   serverTimestamp,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
+import {
+  buildVerificationRecordPayload,
+  validateVerificationRecordDoc,
+} from '../shared/verificationRecord.ts';
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
@@ -70,7 +74,7 @@ export function getFirestoreTelemetry() {
   };
 }
 
-export function handleFirestoreError(error, operationType, path, operationStage = null) {
+export function handleFirestoreError(error, operationType, path, operationStage = null, payloadSummary = null) {
   const errInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
@@ -98,6 +102,7 @@ export function handleFirestoreError(error, operationType, path, operationStage 
     operationStage: operationStage || error?.operationStage || operationType,
     operationType,
     path,
+    ...(payloadSummary ? { payloadSummary } : {}),
     isFirestoreError: true,
   });
   throw wrapped;
@@ -487,129 +492,64 @@ export async function recordVerificationMetadata({
   const t0 = performance.now();
   let debugSummary = null;
   try {
-    // Build a Firestore-rules-safe record. Matcher telemetry can contain NaN/Infinity
-    // when a modality is unavailable; those values must never be sent to Firestore.
-    const safeOutcome = outcome;
-    const safeGroundTruth = ['genuine', 'impostor', 'unlabeled'].includes(groundTruth) ? groundTruth : 'unlabeled';
-    const derivedDatasetCategory = ['operational', 'synthetic_qa', 'benchmark_eval'].includes(datasetCategory)
-      ? datasetCategory
-      : isTestProbe
-      ? 'synthetic_qa'
-      : 'operational';
-    const finiteClamp = (value, min, max, digits = 3) =>
-      typeof value === 'number' && Number.isFinite(value)
-        ? Number(Math.min(max, Math.max(min, value)).toFixed(digits))
-        : null;
-    const safeScore = finiteClamp(score, 0, 1, 4);
-    const cleanPipeline = String(pipeline || 'hierarchical').trim().slice(0, 64) || 'hierarchical';
-    const cleanReasonCode = String(reasonCode || 'evaluated').trim().slice(0, 80) || 'evaluated';
-    const docData = {
+    const docData = buildVerificationRecordPayload({
+      uid,
       verificationId,
       identityRef: cleanIdentityRef,
       modalities: safeModalities,
-      pipeline: cleanPipeline,
-      outcome: safeOutcome,
-      policyDecision: 'pending',
-      reasonCode: cleanReasonCode,
-      score: safeScore ?? 0,
-      operatorUid: uid,
-      datasetCategory: derivedDatasetCategory,
-      captureFailure: Boolean(captureFailure),
+      pipeline,
+      outcome,
+      finalDecision,
+      livenessStatus,
+      livenessDecision,
+      challengeVerified,
+      datasetCategory,
+      captureFailure,
+      reasonCode,
+      score,
+      confidence,
+      identityConfidence,
+      sampleQualityScore,
+      livenessConfidence,
+      confidenceBand,
+      conflictDetected,
+      processingTimeMs,
+      featureVersion,
+      groundTruth,
+      isTestProbe,
+      modalityEvaluations,
+      riskScore,
+      riskLevel,
+      livenessPassed,
+      livenessScore,
+      adaptiveApplied,
+      subjectKey,
+      partition,
+      sampleHash,
+      benchmarkBatchId,
+      provenanceSignature,
       createdAt: serverTimestamp(),
-    };
-    if (['VERIFIED', 'REJECTED', 'INCONCLUSIVE'].includes(finalDecision)) {
-      docData.finalDecision = finalDecision;
-    }
-    if (['LIVENESS PASSED', 'LIVENESS FAILED', 'INCONCLUSIVE', 'NOT SUPPORTED'].includes(livenessStatus)) {
-      docData.livenessStatus = livenessStatus;
-    }
-    if (['PASSED', 'FAILED', 'INCONCLUSIVE'].includes(livenessDecision)) {
-      docData.livenessDecision = livenessDecision;
-    }
-    if (typeof challengeVerified === 'boolean') {
-      docData.challengeVerified = challengeVerified;
-    }
-    { const value = finiteClamp(riskScore, 0, 100, 0); if (value !== null) docData.riskScore = value; }
-    if (['low', 'medium', 'high', 'critical'].includes(riskLevel)) docData.riskLevel = riskLevel;
-    if (typeof livenessPassed === 'boolean') docData.livenessPassed = livenessPassed;
-    { const value = finiteClamp(livenessScore, 0, 1, 2); if (value !== null) docData.livenessScore = value; }
-    if (typeof adaptiveApplied === 'boolean') docData.adaptiveApplied = adaptiveApplied;
-    docData.groundTruth = safeGroundTruth;
-    if (typeof isTestProbe === 'boolean') docData.isTestProbe = isTestProbe;
-    if (typeof processingTimeMs === 'number' && Number.isFinite(processingTimeMs)) {
-      docData.processingTimeMs = Math.min(120000, Math.max(0, Number(processingTimeMs.toFixed(1))));
-    }
-    if (typeof confidence === 'number' && Number.isFinite(confidence)) {
-      docData.confidence = Math.min(1, Math.max(0, Number(confidence.toFixed(3))));
-    }
-    if (typeof identityConfidence === 'number' && Number.isFinite(identityConfidence)) {
-      docData.identityConfidence = Math.min(1, Math.max(0, Number(identityConfidence.toFixed(3))));
-    }
-    if (typeof sampleQualityScore === 'number' && Number.isFinite(sampleQualityScore)) {
-      docData.sampleQualityScore = Math.min(1, Math.max(0, Number(sampleQualityScore.toFixed(3))));
-    }
-    if (typeof livenessConfidence === 'number' && Number.isFinite(livenessConfidence)) {
-      docData.livenessConfidence = Math.min(1, Math.max(0, Number(livenessConfidence.toFixed(3))));
-    }
-    if (['high', 'moderate', 'low'].includes(confidenceBand)) docData.confidenceBand = confidenceBand;
-    if (typeof conflictDetected === 'boolean') docData.conflictDetected = conflictDetected;
-    if (typeof featureVersion === 'string' && featureVersion.trim().length > 0) {
-      docData.featureVersion = featureVersion.trim().slice(0, 32);
-    }
-    if (typeof subjectKey === 'string' && subjectKey.trim().length > 0) {
-      docData.subjectKey = subjectKey.trim().slice(0, 80);
-    }
-    if (partition === 'eval' || partition === 'unassigned') {
-      docData.partition = partition;
-    }
-    if (typeof sampleHash === 'string' && sampleHash.trim().length > 0) {
-      docData.sampleHash = sampleHash.trim().slice(0, 128);
-    }
-    if (typeof benchmarkBatchId === 'string' && benchmarkBatchId.trim().length > 0) {
-      docData.benchmarkBatchId = benchmarkBatchId.trim().slice(0, 80);
-    }
-    if (typeof provenanceSignature === 'string' && provenanceSignature.trim().length > 0) {
-      docData.provenanceSignature = provenanceSignature.trim().slice(0, 160);
-    }
+    });
 
-    if (modalityEvaluations?.face) {
-      { const value = finiteClamp(modalityEvaluations.face.score, 0, 1, 4); if (value !== null) docData.faceScore = value; }
-      { const value = finiteClamp(modalityEvaluations.face.qualityScore, 0, 100, 0); if (value !== null) docData.faceQuality = value; }
-      if (['MATCH', 'NO MATCH', 'INCONCLUSIVE', 'NOT EVALUATED'].includes(modalityEvaluations.face.status)) {
-        docData.faceStatus = modalityEvaluations.face.status;
-      }
-    }
-    if (modalityEvaluations?.voice) {
-      { const value = finiteClamp(modalityEvaluations.voice.score, 0, 1, 4); if (value !== null) docData.voiceScore = value; }
-      { const value = finiteClamp(modalityEvaluations.voice.qualityScore, 0, 100, 0); if (value !== null) docData.voiceQuality = value; }
-      if (['MATCH', 'NO MATCH', 'INCONCLUSIVE', 'NOT EVALUATED'].includes(modalityEvaluations.voice.status)) {
-        docData.voiceStatus = modalityEvaluations.voice.status;
-      }
-    }
-    if (modalityEvaluations?.fingerprint) {
-      { const value = finiteClamp(modalityEvaluations.fingerprint.score, 0, 1, 4); if (value !== null) docData.fingerprintScore = value; }
-      { const value = finiteClamp(modalityEvaluations.fingerprint.qualityScore, 0, 100, 0); if (value !== null) docData.fingerprintQuality = value; }
-      if (['MATCH', 'NO MATCH', 'INCONCLUSIVE', 'NOT EVALUATED'].includes(modalityEvaluations.fingerprint.status)) {
-        docData.fingerprintStatus = modalityEvaluations.fingerprint.status;
-      }
-      const fpDet = modalityEvaluations.fingerprint.details || {};
-      if (typeof fpDet.matchedMinutiae === 'number' && Number.isFinite(fpDet.matchedMinutiae)) {
-        docData.matchedMinutiae = Math.max(0, Math.min(500, Math.round(fpDet.matchedMinutiae)));
-      }
-      if (typeof fpDet.probeMinutiae === 'number' && Number.isFinite(fpDet.probeMinutiae)) {
-        docData.probeMinutiae = Math.max(0, Math.min(500, Math.round(fpDet.probeMinutiae)));
-      }
+    const schemaCheck = validateVerificationRecordDoc(docData, uid, verificationId);
+    if (!schemaCheck.valid) {
+      throw makeDiagnosticError(
+        `Verification record payload failed pre-write validation: ${schemaCheck.errors.join(' ')}`,
+        'verification_record_validation',
+        'verification_record_schema_invalid'
+      );
     }
 
     debugSummary = {
       identityRef: cleanIdentityRef,
       modalities: safeModalities,
-      pipeline: cleanPipeline,
-      outcome: safeOutcome,
+      pipeline: docData.pipeline,
+      outcome: docData.outcome,
       finalDecision: docData.finalDecision,
       livenessStatus: docData.livenessStatus,
-      reasonCode: cleanReasonCode,
-      datasetCategory: derivedDatasetCategory,
+      reasonCode: docData.reasonCode,
+      datasetCategory: docData.datasetCategory,
+      fieldCount: Object.keys(docData).length,
       fieldKeys: Object.keys(docData),
     };
     await setDoc(doc(db, 'users', uid, 'verification_records', verificationId), docData);
@@ -619,7 +559,7 @@ export async function recordVerificationMetadata({
     trackFsOp('write', t0, false);
     if (err?.operationStage) throw err;
     console.error('Verification record write failed; safe payload summary:', debugSummary);
-    handleFirestoreError(err, OperationType.CREATE, path, 'verification_record_creation');
+    handleFirestoreError(err, OperationType.CREATE, path, 'verification_record_creation', debugSummary);
   }
 }
 

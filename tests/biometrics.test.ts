@@ -1437,15 +1437,18 @@ test('Firestore security rules stay strictly aligned with VerificationRecord wri
     [...vrFnMatch[1].matchAll(/'([^']+)'/g)].map((m) => m[1])
   );
 
-  // Extract every key assigned to docData inside recordVerificationMetadata in src/js/firebase.js
-  const recordFnMatch = firebaseJsText.match(/export async function recordVerificationMetadata\([\s\S]*?await setDoc\(doc\(db, 'users', uid, 'verification_records', verificationId\), docData\);/);
-  assert.ok(recordFnMatch, 'Expected recordVerificationMetadata body in src/js/firebase.js');
+  // Extract every key assigned to docData inside buildVerificationRecordPayload (used by recordVerificationMetadata)
+  const vrBuilderText = fs.readFileSync(path.join(process.cwd(), 'src/shared/verificationRecord.ts'), 'utf8');
+  assert.match(firebaseJsText, /buildVerificationRecordPayload\(/);
+  assert.match(firebaseJsText, /validateVerificationRecordDoc\(/);
+  const recordFnMatch = vrBuilderText.match(/export function buildVerificationRecordPayload\([\s\S]*?return docData;\s*\}/);
+  assert.ok(recordFnMatch, 'Expected buildVerificationRecordPayload body in src/shared/verificationRecord.ts');
   const writtenKeys = new Set<string>();
   for (const m of recordFnMatch[0].matchAll(/docData\.([a-zA-Z0-9_]+)\s*=/g)) {
     writtenKeys.add(m[1]);
   }
-  const baseObjMatch = recordFnMatch[0].match(/const docData = \{([\s\S]*?)\};/);
-  assert.ok(baseObjMatch, 'Expected const docData = {...} in recordVerificationMetadata');
+  const baseObjMatch = recordFnMatch[0].match(/const docData[^=]*=\s*\{([\s\S]*?)\};/);
+  assert.ok(baseObjMatch, 'Expected const docData = {...} in buildVerificationRecordPayload');
   for (const m of baseObjMatch[1].matchAll(/^\s*([a-zA-Z0-9_]+)(?:\s*:|\s*,)/gm)) {
     writtenKeys.add(m[1]);
   }
@@ -1845,4 +1848,128 @@ test('Firestore named database resolution, real REST 404 document-vs-database di
     await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
   }
 });
+
+test('VerificationRecord builder & validator stay strictly synchronized with firestore.rules isValidVerificationRecord', async () => {
+  const {
+    VERIFICATION_RECORD_ALLOWED_KEYS,
+    VERIFICATION_RECORD_REQUIRED_KEYS,
+    buildVerificationRecordPayload,
+    validateVerificationRecordDoc,
+  } = await import('../src/shared/verificationRecord.ts');
+
+  const rulesText = fs.readFileSync(path.join(process.cwd(), 'firestore.rules'), 'utf8');
+  const fnMatch = rulesText.match(
+    /function isValidVerificationRecord\(data\)\s*\{[\s\S]*?hasAll\(\[([\s\S]*?)\]\)[\s\S]*?hasOnly\(\[([\s\S]*?)\]\)/
+  );
+  assert.ok(fnMatch, 'Expected isValidVerificationRecord hasAll/hasOnly in firestore.rules');
+
+  const extractList = (raw: string) =>
+    [...raw.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+
+  const rulesRequired = extractList(fnMatch[1]);
+  const rulesAllowed = extractList(fnMatch[2]);
+
+  assert.deepEqual([...VERIFICATION_RECORD_REQUIRED_KEYS], rulesRequired);
+  assert.deepEqual([...VERIFICATION_RECORD_ALLOWED_KEYS], rulesAllowed);
+
+  const mockTs = { _methodName: 'serverTimestamp' };
+  const uid = 'pNFDVh6FlAgbGQuN48H1qaXy7tv1';
+
+  // Case 1: Static image upload under strict liveness (INCONCLUSIVE / not_evaluated)
+  const verId1 = 'ver_1794800001_abc123';
+  const staticPayload = buildVerificationRecordPayload({
+    uid,
+    verificationId: verId1,
+    identityRef: 'subj_test_01',
+    modalities: ['face'],
+    pipeline: 'hierarchical',
+    outcome: 'not_evaluated',
+    finalDecision: 'INCONCLUSIVE',
+    livenessStatus: 'INCONCLUSIVE',
+    livenessDecision: 'INCONCLUSIVE',
+    challengeVerified: false,
+    datasetCategory: 'operational',
+    captureFailure: false,
+    reasonCode: 'liveness_inconclusive_blocked',
+    score: 0.892,
+    confidence: 0.54,
+    identityConfidence: 0.88,
+    sampleQualityScore: 0.91,
+    livenessConfidence: 0.45,
+    confidenceBand: 'moderate',
+    conflictDetected: false,
+    processingTimeMs: 42.7,
+    featureVersion: 'v2.0-multimodal',
+    groundTruth: 'unlabeled',
+    isTestProbe: false,
+    riskScore: 33,
+    riskLevel: 'medium',
+    livenessPassed: false,
+    livenessScore: 0.6,
+    adaptiveApplied: false,
+    partition: 'unassigned',
+    sampleHash: 'a'.repeat(64),
+    provenanceSignature: 'b'.repeat(64),
+    modalityEvaluations: {
+      face: { score: 0.892, qualityScore: 91, status: 'MATCH' },
+    },
+    createdAt: mockTs,
+  });
+  const check1 = validateVerificationRecordDoc(staticPayload, uid, verId1);
+  assert.equal(check1.valid, true, `Expected static upload record valid, got: ${check1.errors.join('; ')}`);
+
+  // Case 2: Live 3-modality VERIFIED benchmark record + NaN/Infinity clamping safety
+  const verId2 = 'ver_1794800002_xyz789';
+  const multiPayload = buildVerificationRecordPayload({
+    uid,
+    verificationId: verId2,
+    identityRef: 'subj_test_02',
+    modalities: ['face', 'voice', 'fingerprint'],
+    pipeline: 'multimodal_strict',
+    outcome: 'match',
+    finalDecision: 'VERIFIED',
+    livenessStatus: 'LIVENESS PASSED',
+    livenessDecision: 'PASSED',
+    challengeVerified: true,
+    datasetCategory: 'benchmark_eval',
+    captureFailure: false,
+    reasonCode: 'multimodal_strict_match',
+    score: 0.914,
+    confidence: 0.92,
+    identityConfidence: 0.95,
+    sampleQualityScore: 0.89,
+    livenessConfidence: 0.94,
+    confidenceBand: 'high',
+    conflictDetected: false,
+    processingTimeMs: 88.4,
+    featureVersion: 'v2.0-multimodal',
+    groundTruth: 'genuine',
+    isTestProbe: false,
+    subjectKey: 'subj_test_02',
+    partition: 'eval',
+    benchmarkBatchId: 'eval_2026_r1',
+    sampleHash: 'c'.repeat(64),
+    provenanceSignature: 'd'.repeat(64),
+    riskScore: 8,
+    riskLevel: 'low',
+    livenessPassed: true,
+    livenessScore: 0.94,
+    adaptiveApplied: false,
+    modalityEvaluations: {
+      face: { score: 0.92, qualityScore: 90, status: 'MATCH' },
+      voice: { score: Number.NaN, qualityScore: 84, status: 'MATCH' },
+      fingerprint: {
+        score: 0.91,
+        qualityScore: 88,
+        status: 'MATCH',
+        details: { matchedMinutiae: 24, probeMinutiae: 36 },
+      },
+    },
+    createdAt: mockTs,
+  });
+  assert.equal('voiceScore' in multiPayload, false, 'NaN voiceScore must be omitted before Firestore write');
+  const check2 = validateVerificationRecordDoc(multiPayload, uid, verId2);
+  assert.equal(check2.valid, true, `Expected multimodal record valid, got: ${check2.errors.join('; ')}`);
+});
+
 

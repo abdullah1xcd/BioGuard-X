@@ -2205,6 +2205,7 @@ export function renderVerification(container, { appState, navigate }) {
           : status >= 500
           ? 'Backend Verification Request Failed'
           : 'Verification / Quality Gate Rejected';
+      const payloadSummary = err?.payloadSummary || null;
       const diagParts = [
         stage ? `stage=${stage}` : '',
         opType ? `op=${opType}` : '',
@@ -2214,6 +2215,10 @@ export function renderVerification(container, { appState, navigate }) {
         projectId ? `project=${projectId}` : '',
         databaseId ? `db=${databaseId}` : '',
         reqId ? `req=${reqId}` : '',
+        payloadSummary?.outcome ? `outcome=${payloadSummary.outcome}` : '',
+        payloadSummary?.finalDecision ? `decision=${payloadSummary.finalDecision}` : '',
+        payloadSummary?.livenessStatus ? `liveness=${payloadSummary.livenessStatus}` : '',
+        payloadSummary?.reasonCode ? `reason=${payloadSummary.reasonCode}` : '',
       ].filter(Boolean);
       resultEl.innerHTML = `<div class="notice-strip danger"><div><strong>${escapeHtml(heading)}</strong><div>${escapeHtml(err.message)}</div>${diagParts.length ? `<div class="meta-line mono" style="margin-top:4px;">${escapeHtml(diagParts.join(' · '))}</div>` : ''}</div></div>`;
       showToast(err.message, 'danger');

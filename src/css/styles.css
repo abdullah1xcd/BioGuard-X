@@ -432,6 +432,11 @@ textarea {
   background: var(--bg-hover);
 }
 
+.avatar-img[hidden],
+.avatar-fallback[hidden] {
+  display: none;
+}
+
 .avatar-img {
   width: 26px;
   height: 26px;
