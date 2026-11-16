@@ -19,6 +19,9 @@ async function apiFetch(url, options = {}) {
     err.operationStage = data.authorizationStage || null;
     err.operationType = data.operation || null;
     err.path = data.path || null;
+    err.projectId = data.projectId || null;
+    err.databaseId = data.databaseId || null;
+    err.upstreamCode = data.upstreamCode || null;
     err.payload = data;
     throw err;
   }

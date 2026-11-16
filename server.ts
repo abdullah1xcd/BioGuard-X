@@ -166,6 +166,9 @@ export interface BackendErrorDiagnostics {
   authorizationStage?: string;
   operation?: string;
   path?: string;
+  projectId?: string;
+  databaseId?: string;
+  upstreamCode?: string;
 }
 
 export class BackendHttpError extends Error {
@@ -174,6 +177,9 @@ export class BackendHttpError extends Error {
   authorizationStage?: string;
   operation?: string;
   path?: string;
+  projectId?: string;
+  databaseId?: string;
+  upstreamCode?: string;
   constructor(status: number, code: string, message: string, diagnostics?: BackendErrorDiagnostics) {
     super(message);
     this.name = 'BackendHttpError';
@@ -182,12 +188,48 @@ export class BackendHttpError extends Error {
     this.authorizationStage = diagnostics?.authorizationStage;
     this.operation = diagnostics?.operation;
     this.path = diagnostics?.path;
+    this.projectId = diagnostics?.projectId;
+    this.databaseId = diagnostics?.databaseId;
+    this.upstreamCode = diagnostics?.upstreamCode;
+  }
+}
+
+export function extractFirestoreErrorDetail(rawDetail: string): { status: string; message: string } {
+  const raw = String(rawDetail || '').trim();
+  if (!raw) return { status: '', message: '' };
+  try {
+    const j = JSON.parse(raw) as { error?: { status?: string; message?: string } };
+    return {
+      status: String(j?.error?.status || '').trim(),
+      message: String(j?.error?.message || '').trim() || raw,
+    };
+  } catch {
+    return { status: '', message: raw };
   }
 }
 
 export function isFirestoreDatabaseMissingDetail(rawDetail: string): boolean {
-  const lower = String(rawDetail || '').toLowerCase();
-  return lower.includes('database') && (lower.includes('does not exist') || lower.includes('not found'));
+  const { message } = extractFirestoreErrorDetail(rawDetail);
+  if (!message) return false;
+
+  // Firestore REST v1 document-level 404s include the full resource name containing "/databases/<db>/documents/...".
+  // Example: Document "projects/<proj>/databases/<db>/documents/users/<uid>/system_settings/default" not found.
+  if (/^\s*document\s+"[^"]*\/documents\/[^"]*"\s+not\s+found\.?\s*$/i.test(message)) {
+    return false;
+  }
+  if (/\/documents\//i.test(message) && /\bdocument\b/i.test(message) && !/\bthe\s+database\b/i.test(message)) {
+    return false;
+  }
+
+  // Genuine missing database / parent resource messages from Cloud Firestore REST API:
+  // e.g. "The database (default) does not exist for project ...", "Database 'projects/.../databases/...' does not exist."
+  if (/\b(?:the\s+)?database\b[^.\n]*\b(?:does\s+not\s+exist|not\s+found|is\s+not\s+found)\b/i.test(message)) {
+    return true;
+  }
+  if (/\bprojects\/[^/\s"']+\/databases\/[^/\s"']+(?!\/documents\/)[^.\n]*\b(?:does\s+not\s+exist|not\s+found)\b/i.test(message)) {
+    return true;
+  }
+  return false;
 }
 
 export function mapFirestoreHttpError(
@@ -196,20 +238,17 @@ export function mapFirestoreHttpError(
   rawDetail: string,
   diagnostics?: BackendErrorDiagnostics
 ): BackendHttpError {
-  let parsedStatus = '';
-  let parsedMsg = '';
-  try {
-    const j = JSON.parse(rawDetail) as { error?: { status?: string; message?: string } };
-    parsedStatus = String(j?.error?.status || '');
-    parsedMsg = String(j?.error?.message || '');
-  } catch {
-    // Plain-text upstream error body
-  }
+  const { status: parsedStatus, message: parsedMsg } = extractFirestoreErrorDetail(rawDetail);
   const detailHint = parsedMsg || rawDetail.slice(0, 220);
+  const projectId = diagnostics?.projectId || firebaseConfig.projectId;
+  const databaseId = diagnostics?.databaseId || firebaseConfig.firestoreDatabaseId;
   const diag: BackendErrorDiagnostics = {
     authorizationStage: diagnostics?.authorizationStage,
     operation: diagnostics?.operation || op,
     path: diagnostics?.path,
+    projectId,
+    databaseId,
+    upstreamCode: diagnostics?.upstreamCode || parsedStatus || (statusCode ? `HTTP_${statusCode}` : undefined),
   };
 
   if (statusCode === 401 || parsedStatus === 'UNAUTHENTICATED') {
@@ -248,7 +287,7 @@ export function mapFirestoreHttpError(
     return new BackendHttpError(
       503,
       'firestore_database_not_found',
-      `Firestore database or collection path could not be resolved during ${op} (project=${firebaseConfig.projectId}, db=${firebaseConfig.firestoreDatabaseId}).`,
+      `Firestore database or collection path could not be resolved during ${op} (project=${projectId}, db=${databaseId}).`,
       diag
     );
   }
@@ -350,18 +389,60 @@ export function decryptVaultMap(raw: string, overrideSecret?: string): Record<st
   return decryptVaultMapWithMeta(raw, overrideSecret).map;
 }
 
-function firestoreDocUrl(docPath: string): string {
-  const dbId = encodeURIComponent(firebaseConfig.firestoreDatabaseId);
-  return `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${dbId}/documents/${docPath}`;
+export function validateFirestoreTargetConfig(
+  cfg: Partial<FirebaseConfig> = firebaseConfig,
+  diagnostics?: BackendErrorDiagnostics
+): { projectId: string; firestoreDatabaseId: string } {
+  const projectId = String(cfg?.projectId || '').trim();
+  const firestoreDatabaseId = String(cfg?.firestoreDatabaseId || '').trim();
+  if (!projectId || !/^[a-z0-9-]+$/.test(projectId)) {
+    throw new BackendHttpError(
+      500,
+      'firestore_config_invalid',
+      `Invalid or missing Firebase projectId ("${projectId || 'empty'}").`,
+      {
+        authorizationStage: diagnostics?.authorizationStage || 'config_validation',
+        operation: diagnostics?.operation || 'config',
+        path: diagnostics?.path,
+        projectId: projectId || 'missing',
+        databaseId: firestoreDatabaseId || 'missing',
+        upstreamCode: 'FAILED_PRECONDITION',
+      }
+    );
+  }
+  if (!firestoreDatabaseId || firestoreDatabaseId === '(default)' || !/^[a-zA-Z0-9_-]+$/.test(firestoreDatabaseId)) {
+    throw new BackendHttpError(
+      500,
+      'firestore_config_invalid',
+      `Invalid or unconfigured named Firestore databaseId ("${firestoreDatabaseId || 'empty'}"). Expected explicit named database instead of "(default)".`,
+      {
+        authorizationStage: diagnostics?.authorizationStage || 'config_validation',
+        operation: diagnostics?.operation || 'config',
+        path: diagnostics?.path,
+        projectId,
+        databaseId: firestoreDatabaseId || 'missing',
+        upstreamCode: 'FAILED_PRECONDITION',
+      }
+    );
+  }
+  return { projectId, firestoreDatabaseId };
+}
+
+export function firestoreDocUrl(docPath: string, cfgOverride?: Partial<FirebaseConfig>): string {
+  const { projectId, firestoreDatabaseId } = validateFirestoreTargetConfig(cfgOverride);
+  const cleanPath = String(docPath || '').replace(/^\/+/, '');
+  return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(firestoreDatabaseId)}/documents/${cleanPath}`;
 }
 
 function firestoreDocName(docPath: string): string {
-  return `projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/${docPath}`;
+  const { projectId, firestoreDatabaseId } = validateFirestoreTargetConfig();
+  const cleanPath = String(docPath || '').replace(/^\/+/, '');
+  return `projects/${projectId}/databases/${firestoreDatabaseId}/documents/${cleanPath}`;
 }
 
 function firestoreCommitUrl(): string {
-  const dbId = encodeURIComponent(firebaseConfig.firestoreDatabaseId);
-  return `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${dbId}/documents:commit`;
+  const { projectId, firestoreDatabaseId } = validateFirestoreTargetConfig();
+  return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(firestoreDatabaseId)}/documents:commit`;
 }
 
 async function loadVaultEntry(uid: string, identityRef: string, idToken: string): Promise<VaultEntry | null> {
@@ -374,11 +455,20 @@ async function loadVaultEntry(uid: string, identityRef: string, idToken: string)
       signal: AbortSignal.timeout(8000),
     });
   } catch (err) {
+    const upstreamCode =
+      err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError') ? 'DEADLINE_EXCEEDED' : 'UNAVAILABLE';
     throw new BackendHttpError(
       503,
       'firestore_unreachable',
       `Failed to reach Firestore while reading vault entry (${err instanceof Error ? err.message : 'network error'}).`,
-      { authorizationStage: 'vault_access', operation: 'get', path: docPath }
+      {
+        authorizationStage: 'vault_access',
+        operation: 'get',
+        path: docPath,
+        projectId: firebaseConfig.projectId,
+        databaseId: firebaseConfig.firestoreDatabaseId,
+        upstreamCode,
+      }
     );
   }
   if (response.status === 404) {
@@ -409,7 +499,13 @@ async function loadVaultEntry(uid: string, identityRef: string, idToken: string)
       422,
       'vault_record_corrupt',
       'Stored Firestore vault document is missing encryptedPayload.',
-      { authorizationStage: 'vault_access', operation: 'get', path: docPath }
+      {
+        authorizationStage: 'vault_access',
+        operation: 'get',
+        path: docPath,
+        projectId: firebaseConfig.projectId,
+        databaseId: firebaseConfig.firestoreDatabaseId,
+      }
     );
   }
   const decrypted = decryptVaultMap(encryptedPayload);
@@ -428,7 +524,26 @@ async function listVaultEntriesWithMeta(
     const qs = new URLSearchParams({ pageSize: '150' });
     if (pageToken) qs.set('pageToken', pageToken);
     const url = `${firestoreDocUrl(`users/${encodeURIComponent(uid)}/biometric_vault`)}?${qs.toString()}`;
-    const response = await fetch(url, { headers: { Authorization: `Bearer ${idToken}` }, signal: AbortSignal.timeout(8000) });
+    let response: globalThis.Response;
+    try {
+      response = await fetch(url, { headers: { Authorization: `Bearer ${idToken}` }, signal: AbortSignal.timeout(8000) });
+    } catch (err) {
+      const upstreamCode =
+        err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError') ? 'DEADLINE_EXCEEDED' : 'UNAVAILABLE';
+      throw new BackendHttpError(
+        503,
+        'firestore_unreachable',
+        `Failed to reach Firestore while listing vault entries (${err instanceof Error ? err.message : 'network error'}).`,
+        {
+          authorizationStage: 'vault_access',
+          operation: 'list',
+          path: collectionPath,
+          projectId: firebaseConfig.projectId,
+          databaseId: firebaseConfig.firestoreDatabaseId,
+          upstreamCode,
+        }
+      );
+    }
     if (response.status === 404) {
       const detail = await response.text().catch(() => '');
       if (isFirestoreDatabaseMissingDetail(detail)) {
@@ -1385,6 +1500,8 @@ export async function fetchUserFirestoreRole(
     if (err instanceof BackendHttpError || (err instanceof Error && typeof (err as Error & { status?: number }).status === 'number')) {
       throw err;
     }
+    const upstreamCode =
+      err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError') ? 'DEADLINE_EXCEEDED' : 'UNAVAILABLE';
     throw new BackendHttpError(
       503,
       'authorization_unavailable',
@@ -1393,6 +1510,9 @@ export async function fetchUserFirestoreRole(
         authorizationStage: 'role_lookup',
         operation: 'get',
         path: docPath,
+        projectId: firebaseConfig.projectId,
+        databaseId: firebaseConfig.firestoreDatabaseId,
+        upstreamCode,
       }
     );
   }
@@ -1742,6 +1862,9 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
       authorizationStage?: string;
       operation?: string;
       path?: string;
+      projectId?: string;
+      databaseId?: string;
+      upstreamCode?: string;
     };
     const isNetworkAbort =
       !(err instanceof BackendHttpError) &&
@@ -1762,6 +1885,9 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
       authorizationStage: errMeta?.authorizationStage || 'firebase_id_token_lookup',
       ...(errMeta?.operation ? { operation: errMeta.operation } : {}),
       ...(errMeta?.path ? { path: errMeta.path } : {}),
+      ...(errMeta?.projectId ? { projectId: errMeta.projectId } : {}),
+      ...(errMeta?.databaseId ? { databaseId: errMeta.databaseId } : {}),
+      ...(errMeta?.upstreamCode ? { upstreamCode: errMeta.upstreamCode } : {}),
       requestId,
     });
   }
@@ -1839,12 +1965,17 @@ function parseFirestoreNumberField(field: { doubleValue?: number; integerValue?:
 export async function loadWorkspacePolicy(
   uid: string,
   idToken: string,
-  opts?: { fetchImpl?: typeof fetch }
+  opts?: { fetchImpl?: typeof fetch; configOverride?: Partial<FirebaseConfig> }
 ): Promise<WorkspacePolicySnapshot | null> {
   const fetchFn = opts?.fetchImpl || fetch;
   const docPath = `users/${uid}/system_settings/default`;
+  const targetCfg = validateFirestoreTargetConfig(opts?.configOverride, {
+    authorizationStage: 'policy_read',
+    operation: 'get',
+    path: docPath,
+  });
   try {
-    const url = firestoreDocUrl(`users/${encodeURIComponent(uid)}/system_settings/default`);
+    const url = firestoreDocUrl(`users/${encodeURIComponent(uid)}/system_settings/default`, targetCfg);
     const res = await fetchFn(url, {
       headers: { Authorization: `Bearer ${idToken}` },
       signal: AbortSignal.timeout(4000),
@@ -1856,8 +1987,11 @@ export async function loadWorkspacePolicy(
           authorizationStage: 'policy_read',
           operation: 'get',
           path: docPath,
+          projectId: targetCfg.projectId,
+          databaseId: targetCfg.firestoreDatabaseId,
         });
       }
+      // Document users/{uid}/system_settings/default has not been created yet -> safely fall back to server defaults.
       return null;
     }
     if (!res.ok) {
@@ -1866,6 +2000,8 @@ export async function loadWorkspacePolicy(
         authorizationStage: 'policy_read',
         operation: 'get',
         path: docPath,
+        projectId: targetCfg.projectId,
+        databaseId: targetCfg.firestoreDatabaseId,
       });
     }
     const payload = (await res.json()) as {
@@ -1915,11 +2051,25 @@ export async function loadWorkspacePolicy(
     if (err instanceof BackendHttpError) {
       throw err;
     }
-    return null;
+    const upstreamCode =
+      err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError') ? 'DEADLINE_EXCEEDED' : 'UNAVAILABLE';
+    throw new BackendHttpError(
+      503,
+      'firestore_unreachable',
+      `Failed to reach Firestore during workspace policy read (${err instanceof Error ? err.message : 'network error'}).`,
+      {
+        authorizationStage: 'policy_read',
+        operation: 'get',
+        path: docPath,
+        projectId: targetCfg.projectId,
+        databaseId: targetCfg.firestoreDatabaseId,
+        upstreamCode,
+      }
+    );
   }
 }
 
-function mergeAuthoritativePolicy(
+export function mergeAuthoritativePolicy(
   workspace: WorkspacePolicySnapshot | null,
   clientBody: {
     thresholds?: Record<string, number | undefined>;
@@ -2091,6 +2241,7 @@ app.get(
 
     let firestoreStatus: 'OPERATIONAL' | 'DEGRADED' | 'OFFLINE' = 'OFFLINE';
     let firestoreLatencyMs: number | null = null;
+    let firestoreDetail = 'Unreachable';
     try {
       const f0 = performance.now();
       const fRes = await fetch(firestoreDocUrl(`users/${encodeURIComponent(req.auth!.uid)}`), {
@@ -2098,9 +2249,28 @@ app.get(
         signal: AbortSignal.timeout(4000),
       });
       firestoreLatencyMs = Number((performance.now() - f0).toFixed(1));
-      firestoreStatus = fRes.ok || fRes.status === 404 ? 'OPERATIONAL' : fRes.status === 403 ? 'DEGRADED' : 'OFFLINE';
+      if (fRes.ok) {
+        firestoreStatus = 'OPERATIONAL';
+        firestoreDetail = `Reachable (${firestoreLatencyMs} ms)`;
+      } else if (fRes.status === 404) {
+        const detail = await fRes.text().catch(() => '');
+        if (isFirestoreDatabaseMissingDetail(detail)) {
+          firestoreStatus = 'OFFLINE';
+          firestoreDetail = `Named database not found (${firebaseConfig.firestoreDatabaseId})`;
+        } else {
+          firestoreStatus = 'OPERATIONAL';
+          firestoreDetail = `Reachable (${firestoreLatencyMs} ms)`;
+        }
+      } else if (fRes.status === 403 || fRes.status === 401) {
+        firestoreStatus = 'DEGRADED';
+        firestoreDetail = `HTTP ${fRes.status} (${firestoreLatencyMs} ms)`;
+      } else {
+        firestoreStatus = 'OFFLINE';
+        firestoreDetail = `HTTP ${fRes.status} (${firestoreLatencyMs} ms)`;
+      }
     } catch {
       firestoreStatus = 'OFFLINE';
+      firestoreDetail = 'Unreachable';
     }
 
     let vaultNeedsRotation = 0;
@@ -2119,12 +2289,14 @@ app.get(
       status: 'ok',
       checkedAt: new Date().toISOString(),
       latencyMs: Number((performance.now() - t0).toFixed(1)),
+      firebaseProject: firebaseConfig.projectId,
+      firestoreDatabase: firebaseConfig.firestoreDatabaseId,
       components: {
         biometricApi: { status: 'OPERATIONAL', detail: `Express API (${FEATURE_VERSION})` },
         firebaseAuth: { status: 'OPERATIONAL', detail: `Verified session (${req.auth!.role})` },
         cloudFirestore: {
           status: firestoreStatus,
-          detail: firestoreLatencyMs !== null ? `Reachable (${firestoreLatencyMs} ms)` : 'Unreachable',
+          detail: firestoreDetail,
         },
         vaultStorage: {
           status: envVaultConfigured ? 'OPERATIONAL' : 'NOT CONFIGURED',
@@ -3378,6 +3550,9 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     authorizationStage?: string;
     operation?: string;
     path?: string;
+    projectId?: string;
+    databaseId?: string;
+    upstreamCode?: string;
   };
   if (err instanceof VaultSecretError || errObj?.code === 'vault_secret_not_configured') {
     res.status(503).json({
@@ -3390,7 +3565,18 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     return;
   }
   if (err instanceof BackendHttpError) {
-    console.error(`BioGuard X backend HTTP error (${err.status} ${err.code}):`, err.message);
+    console.error(
+      `BioGuard X backend HTTP error (${err.status} ${err.code})`,
+      JSON.stringify({
+        requestId,
+        projectId: err.projectId || firebaseConfig.projectId,
+        databaseId: err.databaseId || firebaseConfig.firestoreDatabaseId,
+        authorizationStage: err.authorizationStage,
+        operation: err.operation,
+        path: err.path,
+        upstreamCode: err.upstreamCode,
+      })
+    );
     res.status(err.status).json({
       error: err.code,
       message: err.message,
@@ -3398,6 +3584,9 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
       ...(err.authorizationStage ? { authorizationStage: err.authorizationStage } : {}),
       ...(err.operation ? { operation: err.operation } : {}),
       ...(err.path ? { path: err.path } : {}),
+      ...(err.projectId ? { projectId: err.projectId } : {}),
+      ...(err.databaseId ? { databaseId: err.databaseId } : {}),
+      ...(err.upstreamCode ? { upstreamCode: err.upstreamCode } : {}),
       requestId,
     });
     return;
@@ -3425,6 +3614,9 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     ...(errObj?.authorizationStage ? { authorizationStage: errObj.authorizationStage } : {}),
     ...(errObj?.operation ? { operation: errObj.operation } : {}),
     ...(errObj?.path ? { path: errObj.path } : {}),
+    ...(errObj?.projectId ? { projectId: errObj.projectId } : {}),
+    ...(errObj?.databaseId ? { databaseId: errObj.databaseId } : {}),
+    ...(errObj?.upstreamCode ? { upstreamCode: errObj.upstreamCode } : {}),
     requestId,
   });
 });

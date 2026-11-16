@@ -1095,6 +1095,9 @@ export function renderEnrollment(container, { appState, navigate }) {
       const opPath = String(err?.path || '');
       const status = Number(err?.status || 0);
       const reqId = String(err?.requestId || '');
+      const projectId = String(err?.projectId || '');
+      const databaseId = String(err?.databaseId || '');
+      const upstreamCode = String(err?.upstreamCode || '');
       const heading =
         stage === 'identity_enrollment'
           ? 'Identity Metadata Enrollment Failed'
@@ -1112,6 +1115,9 @@ export function renderEnrollment(container, { appState, navigate }) {
         opType ? `op=${opType}` : '',
         opPath ? `path=${opPath}` : '',
         status ? `http=${status}` : '',
+        upstreamCode ? `upstream=${upstreamCode}` : '',
+        projectId ? `project=${projectId}` : '',
+        databaseId ? `db=${databaseId}` : '',
         reqId ? `req=${reqId}` : '',
       ].filter(Boolean);
       container.querySelector('#be-result').innerHTML = `<div class="notice-strip danger"><div><strong>${escapeHtml(heading)}</strong><div>${escapeHtml(err.message)}</div>${diagParts.length ? `<div class="meta-line mono" style="margin-top:4px;">${escapeHtml(diagParts.join(' · '))}</div>` : ''}</div></div>`;
@@ -2182,6 +2188,9 @@ export function renderVerification(container, { appState, navigate }) {
       const opPath = String(err?.path || '');
       const status = Number(err?.status || 0);
       const reqId = String(err?.requestId || '');
+      const projectId = String(err?.projectId || '');
+      const databaseId = String(err?.databaseId || '');
+      const upstreamCode = String(err?.upstreamCode || '');
       const heading =
         stage === 'identity_lookup'
           ? 'Identity Metadata Lookup Failed'
@@ -2201,6 +2210,9 @@ export function renderVerification(container, { appState, navigate }) {
         opType ? `op=${opType}` : '',
         opPath ? `path=${opPath}` : '',
         status ? `http=${status}` : '',
+        upstreamCode ? `upstream=${upstreamCode}` : '',
+        projectId ? `project=${projectId}` : '',
+        databaseId ? `db=${databaseId}` : '',
         reqId ? `req=${reqId}` : '',
       ].filter(Boolean);
       resultEl.innerHTML = `<div class="notice-strip danger"><div><strong>${escapeHtml(heading)}</strong><div>${escapeHtml(err.message)}</div>${diagParts.length ? `<div class="meta-line mono" style="margin-top:4px;">${escapeHtml(diagParts.join(' · '))}</div>` : ''}</div></div>`;

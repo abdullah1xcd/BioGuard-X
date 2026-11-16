@@ -1609,3 +1609,240 @@ test('Firebase CLI and GitHub Actions rules workflow pin firebase-tools, target 
   assert.match(workflowText, /--dry-run/);
   assert.match(rulesText, /match \/\{document=\*\*\}\s*\{\s*allow read, write: if false;/);
 });
+
+test('Firestore named database resolution, real REST 404 document-vs-database distinction, and loadWorkspacePolicy resilience', async () => {
+  process.env.BIOGUARD_SKIP_LISTEN = '1';
+  const serverMod = await import('../server.ts');
+  const {
+    BackendHttpError,
+    isFirestoreDatabaseMissingDetail,
+    validateFirestoreTargetConfig,
+    firestoreDocUrl,
+    loadWorkspacePolicy,
+    mergeAuthoritativePolicy,
+    app,
+  } = serverMod;
+
+  const expectedProject = 'basic-climber-rmbw7';
+  const expectedDb = 'ai-studio-bioguardx-e1593f08-43df-4912-a9e0-6922af3760d4';
+
+  // 1. Correct named database URL construction (never targets "(default)")
+  const policyUrl = firestoreDocUrl('users/uid_alpha/system_settings/default');
+  assert.equal(
+    policyUrl,
+    `https://firestore.googleapis.com/v1/projects/${expectedProject}/databases/${expectedDb}/documents/users/uid_alpha/system_settings/default`
+  );
+  assert.equal(policyUrl.includes('(default)'), false);
+
+  // 2. Real Firestore REST v1 404 document-not-found vs database-does-not-exist
+  const realMissingDocJson = JSON.stringify({
+    error: {
+      code: 404,
+      status: 'NOT_FOUND',
+      message: `Document "projects/${expectedProject}/databases/${expectedDb}/documents/users/uid_alpha/system_settings/default" not found.`,
+    },
+  });
+  assert.equal(
+    isFirestoreDatabaseMissingDetail(realMissingDocJson),
+    false,
+    'Document 404 containing projects/.../databases/.../documents/... must NOT be classified as missing database'
+  );
+  assert.equal(
+    isFirestoreDatabaseMissingDetail(
+      JSON.stringify({
+        error: {
+          code: 404,
+          status: 'NOT_FOUND',
+          message: `The database (default) does not exist for project ${expectedProject} Please visit https://console.cloud.google.com/datastore/setup?project=${expectedProject}`,
+        },
+      })
+    ),
+    true
+  );
+  assert.equal(
+    isFirestoreDatabaseMissingDetail(
+      JSON.stringify({
+        error: {
+          code: 404,
+          status: 'NOT_FOUND',
+          message: `Database 'projects/${expectedProject}/databases/missing-db' not found.`,
+        },
+      })
+    ),
+    true
+  );
+
+  // 3. Successful workspace policy read
+  const okPolicyFetch: typeof fetch = async (input) => {
+    assert.equal(
+      String(input),
+      `https://firestore.googleapis.com/v1/projects/${expectedProject}/databases/${expectedDb}/documents/users/uid_alpha/system_settings/default`
+    );
+    return new Response(
+      JSON.stringify({
+        fields: {
+          faceThreshold: { doubleValue: 0.81 },
+          voiceThreshold: { doubleValue: 0.77 },
+          fingerprintThreshold: { doubleValue: 0.79 },
+          threeModalThreshold: { doubleValue: 0.83 },
+          fusionPolicy: { stringValue: 'strict_and' },
+          strictLiveness: { booleanValue: true },
+          modalityWeights: {
+            mapValue: {
+              fields: {
+                face: { doubleValue: 0.5 },
+                voice: { doubleValue: 0.3 },
+                fingerprint: { doubleValue: 0.2 },
+              },
+            },
+          },
+        },
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  };
+  const loadedPolicy = await loadWorkspacePolicy('uid_alpha', 'tok_ok', { fetchImpl: okPolicyFetch });
+  assert.ok(loadedPolicy);
+  assert.equal(loadedPolicy.loaded, true);
+  assert.equal(loadedPolicy.thresholds.face, 0.81);
+  assert.equal(loadedPolicy.fusionPolicy, 'strict_and');
+  assert.equal(loadedPolicy.strictLiveness, true);
+  assert.deepEqual(loadedPolicy.modalityWeights, { face: 0.5, voice: 0.3, fingerprint: 0.2 });
+
+  // 4. Missing policy document (real Firestore REST 404 payload) -> returns null + safe defaults
+  const realMissingDocFetch: typeof fetch = async () =>
+    new Response(realMissingDocJson, { status: 404, headers: { 'Content-Type': 'application/json' } });
+  const missingDocPolicy = await loadWorkspacePolicy('uid_alpha', 'tok_ok', { fetchImpl: realMissingDocFetch });
+  assert.equal(missingDocPolicy, null);
+
+  // 5. Safe default policy behavior when system_settings/default does not exist
+  const mergedDefault = mergeAuthoritativePolicy(missingDocPolicy, {
+    strictLiveness: false,
+    fusionPolicy: 'weighted_score',
+    thresholds: { face: 0.68 },
+  });
+  assert.equal(mergedDefault.livenessPolicy.strictLiveness, true, 'Missing workspace policy must enforce strictLiveness=true');
+  assert.equal(mergedDefault.thresholds.face, 0.68);
+  assert.equal(mergedDefault.fusionPolicy, 'weighted_score');
+
+  // 6. Missing Firestore database -> throws 503 firestore_database_not_found with full safe diagnostics
+  const missingDbFetch: typeof fetch = async () =>
+    new Response(
+      JSON.stringify({
+        error: {
+          code: 404,
+          status: 'NOT_FOUND',
+          message: `The database ${expectedDb} does not exist for project ${expectedProject}`,
+        },
+      }),
+      { status: 404, headers: { 'Content-Type': 'application/json' } }
+    );
+  await assert.rejects(
+    () => loadWorkspacePolicy('uid_alpha', 'tok_ok', { fetchImpl: missingDbFetch }),
+    (err: unknown) =>
+      err instanceof BackendHttpError &&
+      err.status === 503 &&
+      err.code === 'firestore_database_not_found' &&
+      err.authorizationStage === 'policy_read' &&
+      err.operation === 'get' &&
+      err.path === 'users/uid_alpha/system_settings/default' &&
+      err.projectId === expectedProject &&
+      err.databaseId === expectedDb &&
+      err.upstreamCode === 'NOT_FOUND'
+  );
+
+  // 7. Permission denied -> throws 403 firestore_permission_denied
+  const deniedFetch: typeof fetch = async () =>
+    new Response(
+      JSON.stringify({ error: { code: 403, status: 'PERMISSION_DENIED', message: 'Missing or insufficient permissions.' } }),
+      { status: 403, headers: { 'Content-Type': 'application/json' } }
+    );
+  await assert.rejects(
+    () => loadWorkspacePolicy('uid_alpha', 'tok_ok', { fetchImpl: deniedFetch }),
+    (err: unknown) =>
+      err instanceof BackendHttpError &&
+      err.status === 403 &&
+      err.code === 'firestore_permission_denied' &&
+      err.projectId === expectedProject &&
+      err.databaseId === expectedDb &&
+      err.upstreamCode === 'PERMISSION_DENIED'
+  );
+
+  // 8. Invalid project/database configuration validation
+  assert.throws(
+    () => validateFirestoreTargetConfig({ projectId: expectedProject, firestoreDatabaseId: '(default)' }),
+    (err: unknown) => err instanceof BackendHttpError && err.status === 500 && err.code === 'firestore_config_invalid'
+  );
+  await assert.rejects(
+    () =>
+      loadWorkspacePolicy('uid_alpha', 'tok_ok', {
+        fetchImpl: okPolicyFetch,
+        configOverride: { projectId: '', firestoreDatabaseId: expectedDb },
+      }),
+    (err: unknown) => err instanceof BackendHttpError && err.status === 500 && err.code === 'firestore_config_invalid'
+  );
+
+  // 9. Expired/invalid token -> 401 on Firestore REST + 401 on HTTP verification route when Identity Toolkit rejects token
+  const unauthFetch: typeof fetch = async () =>
+    new Response(
+      JSON.stringify({ error: { code: 401, status: 'UNAUTHENTICATED', message: 'Request had invalid authentication credentials.' } }),
+      { status: 401, headers: { 'Content-Type': 'application/json' } }
+    );
+  await assert.rejects(
+    () => loadWorkspacePolicy('uid_alpha', 'tok_expired', { fetchImpl: unauthFetch }),
+    (err: unknown) =>
+      err instanceof BackendHttpError &&
+      err.status === 401 &&
+      err.code === 'firestore_unauthenticated' &&
+      err.upstreamCode === 'UNAUTHENTICATED'
+  );
+
+  // 10. Network timeout / fetch error -> throws 503 firestore_unreachable (never silently swallowed as null)
+  const timeoutFetch: typeof fetch = async () => {
+    const err = new Error('The operation timed out.');
+    err.name = 'TimeoutError';
+    throw err;
+  };
+  await assert.rejects(
+    () => loadWorkspacePolicy('uid_alpha', 'tok_ok', { fetchImpl: timeoutFetch }),
+    (err: unknown) =>
+      err instanceof BackendHttpError &&
+      err.status === 503 &&
+      err.code === 'firestore_unreachable' &&
+      err.authorizationStage === 'policy_read' &&
+      err.upstreamCode === 'DEADLINE_EXCEEDED'
+  );
+
+  // 11. Express verification endpoint rejects expired/invalid Firebase ID token with HTTP 401
+  const origFetch = globalThis.fetch;
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address() as AddressInfo;
+  try {
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const url = String(input);
+      if (url.includes('identitytoolkit.googleapis.com')) {
+        return new Response(JSON.stringify({ error: { code: 400, message: 'INVALID_ID_TOKEN' } }), { status: 400 });
+      }
+      return origFetch(input, init);
+    }) as typeof fetch;
+
+    const verRes = await origFetch(`http://127.0.0.1:${addr.port}/api/v1/verification/multimodal`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer expired.jwt.token',
+      },
+      body: JSON.stringify({ identityRef: 'test_id' }),
+    });
+    assert.equal(verRes.status, 401);
+    const verJson = (await verRes.json()) as { error: string; authorizationStage?: string; requestId?: string };
+    assert.equal(verJson.error, 'invalid_credentials');
+    assert.equal(verJson.authorizationStage, 'firebase_id_token_lookup');
+    assert.ok(verJson.requestId);
+  } finally {
+    globalThis.fetch = origFetch;
+    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  }
+});
+
