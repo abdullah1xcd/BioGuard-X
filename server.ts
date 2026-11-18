@@ -3065,6 +3065,14 @@ app.post(
       res.status(400).json({ error: 'invalid_identity_ref', message: 'Valid identityRefA and identityRefB are required.', requestId });
       return;
     }
+    if (refA === refB) {
+      res.status(400).json({
+        error: 'same_identity_comparison',
+        message: 'Identity comparison requires two distinct enrolled identity references.',
+        requestId,
+      });
+      return;
+    }
 
     const [entryA, entryB, workspacePolicy] = await Promise.all([
       loadVaultEntry(req.auth!.uid, refA, req.auth!.idToken),

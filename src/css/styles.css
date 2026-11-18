@@ -1648,3 +1648,50 @@ html.light .btn-primary {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }
+
+
+/* Analytics report print layout: use the browser print dialog to print or save as PDF. */
+@media print {
+  body * {
+    visibility: hidden !important;
+  }
+
+  .print-report-mode,
+  .print-report-mode * {
+    visibility: visible !important;
+    color: #111 !important;
+    border-color: #ccc !important;
+    box-shadow: none !important;
+    text-shadow: none !important;
+  }
+
+  .print-report-mode {
+    position: absolute !important;
+    inset: 0 auto auto 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 12mm !important;
+    background: #fff !important;
+  }
+
+  .print-report-mode .page-actions,
+  .print-report-mode #an-days,
+  .print-report-mode #an-scope,
+  .print-report-mode #an-custom-dates {
+    display: none !important;
+  }
+
+  .print-report-mode .panel,
+  .print-report-mode .kpi-strip,
+  .print-report-mode .chart-card,
+  .print-report-mode table {
+    background: #fff !important;
+    break-inside: avoid;
+  }
+
+  .print-report-mode canvas,
+  .print-report-mode svg {
+    max-width: 100% !important;
+  }
+}
