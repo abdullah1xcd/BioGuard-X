@@ -447,6 +447,14 @@ async function bootstrapAuthenticatedSession(fbUser) {
 
   const conn = await testFirestoreConnection();
   appState.firestoreOk = conn.connected;
+  if (!conn.connected && conn.code === 'wrong_firestore_database') {
+    const cfgErr = new Error(conn.error || 'Firestore named database configuration is invalid.');
+    cfgErr.diagnosticCode = 'wrong_firestore_database';
+    cfgErr.diagnosticTitle = 'Wrong Firestore Named Database Configuration';
+    cfgErr.diagnosticExplanation = conn.error;
+    cfgErr.diagnosticRemediation = 'Verify firebase-applet-config.json specifies the named database ID rather than "(default)".';
+    throw cfgErr;
+  }
 
   const profile = await provisionUserProfile(fbUser);
   const serverMe = await fetchServerSession();
@@ -572,9 +580,13 @@ function initApp() {
     try {
       await bootstrapAuthenticatedSession(fbUser);
     } catch (err) {
-      showToast(err.message, 'danger');
+      const msg =
+        err?.diagnosticExplanation ||
+        (typeof err?.message === 'string' && !err.message.trim().startsWith('{') ? err.message : 'Workspace session initialization failed due to Firestore permissions or configuration.');
+      const displayText = [err?.diagnosticTitle, msg, err?.diagnosticRemediation].filter(Boolean).join(' — ');
+      showToast((err?.diagnosticTitle ? `${err.diagnosticTitle}: ${msg}` : msg).slice(0, 220), 'danger');
       authError.hidden = false;
-      authError.textContent = err.message;
+      authError.textContent = displayText;
       appShell.hidden = true;
       authGate.hidden = false;
     }

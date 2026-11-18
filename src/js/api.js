@@ -1,28 +1,83 @@
-import { getFreshIdToken } from './firebase.js';
+import { getFreshIdToken, getFirebaseTargetInfo } from './firebase.js';
+import {
+  classifyFirestoreDiagnostic,
+  sanitizeDiagnosticPayload,
+} from '../shared/firestoreDiagnostics.ts';
 
 async function apiFetch(url, options = {}) {
   const token = await getFreshIdToken();
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-      ...(options.headers || {}),
-    },
-  });
+  const target = getFirebaseTargetInfo();
+  let res;
+  try {
+    res = await fetch(url, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        ...(options.headers || {}),
+      },
+    });
+  } catch (netErr) {
+    const rawMsg = netErr instanceof Error ? netErr.message : String(netErr || 'Network request failed');
+    const classified = classifyFirestoreDiagnostic({
+      code: 'network_failure',
+      operationStage: 'api_request',
+      operationType: options.method || 'GET',
+      path: url,
+      httpStatus: 503,
+      message: rawMsg,
+      projectId: target.projectId,
+      databaseId: target.databaseId,
+    });
+    const err = new Error(`Network request failed while calling ${url}: ${rawMsg}`, { cause: netErr });
+    err.code = 'network_failure';
+    err.status = 503;
+    err.httpStatus = 503;
+    err.operationStage = 'api_request';
+    err.operationType = options.method || 'GET';
+    err.path = url;
+    err.projectId = target.projectId;
+    err.databaseId = target.databaseId;
+    err.diagnosticCode = classified.diagnosticCode;
+    err.diagnosticCategory = classified.diagnosticCategory;
+    err.diagnosticTitle = classified.diagnosticTitle;
+    err.diagnosticExplanation = classified.diagnosticExplanation;
+    err.diagnosticRemediation = classified.diagnosticRemediation;
+    throw err;
+  }
+
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    const rawCode = data.error || 'api_error';
+    const httpStatus = data.httpStatus || res.status;
+    const classified = classifyFirestoreDiagnostic({
+      code: rawCode,
+      rawCode: data.upstreamCode || rawCode,
+      operationStage: data.authorizationStage || undefined,
+      operationType: data.operation || options.method || 'POST',
+      path: data.path || url,
+      httpStatus,
+      message: data.message || `API request failed (${res.status})`,
+      projectId: data.projectId || target.projectId,
+      databaseId: data.databaseId || target.databaseId,
+    });
     const err = new Error(data.message || `API request failed (${res.status})`);
-    err.code = data.error || 'api_error';
-    err.status = data.httpStatus || res.status;
+    err.code = rawCode;
+    err.status = httpStatus;
+    err.httpStatus = httpStatus;
     err.requestId = data.requestId || res.headers.get('X-Request-Id') || null;
     err.operationStage = data.authorizationStage || null;
     err.operationType = data.operation || null;
     err.path = data.path || null;
-    err.projectId = data.projectId || null;
-    err.databaseId = data.databaseId || null;
+    err.projectId = data.projectId || target.projectId;
+    err.databaseId = data.databaseId || target.databaseId;
     err.upstreamCode = data.upstreamCode || null;
-    err.payload = data;
+    err.diagnosticCode = classified.diagnosticCode;
+    err.diagnosticCategory = classified.diagnosticCategory;
+    err.diagnosticTitle = classified.diagnosticTitle;
+    err.diagnosticExplanation = classified.diagnosticExplanation;
+    err.diagnosticRemediation = classified.diagnosticRemediation;
+    err.payload = sanitizeDiagnosticPayload(data);
     throw err;
   }
   return data;

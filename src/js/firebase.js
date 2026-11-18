@@ -29,10 +29,26 @@ import {
   buildVerificationRecordPayload,
   validateVerificationRecordDoc,
 } from '../shared/verificationRecord.ts';
+import {
+  BOOTSTRAPPED_ADMIN_EMAIL,
+  classifyFirestoreDiagnostic,
+  isBootstrapAdminEmail,
+  sanitizeDiagnosticPayload,
+  validateClientFirebaseConfig,
+} from '../shared/firestoreDiagnostics.ts';
 
+const clientConfigCheck = validateClientFirebaseConfig(firebaseConfig);
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
+
+export function getFirebaseTargetInfo() {
+  return {
+    projectId: clientConfigCheck.projectId,
+    databaseId: clientConfigCheck.databaseId,
+    configValid: clientConfigCheck.valid,
+  };
+}
 
 const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
@@ -74,17 +90,88 @@ export function getFirestoreTelemetry() {
   };
 }
 
-export function handleFirestoreError(error, operationType, path, operationStage = null, payloadSummary = null) {
+function makeDiagnosticError(message, operationStage, code, extra = {}) {
+  const err = new Error(message);
+  const classified = classifyFirestoreDiagnostic({
+    code: code || operationStage,
+    operationStage,
+    message,
+    projectId: clientConfigCheck.projectId,
+    databaseId: clientConfigCheck.databaseId,
+    configValid: clientConfigCheck.valid,
+    isAuthenticated: Boolean(auth.currentUser?.uid),
+    emailVerified: auth.currentUser?.emailVerified,
+    isBootstrapAdmin: isBootstrapAdminEmail(auth.currentUser?.email, auth.currentUser?.emailVerified),
+    ...extra,
+  });
+  return Object.assign(err, {
+    operationStage,
+    code: code || operationStage,
+    httpStatus: classified.httpStatus,
+    status: classified.httpStatus,
+    projectId: classified.projectId,
+    databaseId: classified.databaseId,
+    diagnosticCode: classified.diagnosticCode,
+    diagnosticCategory: classified.diagnosticCategory,
+    diagnosticTitle: classified.diagnosticTitle,
+    diagnosticExplanation: classified.diagnosticExplanation,
+    diagnosticRemediation: classified.diagnosticRemediation,
+    ...extra,
+  });
+}
+
+async function probeUserWorkspaceState(uid) {
+  if (!uid || !clientConfigCheck.valid) return { probed: false };
+  const ref = doc(db, 'users', uid);
+  try {
+    let snap;
+    try {
+      snap = await getDocFromServer(ref);
+    } catch {
+      snap = await getDoc(ref);
+    }
+    if (!snap.exists()) {
+      return {
+        probed: true,
+        userDocExists: false,
+        userRole: null,
+        userStatus: null,
+      };
+    }
+    const data = snap.data() || {};
+    return {
+      probed: true,
+      userDocExists: true,
+      userRole: typeof data.role === 'string' ? data.role : null,
+      userStatus: typeof data.status === 'string' ? data.status : null,
+    };
+  } catch (probeErr) {
+    return {
+      probed: false,
+      probeErrorCode: String(probeErr?.code || 'unknown'),
+    };
+  }
+}
+
+export function handleFirestoreError(
+  error,
+  operationType,
+  path,
+  operationStage = null,
+  payloadSummary = null,
+  diagnosticContext = null
+) {
+  const user = auth.currentUser;
   const errInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
-      userId: auth.currentUser?.uid || null,
-      email: auth.currentUser?.email || null,
-      emailVerified: auth.currentUser?.emailVerified ?? null,
-      isAnonymous: auth.currentUser?.isAnonymous ?? null,
-      tenantId: auth.currentUser?.tenantId || null,
+      userId: user?.uid || null,
+      email: user?.email || null,
+      emailVerified: user?.emailVerified ?? null,
+      isAnonymous: user?.isAnonymous ?? null,
+      tenantId: user?.tenantId || null,
       providerInfo:
-        auth.currentUser?.providerData?.map((p) => ({
+        user?.providerData?.map((p) => ({
           providerId: p.providerId,
           email: p.email,
         })) || [],
@@ -95,14 +182,50 @@ export function handleFirestoreError(error, operationType, path, operationStage 
   const serialized = JSON.stringify(errInfo);
   console.error('Firestore Error:', serialized);
   const rawCode = String(error?.code || '');
-  const httpStatus = rawCode === 'permission-denied' ? 403 : rawCode === 'unauthenticated' ? 401 : undefined;
+  const classified = classifyFirestoreDiagnostic({
+    code: rawCode ? `firestore_${rawCode.replace(/[^a-zA-Z0-9_]/g, '_')}` : 'firestore_error',
+    rawCode,
+    operationStage: operationStage || error?.operationStage || operationType,
+    operationType,
+    path,
+    message: errInfo.error,
+    projectId: clientConfigCheck.projectId,
+    databaseId: clientConfigCheck.databaseId,
+    configValid: clientConfigCheck.valid,
+    isAuthenticated: Boolean(user?.uid),
+    emailVerified: user?.emailVerified,
+    isBootstrapAdmin: isBootstrapAdminEmail(user?.email, user?.emailVerified),
+    ...(diagnosticContext || {}),
+  });
+  const safePayloadSummary = payloadSummary ? sanitizeDiagnosticPayload(payloadSummary) : null;
+  const workspaceDiagnostics = diagnosticContext
+    ? sanitizeDiagnosticPayload({
+        userDocExists: diagnosticContext.userDocExists ?? null,
+        userRole: diagnosticContext.userRole ?? null,
+        userStatus: diagnosticContext.userStatus ?? null,
+        identityExists: diagnosticContext.identityExists ?? null,
+        identityStatus: diagnosticContext.identityStatus ?? null,
+        emailVerified: user?.emailVerified ?? null,
+        isBootstrapAdmin: isBootstrapAdminEmail(user?.email, user?.emailVerified),
+      })
+    : null;
+  const httpStatus = classified.httpStatus || (rawCode === 'permission-denied' ? 403 : rawCode === 'unauthenticated' ? 401 : undefined);
   const wrapped = Object.assign(new Error(serialized, { cause: error }), {
     code: rawCode ? `firestore_${rawCode.replace(/[^a-zA-Z0-9_]/g, '_')}` : 'firestore_error',
+    upstreamCode: rawCode || undefined,
     ...(httpStatus ? { status: httpStatus, httpStatus } : {}),
     operationStage: operationStage || error?.operationStage || operationType,
     operationType,
     path,
-    ...(payloadSummary ? { payloadSummary } : {}),
+    projectId: classified.projectId,
+    databaseId: classified.databaseId,
+    diagnosticCode: classified.diagnosticCode,
+    diagnosticCategory: classified.diagnosticCategory,
+    diagnosticTitle: classified.diagnosticTitle,
+    diagnosticExplanation: classified.diagnosticExplanation,
+    diagnosticRemediation: classified.diagnosticRemediation,
+    ...(workspaceDiagnostics ? { workspaceDiagnostics } : {}),
+    ...(safePayloadSummary ? { payloadSummary: safePayloadSummary } : {}),
     isFirestoreError: true,
   });
   throw wrapped;
@@ -110,16 +233,41 @@ export function handleFirestoreError(error, operationType, path, operationStage 
 
 // Connection check on boot
 export async function testFirestoreConnection() {
+  if (!clientConfigCheck.valid) {
+    return {
+      connected: false,
+      code: 'wrong_firestore_database',
+      projectId: clientConfigCheck.projectId,
+      databaseId: clientConfigCheck.databaseId,
+      error: clientConfigCheck.reason,
+    };
+  }
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
-    return { connected: true };
+    return { connected: true, projectId: clientConfigCheck.projectId, databaseId: clientConfigCheck.databaseId };
   } catch (error) {
+    const rawCode = String(error?.code || '');
     const msg = error instanceof Error ? error.message : String(error);
-    if (msg.includes('the client is offline')) {
-      return { connected: false, error: 'Firestore client is offline. Check Firebase configuration.' };
+    if (msg.includes('the client is offline') || rawCode === 'unavailable' || rawCode === 'deadline-exceeded') {
+      return {
+        connected: false,
+        code: 'network_failure',
+        projectId: clientConfigCheck.projectId,
+        databaseId: clientConfigCheck.databaseId,
+        error: 'Firestore client is offline or unreachable. Check network connection and Firebase configuration.',
+      };
+    }
+    if (/database .* does not exist|database .* not found/i.test(msg)) {
+      return {
+        connected: false,
+        code: 'wrong_firestore_database',
+        projectId: clientConfigCheck.projectId,
+        databaseId: clientConfigCheck.databaseId,
+        error: msg,
+      };
     }
     // Permission denied on /test/connection still proves server reachability
-    return { connected: true };
+    return { connected: true, projectId: clientConfigCheck.projectId, databaseId: clientConfigCheck.databaseId };
   }
 }
 
@@ -176,27 +324,27 @@ function makeId(prefix) {
   return `${prefix}_${Date.now()}_${rand}`.replace(/[^a-zA-Z0-9_-]/g, '');
 }
 
-const BOOTSTRAPPED_ADMIN_EMAIL = 'abdullahmohamedharoon8@gmail.com';
 const VALID_IDENTITY_RE = /^[a-zA-Z0-9_-]{2,64}$/;
 const SUPPORTED_MODALITIES = new Set(['face', 'voice', 'fingerprint']);
 
-function makeDiagnosticError(message, operationStage, code) {
-  const err = new Error(message);
-  err.operationStage = operationStage;
-  err.code = code || operationStage;
-  return err;
-}
-
 // Idempotent user provisioning & bootstrap admin self-healing in /users/{uid} and /admins/{uid}
 export async function provisionUserProfile(fbUser) {
+  if (!clientConfigCheck.valid) {
+    throw makeDiagnosticError(
+      clientConfigCheck.reason,
+      'user_profile_provisioning',
+      'wrong_firestore_database'
+    );
+  }
   if (!fbUser?.uid) {
-    throw makeDiagnosticError('Authenticated user UID is missing.', 'user_profile_provisioning', 'missing_uid');
+    throw makeDiagnosticError('Authenticated user UID is missing.', 'user_profile_provisioning', 'unauthenticated');
   }
   if (!fbUser.emailVerified) {
     throw makeDiagnosticError(
       'Verified Google email address is required before provisioning profile.',
       'user_profile_provisioning',
-      'email_not_verified'
+      'email_not_verified',
+      { emailVerified: false }
     );
   }
 
@@ -207,9 +355,11 @@ export async function provisionUserProfile(fbUser) {
     fbUser.emailVerified === true &&
     String(fbUser.email || '').trim().toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL;
 
+  let existingState = null;
   try {
     const snap = await getDoc(ref);
     if (!snap.exists()) {
+      existingState = { userDocExists: false, userRole: isBootstrap ? 'super_admin' : 'operator', userStatus: 'active' };
       const initialRole = isBootstrap ? 'super_admin' : 'operator';
       const fallbackEmail = `${fbUser.uid}@users.local`;
       const payload = {
@@ -238,7 +388,20 @@ export async function provisionUserProfile(fbUser) {
       const created = await getDoc(ref);
       return created.data();
     } else {
-      const existingData = snap.data();
+      const existingData = snap.data() || {};
+      existingState = {
+        userDocExists: true,
+        userRole: typeof existingData.role === 'string' ? existingData.role : null,
+        userStatus: typeof existingData.status === 'string' ? existingData.status : null,
+      };
+      if (!isBootstrap && existingData.status === 'suspended') {
+        throw makeDiagnosticError(
+          'Your BioGuard X operator account is suspended.',
+          'account_status',
+          'account_suspended',
+          { ...existingState, path: userPath }
+        );
+      }
       const updates = {
         displayName: (fbUser.displayName || existingData.displayName || 'Operator').slice(0, 120),
         photoURL: (fbUser.photoURL || existingData.photoURL || '').slice(0, 500),
@@ -265,8 +428,11 @@ export async function provisionUserProfile(fbUser) {
       return updated.data();
     }
   } catch (err) {
-    if (err?.operationStage) throw err;
-    handleFirestoreError(err, OperationType.WRITE, userPath, 'user_profile_provisioning');
+    if (err?.diagnosticCode || err?.operationStage) throw err;
+    handleFirestoreError(err, OperationType.WRITE, userPath, 'user_profile_provisioning', null, {
+      ...(existingState || {}),
+      isBootstrapAdmin: isBootstrap,
+    });
   }
 }
 
@@ -425,8 +591,25 @@ export async function recordVerificationMetadata({
   benchmarkBatchId,
   provenanceSignature,
 }) {
-  const uid = auth.currentUser?.uid;
+  if (!clientConfigCheck.valid) {
+    throw makeDiagnosticError(
+      clientConfigCheck.reason,
+      'verification_record_validation',
+      'wrong_firestore_database'
+    );
+  }
+
+  const user = auth.currentUser;
+  const uid = user?.uid;
   if (!uid) throw makeDiagnosticError('Not signed in.', 'verification_record_validation', 'unauthenticated');
+  if (user.emailVerified !== true) {
+    throw makeDiagnosticError(
+      'Verified Google email address is required before creating verification records.',
+      'email_verification',
+      'email_not_verified',
+      { emailVerified: false }
+    );
+  }
 
   const cleanIdentityRef = String(identityRef || '').trim();
   if (!VALID_IDENTITY_RE.test(cleanIdentityRef)) {
@@ -458,13 +641,19 @@ export async function recordVerificationMetadata({
 
   // Verify the referenced identity metadata exists, belongs to this workspace, and is active before creating a record
   const identityPath = `users/${uid}/identities/${cleanIdentityRef}`;
+  let identityProbe = {
+    identityExists: null,
+    identityStatus: null,
+    identityRefMatches: null,
+  };
   try {
     const idSnap = await getDoc(doc(db, 'users', uid, 'identities', cleanIdentityRef));
     if (!idSnap.exists()) {
       throw makeDiagnosticError(
         `Identity metadata not found at "${identityPath}". Re-enroll identity metadata before verifying.`,
         'identity_lookup',
-        'identity_metadata_missing'
+        'identity_metadata_missing',
+        { path: identityPath, identityExists: false }
       );
     }
     const idData = idSnap.data();
@@ -472,19 +661,29 @@ export async function recordVerificationMetadata({
       throw makeDiagnosticError(
         `Identity "${cleanIdentityRef}" is currently "${idData.status}" and cannot accept new verification records.`,
         'identity_lookup',
-        'identity_inactive'
+        'identity_inactive',
+        { path: identityPath, identityExists: true, identityStatus: idData.status, identityRefMatches: idData.identityRef === cleanIdentityRef }
       );
     }
     if (idData.identityRef !== cleanIdentityRef) {
       throw makeDiagnosticError(
         `Identity metadata integrity mismatch at "${identityPath}" (document identityRef="${idData.identityRef}").`,
         'identity_lookup',
-        'identity_ref_mismatch'
+        'identity_ref_mismatch',
+        { path: identityPath, identityExists: true, identityStatus: idData.status, identityRefMatches: false }
       );
     }
+    identityProbe = {
+      identityExists: true,
+      identityStatus: idData.status,
+      identityRefMatches: true,
+    };
   } catch (err) {
-    if (err?.operationStage) throw err;
-    handleFirestoreError(err, OperationType.GET, identityPath, 'identity_lookup');
+    if (err?.diagnosticCode || err?.operationStage) throw err;
+    const userState = await probeUserWorkspaceState(uid);
+    handleFirestoreError(err, OperationType.GET, identityPath, 'identity_lookup', null, {
+      ...userState,
+    });
   }
 
   const verificationId = makeId('ver');
@@ -536,11 +735,12 @@ export async function recordVerificationMetadata({
       throw makeDiagnosticError(
         `Verification record payload failed pre-write validation: ${schemaCheck.errors.join(' ')}`,
         'verification_record_validation',
-        'verification_record_schema_invalid'
+        'verification_record_schema_invalid',
+        { schemaValid: false, schemaErrors: schemaCheck.errors }
       );
     }
 
-    debugSummary = {
+    debugSummary = sanitizeDiagnosticPayload({
       identityRef: cleanIdentityRef,
       modalities: safeModalities,
       pipeline: docData.pipeline,
@@ -551,15 +751,20 @@ export async function recordVerificationMetadata({
       datasetCategory: docData.datasetCategory,
       fieldCount: Object.keys(docData).length,
       fieldKeys: Object.keys(docData),
-    };
+    });
     await setDoc(doc(db, 'users', uid, 'verification_records', verificationId), docData);
     trackFsOp('write', t0, true);
     return verificationId;
   } catch (err) {
     trackFsOp('write', t0, false);
-    if (err?.operationStage) throw err;
+    if (err?.diagnosticCode || err?.operationStage) throw err;
+    const userState = await probeUserWorkspaceState(uid);
     console.error('Verification record write failed; safe payload summary:', debugSummary);
-    handleFirestoreError(err, OperationType.CREATE, path, 'verification_record_creation', debugSummary);
+    handleFirestoreError(err, OperationType.CREATE, path, 'verification_record_creation', debugSummary, {
+      ...userState,
+      ...identityProbe,
+      schemaValid: true,
+    });
   }
 }
 

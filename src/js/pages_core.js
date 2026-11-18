@@ -66,6 +66,55 @@ function formatDecisionBadge(v) {
   return `<span class="state-text ${cls}">${escapeHtml(dec)}</span>`;
 }
 
+function buildDiagnosticErrorView(err, heading) {
+  const diagCode = String(err?.diagnosticCode || '');
+  const diagTitle = String(err?.diagnosticTitle || '');
+  const diagExplanation = String(err?.diagnosticExplanation || '');
+  const diagRemediation = String(err?.diagnosticRemediation || '');
+  const stage = String(err?.operationStage || '');
+  const opType = String(err?.operationType || '');
+  const opPath = String(err?.path || '');
+  const status = Number(err?.status || 0);
+  const reqId = String(err?.requestId || '');
+  const projectId = String(err?.projectId || '');
+  const databaseId = String(err?.databaseId || '');
+  const upstreamCode = String(err?.upstreamCode || '');
+  const ws = err?.workspaceDiagnostics || null;
+  const payloadSummary = err?.payloadSummary || null;
+
+  const isRawJsonMessage = typeof err?.message === 'string' && err.message.trim().startsWith('{');
+  const primarySummary = diagExplanation || (isRawJsonMessage ? 'Operation rejected by Firestore Security Rules.' : String(err?.message || 'Operation failed.'));
+
+  const diagParts = [
+    diagCode ? `diag=${diagCode}` : '',
+    stage ? `stage=${stage}` : '',
+    opType ? `op=${opType}` : '',
+    opPath ? `path=${opPath}` : '',
+    status ? `http=${status}` : '',
+    upstreamCode ? `upstream=${upstreamCode}` : '',
+    ws?.userRole ? `role=${ws.userRole}` : '',
+    ws?.userStatus ? `acct=${ws.userStatus}` : '',
+    ws?.identityStatus ? `idStatus=${ws.identityStatus}` : '',
+    projectId ? `project=${projectId}` : '',
+    databaseId ? `db=${databaseId}` : '',
+    reqId ? `req=${reqId}` : '',
+    payloadSummary?.outcome ? `outcome=${payloadSummary.outcome}` : '',
+    payloadSummary?.finalDecision ? `decision=${payloadSummary.finalDecision}` : '',
+    payloadSummary?.livenessStatus ? `liveness=${payloadSummary.livenessStatus}` : '',
+    payloadSummary?.reasonCode ? `reason=${payloadSummary.reasonCode}` : '',
+  ].filter(Boolean);
+
+  const subTitle = diagTitle && diagTitle !== heading ? `<div style="font-size:13px;font-weight:600;margin-top:2px;">${escapeHtml(diagTitle)}</div>` : '';
+  const remediationHtml = diagRemediation ? `<div style="font-size:12.5px;margin-top:6px;"><strong>Recommended Fix:</strong> ${escapeHtml(diagRemediation)}</div>` : '';
+  const rawDetailsHtml = isRawJsonMessage || payloadSummary
+    ? `<details style="margin-top:6px;"><summary style="cursor:pointer;font-size:12px;">Technical Diagnostics</summary><pre class="mono" style="margin-top:4px;white-space:pre-wrap;font-size:11.5px;overflow-x:auto;">${escapeHtml(isRawJsonMessage ? err.message : JSON.stringify(payloadSummary, null, 2))}</pre></details>`
+    : '';
+
+  const toastText = diagTitle ? `${diagTitle}: ${primarySummary}` : primarySummary;
+  const html = `<div class="notice-strip danger"><div><strong>${escapeHtml(heading)}</strong>${subTitle}<div style="margin-top:3px;">${escapeHtml(primarySummary)}</div>${remediationHtml}${diagParts.length ? `<div class="meta-line mono" style="margin-top:6px;">${escapeHtml(diagParts.join(' · '))}</div>` : ''}${rawDetailsHtml}</div></div>`;
+  return { html, toastText: toastText.slice(0, 220) };
+}
+
 // 1. MAIN DASHBOARD
 export function renderOverview(container, { appState, navigate }) {
   const { identities, verifications, alerts, health, permissions } = appState;
@@ -1134,37 +1183,22 @@ export function renderEnrollment(container, { appState, navigate }) {
     } catch (err) {
       const code = String(err?.code || '');
       const stage = String(err?.operationStage || '');
-      const opType = String(err?.operationType || '');
-      const opPath = String(err?.path || '');
       const status = Number(err?.status || 0);
-      const reqId = String(err?.requestId || '');
-      const projectId = String(err?.projectId || '');
-      const databaseId = String(err?.databaseId || '');
-      const upstreamCode = String(err?.upstreamCode || '');
       const heading =
         stage === 'identity_enrollment'
           ? 'Identity Metadata Enrollment Failed'
           : code === 'vault_secret_not_configured'
           ? 'Vault Encryption Secret Not Configured'
-          : code.startsWith('firestore_')
+          : code.startsWith('firestore_') || err?.diagnosticCode
           ? 'Firestore Configuration / Permission Error'
-          : status >= 500 || code === 'backend_unavailable'
+          : status >= 500 || code === 'backend_unavailable' || code === 'network_failure'
           ? 'Backend / Storage Request Failed'
           : code === 'vault_decryption_failed'
           ? 'Existing Vault Record Decryption Mismatch'
           : 'Enrollment Quality / Validation Rejected';
-      const diagParts = [
-        stage ? `stage=${stage}` : '',
-        opType ? `op=${opType}` : '',
-        opPath ? `path=${opPath}` : '',
-        status ? `http=${status}` : '',
-        upstreamCode ? `upstream=${upstreamCode}` : '',
-        projectId ? `project=${projectId}` : '',
-        databaseId ? `db=${databaseId}` : '',
-        reqId ? `req=${reqId}` : '',
-      ].filter(Boolean);
-      container.querySelector('#be-result').innerHTML = `<div class="notice-strip danger"><div><strong>${escapeHtml(heading)}</strong><div>${escapeHtml(err.message)}</div>${diagParts.length ? `<div class="meta-line mono" style="margin-top:4px;">${escapeHtml(diagParts.join(' · '))}</div>` : ''}</div></div>`;
-      showToast(err.message, 'danger');
+      const diagView = buildDiagnosticErrorView(err, heading);
+      container.querySelector('#be-result').innerHTML = diagView.html;
+      showToast(diagView.toastText, 'danger');
     } finally {
       submitBtn.disabled = false;
       submitBtn.textContent = 'Enroll Identity';
@@ -2271,13 +2305,7 @@ export function renderVerification(container, { appState, navigate }) {
     } catch (err) {
       const stage = String(err?.operationStage || '');
       const code = String(err?.code || '');
-      const opType = String(err?.operationType || '');
-      const opPath = String(err?.path || '');
       const status = Number(err?.status || 0);
-      const reqId = String(err?.requestId || '');
-      const projectId = String(err?.projectId || '');
-      const databaseId = String(err?.databaseId || '');
-      const upstreamCode = String(err?.upstreamCode || '');
       const heading =
         stage === 'identity_lookup'
           ? 'Identity Metadata Lookup Failed'
@@ -2287,28 +2315,14 @@ export function renderVerification(container, { appState, navigate }) {
           ? 'Firestore Verification Record Permission / Write Error'
           : stage === 'audit_logging'
           ? 'Audit Log Persistence Error'
-          : code.startsWith('firestore_')
+          : code.startsWith('firestore_') || err?.diagnosticCode
           ? 'Firestore Permission / Configuration Error'
-          : status >= 500
+          : status >= 500 || code === 'network_failure'
           ? 'Backend Verification Request Failed'
           : 'Verification / Quality Gate Rejected';
-      const payloadSummary = err?.payloadSummary || null;
-      const diagParts = [
-        stage ? `stage=${stage}` : '',
-        opType ? `op=${opType}` : '',
-        opPath ? `path=${opPath}` : '',
-        status ? `http=${status}` : '',
-        upstreamCode ? `upstream=${upstreamCode}` : '',
-        projectId ? `project=${projectId}` : '',
-        databaseId ? `db=${databaseId}` : '',
-        reqId ? `req=${reqId}` : '',
-        payloadSummary?.outcome ? `outcome=${payloadSummary.outcome}` : '',
-        payloadSummary?.finalDecision ? `decision=${payloadSummary.finalDecision}` : '',
-        payloadSummary?.livenessStatus ? `liveness=${payloadSummary.livenessStatus}` : '',
-        payloadSummary?.reasonCode ? `reason=${payloadSummary.reasonCode}` : '',
-      ].filter(Boolean);
-      resultEl.innerHTML = `<div class="notice-strip danger"><div><strong>${escapeHtml(heading)}</strong><div>${escapeHtml(err.message)}</div>${diagParts.length ? `<div class="meta-line mono" style="margin-top:4px;">${escapeHtml(diagParts.join(' · '))}</div>` : ''}</div></div>`;
-      showToast(err.message, 'danger');
+      const diagView = buildDiagnosticErrorView(err, heading);
+      resultEl.innerHTML = diagView.html;
+      showToast(diagView.toastText, 'danger');
     } finally {
       runBtn.disabled = false; runBtn.textContent = 'Verify Identity';
     }

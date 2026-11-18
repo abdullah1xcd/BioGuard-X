@@ -1824,6 +1824,8 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
         message: 'A verified Google/Firebase email address is required to access BioGuard X.',
         httpStatus: 403,
         authorizationStage: 'email_verification',
+        projectId: firebaseConfig.projectId,
+        databaseId: firebaseConfig.firestoreDatabaseId,
         requestId,
       });
       return;
@@ -1841,6 +1843,8 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
         httpStatus: 403,
         authorizationStage: 'account_status',
         path: `users/${decoded.uid}`,
+        projectId: firebaseConfig.projectId,
+        databaseId: firebaseConfig.firestoreDatabaseId,
         requestId,
       });
       return;
@@ -1905,6 +1909,8 @@ function requireCapability(capability: string) {
         authorizationStage: 'capability_check',
         operation: capability,
         path: req.auth?.uid ? `users/${req.auth.uid}` : undefined,
+        projectId: firebaseConfig.projectId,
+        databaseId: firebaseConfig.firestoreDatabaseId,
         requestId: getRequestId(res),
       });
       return;

@@ -2224,5 +2224,415 @@ test('Face Pipeline: resilient multi-frame orchestrator retries transient failur
   }
 });
 
+test('VerificationRecord create rule evaluator covers operator, bootstrap admin, unverified email, cross-UID, viewer, suspended, identity, schema, timestamp & outdated rules', async () => {
+  const { buildVerificationRecordPayload } = await import('../src/shared/verificationRecord.ts');
+  const {
+    EXPECTED_FIREBASE_PROJECT_ID,
+    EXPECTED_FIRESTORE_DATABASE_ID,
+    evaluateVerificationRecordCreateRule,
+  } = await import('../src/shared/firestoreDiagnostics.ts');
+
+  const appletConfig = JSON.parse(
+    fs.readFileSync(path.join(process.cwd(), 'firebase-applet-config.json'), 'utf8')
+  ) as { projectId: string; firestoreDatabaseId: string };
+  assert.equal(appletConfig.projectId, EXPECTED_FIREBASE_PROJECT_ID);
+  assert.equal(appletConfig.firestoreDatabaseId, EXPECTED_FIRESTORE_DATABASE_ID);
+
+  const serverTime = { _methodName: 'serverTimestamp' };
+  const uid = 'pNFDVh6FlAgbGQuN48H1qaXy7tv1';
+  const verId = 'ver_1794900001_regression';
+  const identityRef = 'abdullah_primary';
+
+  const makePayload = (overrides: Record<string, unknown> = {}, overrideUid = uid, overrideVerId = verId) => ({
+    ...buildVerificationRecordPayload({
+      uid: overrideUid,
+      verificationId: overrideVerId,
+      identityRef,
+      modalities: ['face'],
+      pipeline: 'hierarchical',
+      outcome: 'match',
+      finalDecision: 'VERIFIED',
+      livenessStatus: 'LIVENESS PASSED',
+      livenessDecision: 'PASSED',
+      challengeVerified: true,
+      datasetCategory: 'operational',
+      captureFailure: false,
+      reasonCode: 'single_modal_face_verified',
+      score: 0.912,
+      confidence: 0.91,
+      identityConfidence: 0.93,
+      sampleQualityScore: 0.89,
+      livenessConfidence: 0.92,
+      confidenceBand: 'high',
+      conflictDetected: false,
+      processingTimeMs: 36.2,
+      featureVersion: 'v2.0-multimodal',
+      groundTruth: 'unlabeled',
+      isTestProbe: false,
+      riskScore: 10,
+      riskLevel: 'low',
+      livenessPassed: true,
+      livenessScore: 0.94,
+      adaptiveApplied: false,
+      partition: 'unassigned',
+      sampleHash: 'e'.repeat(64),
+      provenanceSignature: 'f'.repeat(64),
+      modalityEvaluations: {
+        face: { score: 0.912, qualityScore: 89, status: 'MATCH' },
+      },
+      createdAt: serverTime,
+    }),
+    ...overrides,
+  });
+
+  const activeIdentity = { identityRef, status: 'active' };
+  const activeOperator = { uid, role: 'operator', status: 'active' };
+
+  // 1. Authorized active operator writing valid payload -> ALLOWED
+  const okOperator = evaluateVerificationRecordCreateRule({
+    auth: { uid, email: 'operator@bioguard.example', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload(),
+    requestTimeSentinel: serverTime,
+    userDoc: activeOperator,
+    identityDoc: activeIdentity,
+  });
+  assert.equal(okOperator.allowed, true, `Expected active operator create allowed, got: ${okOperator.deniedReasons.join('; ')}`);
+
+  // 2. Bootstrapped admin (case-insensitive, email_verified: true) -> ALLOWED even if userDoc is null
+  const okBootstrap = evaluateVerificationRecordCreateRule({
+    auth: { uid, email: 'AbdullahMohamedHaroon8@gmail.com', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload(),
+    requestTimeSentinel: serverTime,
+    userDoc: null,
+    identityDoc: activeIdentity,
+  });
+  assert.equal(okBootstrap.allowed, true, `Expected bootstrap admin create allowed, got: ${okBootstrap.deniedReasons.join('; ')}`);
+
+  // 3. Unauthenticated -> DENIED
+  const noAuth = evaluateVerificationRecordCreateRule({
+    auth: null,
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload(),
+    requestTimeSentinel: serverTime,
+    userDoc: activeOperator,
+    identityDoc: activeIdentity,
+  });
+  assert.equal(noAuth.allowed, false);
+
+  // 4. Unverified email (even with spoofed bootstrap admin email!) -> DENIED
+  const unverifiedSpoof = evaluateVerificationRecordCreateRule({
+    auth: { uid, email: 'abdullahmohamedharoon8@gmail.com', email_verified: false },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload(),
+    requestTimeSentinel: serverTime,
+    userDoc: activeOperator,
+    identityDoc: activeIdentity,
+  });
+  assert.equal(unverifiedSpoof.allowed, false);
+  assert.ok(unverifiedSpoof.deniedReasons.some((r) => r.includes('email_verified')));
+
+  // 5. Cross-UID path write & operatorUid spoofing -> DENIED
+  const crossUid = evaluateVerificationRecordCreateRule({
+    auth: { uid: 'other_user_uid', email: 'other@example.com', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload(),
+    requestTimeSentinel: serverTime,
+    userDoc: { uid: 'other_user_uid', role: 'operator', status: 'active' },
+    identityDoc: activeIdentity,
+  });
+  assert.equal(crossUid.allowed, false);
+  assert.ok(crossUid.deniedReasons.some((r) => r.includes('isOwner')));
+
+  // 6. Viewer role -> DENIED
+  const viewerDenied = evaluateVerificationRecordCreateRule({
+    auth: { uid, email: 'viewer@example.com', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload(),
+    requestTimeSentinel: serverTime,
+    userDoc: { uid, role: 'viewer', status: 'active' },
+    identityDoc: activeIdentity,
+  });
+  assert.equal(viewerDenied.allowed, false);
+  assert.ok(viewerDenied.deniedReasons.some((r) => r.includes('viewer')));
+
+  // 7. Suspended account (non-bootstrap) -> DENIED
+  const suspendedDenied = evaluateVerificationRecordCreateRule({
+    auth: { uid, email: 'operator@example.com', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload(),
+    requestTimeSentinel: serverTime,
+    userDoc: { uid, role: 'operator', status: 'suspended' },
+    identityDoc: activeIdentity,
+  });
+  assert.equal(suspendedDenied.allowed, false);
+  assert.ok(suspendedDenied.deniedReasons.some((r) => r.includes('suspended')));
+
+  // 8. Missing user profile doc (non-bootstrap) -> DENIED
+  const missingUserDoc = evaluateVerificationRecordCreateRule({
+    auth: { uid, email: 'operator@example.com', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload(),
+    requestTimeSentinel: serverTime,
+    userDoc: null,
+    identityDoc: activeIdentity,
+  });
+  assert.equal(missingUserDoc.allowed, false);
+
+  // 9. Missing or inactive or mismatched identity -> DENIED
+  const missingId = evaluateVerificationRecordCreateRule({
+    auth: { uid, email: 'abdullahmohamedharoon8@gmail.com', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload(),
+    requestTimeSentinel: serverTime,
+    userDoc: activeOperator,
+    identityDoc: null,
+  });
+  assert.equal(missingId.allowed, false);
+
+  const inactiveId = evaluateVerificationRecordCreateRule({
+    auth: { uid, email: 'abdullahmohamedharoon8@gmail.com', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload(),
+    requestTimeSentinel: serverTime,
+    userDoc: activeOperator,
+    identityDoc: { identityRef, status: 'inactive' },
+  });
+  assert.equal(inactiveId.allowed, false);
+  assert.ok(inactiveId.deniedReasons.some((r) => r.includes('inactive')));
+
+  const mismatchId = evaluateVerificationRecordCreateRule({
+    auth: { uid, email: 'abdullahmohamedharoon8@gmail.com', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload(),
+    requestTimeSentinel: serverTime,
+    userDoc: activeOperator,
+    identityDoc: { identityRef: 'different_ref', status: 'active' },
+  });
+  assert.equal(mismatchId.allowed, false);
+
+  // 10. Payload/schema/timestamp tampering -> DENIED
+  const extraField = evaluateVerificationRecordCreateRule({
+    auth: { uid, email: 'abdullahmohamedharoon8@gmail.com', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload({ shadowField: 'bad' }),
+    requestTimeSentinel: serverTime,
+    userDoc: activeOperator,
+    identityDoc: activeIdentity,
+  });
+  assert.equal(extraField.allowed, false);
+
+  const forgedTimestamp = evaluateVerificationRecordCreateRule({
+    auth: { uid, email: 'abdullahmohamedharoon8@gmail.com', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload({ createdAt: new Date().toISOString() }),
+    requestTimeSentinel: serverTime,
+    userDoc: activeOperator,
+    identityDoc: activeIdentity,
+  });
+  assert.equal(forgedTimestamp.allowed, false);
+  assert.ok(forgedTimestamp.deniedReasons.some((r) => r.includes('request.time')));
+
+  const wrongDocId = evaluateVerificationRecordCreateRule({
+    auth: { uid, email: 'abdullahmohamedharoon8@gmail.com', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: 'ver_different_doc_id',
+    resourceData: makePayload(),
+    requestTimeSentinel: serverTime,
+    userDoc: activeOperator,
+    identityDoc: activeIdentity,
+  });
+  assert.equal(wrongDocId.allowed, false);
+
+  // 11. Simulating outdated deployed ruleset (before new fields like finalDecision/provenanceSignature were added)
+  const legacyAllowedKeys = [
+    'verificationId',
+    'identityRef',
+    'modalities',
+    'pipeline',
+    'outcome',
+    'policyDecision',
+    'reasonCode',
+    'score',
+    'operatorUid',
+    'createdAt',
+  ];
+  const outdatedRulesResult = evaluateVerificationRecordCreateRule({
+    auth: { uid, email: 'abdullahmohamedharoon8@gmail.com', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    resourceData: makePayload(),
+    requestTimeSentinel: serverTime,
+    userDoc: activeOperator,
+    identityDoc: activeIdentity,
+    deployedAllowedKeysOverride: legacyAllowedKeys,
+  });
+  assert.equal(outdatedRulesResult.allowed, false);
+  assert.ok(outdatedRulesResult.deniedReasons.some((r) => r.includes('finalDecision')));
+  assert.ok(outdatedRulesResult.deniedReasons.some((r) => r.includes('provenanceSignature')));
+});
+
+test('Firestore diagnostic classifier distinguishes all 12 failure causes cleanly and redacts embeddings & tokens', async () => {
+  const {
+    EXPECTED_FIREBASE_PROJECT_ID,
+    EXPECTED_FIRESTORE_DATABASE_ID,
+    classifyFirestoreDiagnostic,
+    sanitizeDiagnosticPayload,
+    validateClientFirebaseConfig,
+  } = await import('../src/shared/firestoreDiagnostics.ts');
+
+  // Config validator rejects "(default)" and empty projectId
+  assert.equal(
+    validateClientFirebaseConfig({ projectId: EXPECTED_FIREBASE_PROJECT_ID, firestoreDatabaseId: '(default)' }).errorCode,
+    'wrong_firestore_database'
+  );
+  assert.equal(
+    validateClientFirebaseConfig({ projectId: '', firestoreDatabaseId: EXPECTED_FIRESTORE_DATABASE_ID }).errorCode,
+    'wrong_firestore_database'
+  );
+  assert.equal(
+    validateClientFirebaseConfig({ projectId: EXPECTED_FIREBASE_PROJECT_ID, firestoreDatabaseId: EXPECTED_FIRESTORE_DATABASE_ID }).valid,
+    true
+  );
+
+  // All 12 diagnostic categories
+  assert.equal(classifyFirestoreDiagnostic({ isAuthenticated: false }).diagnosticCode, 'unauthenticated');
+  assert.equal(
+    classifyFirestoreDiagnostic({
+      code: 'invalid_credentials',
+      operationStage: 'firebase_id_token_lookup',
+      httpStatus: 401,
+    }).diagnosticCode,
+    'backend_auth_failure'
+  );
+  assert.equal(classifyFirestoreDiagnostic({ emailVerified: false }).diagnosticCode, 'email_not_verified');
+  assert.equal(
+    classifyFirestoreDiagnostic({ configValid: false, databaseId: '(default)' }).diagnosticCode,
+    'wrong_firestore_database'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({
+      isAuthenticated: true,
+      emailVerified: true,
+      isBootstrapAdmin: false,
+      userDocExists: false,
+      rawCode: 'permission-denied',
+    }).diagnosticCode,
+    'user_profile_missing'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({
+      isAuthenticated: true,
+      emailVerified: true,
+      userDocExists: true,
+      userStatus: 'suspended',
+      rawCode: 'permission-denied',
+    }).diagnosticCode,
+    'account_suspended'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({
+      isAuthenticated: true,
+      emailVerified: true,
+      isBootstrapAdmin: false,
+      userDocExists: true,
+      userStatus: 'active',
+      userRole: 'viewer',
+      rawCode: 'permission-denied',
+    }).diagnosticCode,
+    'unauthorized_role'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({
+      isAuthenticated: true,
+      emailVerified: true,
+      identityExists: false,
+      code: 'identity_metadata_missing',
+    }).diagnosticCode,
+    'identity_metadata_missing'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({
+      isAuthenticated: true,
+      emailVerified: true,
+      identityExists: true,
+      identityStatus: 'inactive',
+      code: 'identity_inactive',
+    }).diagnosticCode,
+    'identity_inactive'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({
+      isAuthenticated: true,
+      emailVerified: true,
+      schemaValid: false,
+      schemaErrors: ['Unexpected key "bad"'],
+    }).diagnosticCode,
+    'verification_record_schema_invalid'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({
+      configValid: true,
+      isAuthenticated: true,
+      emailVerified: true,
+      isBootstrapAdmin: true,
+      userDocExists: true,
+      userRole: 'super_admin',
+      userStatus: 'active',
+      identityExists: true,
+      identityStatus: 'active',
+      identityRefMatches: true,
+      schemaValid: true,
+      operationStage: 'verification_record_creation',
+      operationType: 'create',
+      rawCode: 'permission-denied',
+      message: 'Missing or insufficient permissions.',
+    }).diagnosticCode,
+    'undeployed_or_outdated_security_rules'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({
+      rawCode: 'unavailable',
+      message: 'Failed to get document because the client is offline.',
+    }).diagnosticCode,
+    'network_failure'
+  );
+
+  // Redaction guarantees no biometric vectors or tokens leak into diagnostics
+  const cleaned = sanitizeDiagnosticPayload({
+    identityRef: 'subj_01',
+    embedding: [0.1, 0.2, 0.3],
+    samples: { face: [0.4, 0.5] },
+    idToken: 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig',
+    bearerHeader: 'Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.abc.def',
+    encryptedPayload: 'aes-gcm-cipher',
+    rawArray: new Array(128).fill(0.12),
+  });
+  const serialized = JSON.stringify(cleaned);
+  assert.equal(serialized.includes('aes-gcm-cipher'), false);
+  assert.equal(serialized.includes('eyJhbGci'), false);
+  assert.equal(cleaned.embedding, '[REDACTED]');
+  assert.equal(cleaned.samples, '[REDACTED]');
+  assert.equal(cleaned.idToken, '[REDACTED]');
+  assert.equal(cleaned.bearerHeader, '[REDACTED_TOKEN]');
+  assert.equal(cleaned.rawArray, '[REDACTED_VECTOR(128)]');
+  assert.equal(cleaned.identityRef, 'subj_01');
+});
+
+
 
 
