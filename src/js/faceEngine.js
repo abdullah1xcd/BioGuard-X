@@ -373,8 +373,8 @@ function measureRoiImageQuality(source, box, dims) {
   const by = Math.max(0, Math.min(h - 1, rawY));
   const adjW = rawX < 0 ? rawW + rawX : rawW;
   const adjH = rawY < 0 ? rawH + rawY : rawH;
-  const bw = Math.max(16, Math.min(w - bx, adjW));
-  const bh = Math.max(16, Math.min(h - by, adjH));
+  const bw = Math.max(1, Math.min(w - bx, Math.max(16, adjW)));
+  const bh = Math.max(1, Math.min(h - by, Math.max(16, adjH)));
 
   const sampleSize = 96;
   const canvas = getScratchCanvas('roi', sampleSize);

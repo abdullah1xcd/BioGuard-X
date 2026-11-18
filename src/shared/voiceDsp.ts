@@ -358,15 +358,20 @@ export function extractVoiceFeaturesV2(
 
   const evalFrames = activeFrames.length >= 6 ? activeFrames : allFrames;
 
-  // 4. Spectral subtraction -> 32 Mel filters -> 20 MFCCs (c1..c20)
+  // 4. Conservative spectral subtraction (only when non-speech noise gap exists) -> 32 Mel filters -> 20 MFCCs (c1..c20)
   const numMfcc = 20;
   const numFilters = MEL_FILTERS_16K.length;
   const mfccFrames: number[][] = [];
+  const hasSilenceGap = noiseFloorRms < vadThreshold * 0.72 && meanRms > 0.004;
+  const noiseSubFactor = hasSilenceGap ? 0.45 : 0;
 
   for (const f of evalFrames) {
     const cleanMag = new Float32Array(nBins);
     for (let k = 0; k < nBins; k++) {
-      cleanMag[k] = Math.max(0.08 * f.magSpec[k], f.magSpec[k] - 1.05 * noiseSpec[k]);
+      cleanMag[k] =
+        noiseSubFactor > 0
+          ? Math.max(0.14 * f.magSpec[k], f.magSpec[k] - noiseSubFactor * noiseSpec[k])
+          : f.magSpec[k];
     }
     const logMel = new Float32Array(numFilters);
     for (let m = 0; m < numFilters; m++) {

@@ -1009,6 +1009,7 @@ export function renderEnrollment(container, { appState, navigate }) {
 
   container.querySelector('#be-face-file').addEventListener('change', async (e) => {
     const f = e.target.files?.[0];
+    e.target.value = '';
     if (!f) return;
     if (f.size > 8 * 1024 * 1024) { showToast('Face image exceeds 8 MB limit.', 'danger'); return; }
     try {
@@ -1043,6 +1044,7 @@ export function renderEnrollment(container, { appState, navigate }) {
 
   container.querySelector('#be-voice-file').addEventListener('change', async (e) => {
     const f = e.target.files?.[0];
+    e.target.value = '';
     if (!f) return;
     try {
       const p = await decodeAudioFileToPCM(f);
@@ -1060,6 +1062,7 @@ export function renderEnrollment(container, { appState, navigate }) {
 
   container.querySelector('#be-fp-file').addEventListener('change', async (e) => {
     const f = e.target.files?.[0];
+    e.target.value = '';
     if (!f) return;
     try { setFp(await loadImageFile(f), 'Good Quality', 'upload'); }
     catch (err) { showToast(err.message, 'danger'); }
@@ -1368,7 +1371,7 @@ export function renderVerification(container, { appState, navigate }) {
               <span id="mv-face-st" class="state-text state-neutral">Empty</span>
             </div>
             <div id="mv-face-challenge-banner" class="challenge-banner" hidden></div>
-            <div id="mv-face-live-wrap" class="preview-frame" style="max-height:175px;" hidden></div>
+            <div id="mv-face-live-wrap" class="preview-frame" style="max-height:220px;" hidden></div>
             <div id="mv-face-q" class="meta-line">Live camera or photo upload</div>
             <div class="row-wrap">
               <button type="button" class="btn btn-secondary btn-sm" id="mv-face-cam">Live Camera</button>
@@ -1885,6 +1888,7 @@ export function renderVerification(container, { appState, navigate }) {
 
   container.querySelector('#mv-face-file').addEventListener('change', async (e) => {
     const f = e.target.files?.[0];
+    e.target.value = '';
     if (!f) return;
     try { haltProbeCamera(); await setFaceRealProbe(await loadImageFile(f), 'Uploaded ✓', { captureSource: 'upload' }); }
     catch (err) { showToast(err.message, 'danger'); }
@@ -1899,7 +1903,7 @@ export function renderVerification(container, { appState, navigate }) {
         activeChallenge = await requestLivenessChallenge(['face', 'voice']).catch(() => null);
       }
       if (voiceChallengeBanner && activeChallenge?.voicePassphrase) {
-        voiceChallengeBanner.textContent = `Speak clearly: "${activeChallenge.voicePassphrase}" (acoustic replay/DR screening only; spoken-text ASR not enabled)`;
+        voiceChallengeBanner.textContent = `Speak naturally for 2.4s (e.g., "${activeChallenge.voicePassphrase}") — text-independent voiceprint match (speech-to-text ASR is not enabled; pair with Live Face or relax Strict Liveness in Settings for voice-only testing).`;
         voiceChallengeBanner.hidden = false;
       }
       const p = await recordMicrophonePCM(2400, ({ elapsedSec, totalSec }) => {
@@ -1911,6 +1915,7 @@ export function renderVerification(container, { appState, navigate }) {
   });
   container.querySelector('#mv-voice-file').addEventListener('change', async (e) => {
     const f = e.target.files?.[0];
+    e.target.value = '';
     if (!f) return;
     try {
       const p = await decodeAudioFileToPCM(f);
@@ -1922,6 +1927,7 @@ export function renderVerification(container, { appState, navigate }) {
 
   container.querySelector('#mv-fp-file').addEventListener('change', async (e) => {
     const f = e.target.files?.[0];
+    e.target.value = '';
     if (!f) return;
     try { setFpProbe(await loadImageFile(f), 'Uploaded ✓', 'upload'); }
     catch (err) { showToast(err.message, 'danger'); }

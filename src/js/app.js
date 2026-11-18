@@ -634,6 +634,16 @@ function initApp() {
   document.getElementById('sidebar-backdrop')?.addEventListener('click', closeMobileDrawer);
   document.getElementById('modal-close-btn')?.addEventListener('click', closeModal);
   document.getElementById('modal-backdrop')?.addEventListener('click', closeModal);
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    const modalRoot = document.getElementById('modal-root');
+    if (modalRoot && !modalRoot.hidden) {
+      closeModal();
+      return;
+    }
+    const sidebar = document.querySelector('.sidebar.mobile-open');
+    if (sidebar) closeMobileDrawer();
+  });
 
   const mbnIcons = { overview: 'dashboard', verification: 'layers', compare: 'compare', analytics: 'barChart' };
   document.querySelectorAll('#mobile-bottom-nav [data-route]').forEach((btn) => {

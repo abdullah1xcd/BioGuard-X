@@ -136,7 +136,7 @@ export function renderCompareIdentities(container, { appState, navigate }) {
         <div id="cmp-1ton-probe-box" class="grid-3" hidden>
           <div class="probe-card">
             <div class="row-between"><strong>Face Probe</strong><span id="idn-face-st" class="state-text state-neutral">Optional</span></div>
-            <div id="idn-face-live" class="preview-frame" style="max-height:150px;" hidden></div>
+            <div id="idn-face-live" class="preview-frame" style="max-height:220px;" hidden></div>
             <div id="idn-face-q" class="meta-line">Live camera or photo upload</div>
             <div class="row-wrap">
               <button type="button" class="btn btn-secondary btn-sm" id="idn-face-cam">Live Camera</button>
@@ -500,6 +500,7 @@ export function renderCompareIdentities(container, { appState, navigate }) {
 
   container.querySelector('#idn-face-file').addEventListener('change', async (e) => {
     const f = e.target.files?.[0];
+    e.target.value = '';
     if (!f) return;
     try {
       stopCamera();
@@ -536,6 +537,7 @@ export function renderCompareIdentities(container, { appState, navigate }) {
 
   container.querySelector('#idn-voice-file').addEventListener('change', async (e) => {
     const f = e.target.files?.[0];
+    e.target.value = '';
     if (!f) return;
     try {
       const p = await decodeAudioFileToPCM(f);
@@ -552,6 +554,7 @@ export function renderCompareIdentities(container, { appState, navigate }) {
 
   container.querySelector('#idn-fp-file').addEventListener('change', async (e) => {
     const f = e.target.files?.[0];
+    e.target.value = '';
     if (!f) return;
     try {
       const res = extractFingerprintFeatures(await loadImageFile(f), 'upload');

@@ -110,8 +110,8 @@ export function calibrateSimilarity(rawCos: number, modality: 'face' | 'voice' |
     return Number(Math.max(0, Math.min(1, (rawCos - 0.12) / 0.72)).toFixed(4));
   }
   if (modality === 'voice') {
-    // Acoustic 96-D CMVN MFCC+Delta+F0: unrelated < 0.42, genuine > 0.65
-    return Number(Math.max(0, Math.min(1, (rawCos - 0.15) / 0.72)).toFixed(4));
+    // Acoustic 96-D CMVN MFCC+Delta+F0: unrelated < 0.38, conversational genuine >= 0.56
+    return Number(Math.max(0, Math.min(1, (rawCos - 0.08) / 0.68)).toFixed(4));
   }
   // Legacy v1.1 vectors: non-negative cosine clamped cleanly
   return Number(Math.max(0, Math.min(1, rawCos)).toFixed(4));

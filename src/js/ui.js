@@ -319,7 +319,7 @@ export async function recordMicrophonePCM(durationMs = 2400, onProgress) {
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+      audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: true },
     });
   } catch {
     try {
@@ -331,19 +331,30 @@ export async function recordMicrophonePCM(durationMs = 2400, onProgress) {
   }
 
   const source = ctx.createMediaStreamSource(stream);
-  const processor = ctx.createScriptProcessor(4096, 1, 1);
+  const inputChannels = Math.max(1, Math.min(2, source.channelCount || 1));
+  const processor = ctx.createScriptProcessor(4096, inputChannels, 1);
   const chunks = [];
   const startedAt = performance.now();
   let sampleRate;
 
   try {
     processor.onaudioprocess = (e) => {
-      const ch = new Float32Array(e.inputBuffer.getChannelData(0));
-      chunks.push(ch);
+      const nCh = e.inputBuffer.numberOfChannels || 1;
+      const ch0 = e.inputBuffer.getChannelData(0);
+      const mono = new Float32Array(ch0.length);
+      if (nCh === 1) {
+        mono.set(ch0);
+      } else {
+        for (let c = 0; c < nCh; c++) {
+          const data = e.inputBuffer.getChannelData(c);
+          for (let i = 0; i < data.length; i++) mono[i] += data[i] / nCh;
+        }
+      }
+      chunks.push(mono);
       if (onProgress) {
         let sum = 0;
-        for (let i = 0; i < ch.length; i++) sum += ch[i] * ch[i];
-        const rms = Math.sqrt(sum / ch.length);
+        for (let i = 0; i < mono.length; i++) sum += mono[i] * mono[i];
+        const rms = Math.sqrt(sum / mono.length);
         const elapsedSec = Math.min(durationMs / 1000, (performance.now() - startedAt) / 1000);
         onProgress({ elapsedSec, totalSec: durationMs / 1000, rms });
       }

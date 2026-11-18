@@ -2633,6 +2633,65 @@ test('Firestore diagnostic classifier distinguishes all 12 failure causes cleanl
   assert.equal(cleaned.identityRef, 'subj_01');
 });
 
+test('Voice spectral subtraction preserves continuous speech without false voice_strong_mismatch', () => {
+  const synthContinuous = (f0Hz: number, formantBias: number, amp = 0.34, seed = 11) => {
+    const sr = 16000;
+    const total = Math.floor(sr * 2.2);
+    const out = new Float32Array(total);
+    let state = seed >>> 0;
+    const rand = () => {
+      state = (state * 1664525 + 1013904223) >>> 0;
+      return (state / 0xffffffff) * 2 - 1;
+    };
+    for (let i = 0; i < total; i++) {
+      const t = i / sr;
+      // Continuous conversational envelope with NO zero-energy pause gap
+      const env = 0.55 + 0.35 * Math.sin(2 * Math.PI * 2.4 * t);
+      const f0 = f0Hz * (1 + 0.02 * Math.sin(2 * Math.PI * 4.5 * t));
+      const p = 2 * Math.PI * f0 * t;
+      const w =
+        0.50 * Math.sin(p) +
+        (0.35 + formantBias * 0.25) * Math.sin(2 * p + 0.25) +
+        (0.28 - formantBias * 0.15) * Math.sin(4 * p + 0.7) +
+        (0.22 + formantBias * 0.20) * Math.sin(7 * p + 1.1) +
+        (0.18 - formantBias * 0.15) * Math.sin(11 * p + 0.4) +
+        (0.14 + formantBias * 0.12) * Math.sin(17 * p);
+      out[i] = Math.max(-1, Math.min(1, w * amp * env + rand() * 0.01));
+    }
+    return out;
+  };
 
+  const enroll = extractVoiceFeaturesV2(synthContinuous(120, 0.70, 0.35, 401), 16000, 'microphone');
+  const genuineContinuous = extractVoiceFeaturesV2(synthContinuous(122, 0.65, 0.24, 402), 16000, 'microphone');
+  const impostor = extractVoiceFeaturesV2(synthContinuous(240, -0.75, 0.34, 403), 16000, 'microphone');
 
+  const gScore = scoreVectorRefs(genuineContinuous.vector, [enroll.vector], 'voice');
+  const iScore = scoreVectorRefs(impostor.vector, [enroll.vector], 'voice');
+  assert.ok(gScore.score >= 0.72, `Expected continuous genuine voice score >= 0.72, got ${gScore.score} (raw=${gScore.rawCosine})`);
+  assert.ok(iScore.score < 0.50, `Expected impostor voice score < 0.50, got ${iScore.score} (raw=${iScore.rawCosine})`);
 
+  const fusionRes = fuseMultimodalScores({
+    pipeline: 'voice_only',
+    thresholds: { face: 0.72, voice: 0.70, fingerprint: 0.72, early: 0.72, threeModal: 0.74 },
+    livenessPolicy: { strictLiveness: false },
+    available: { voice: { score: gScore.score, rawCosine: gScore.rawCosine, qualityScore: genuineContinuous.stats.voiceQualityScore } },
+    livenessStatus: 'INCONCLUSIVE',
+    livenessScore: 0.5,
+  });
+  assert.notEqual(fusionRes.reasonCode, 'voice_strong_mismatch');
+  assert.equal(fusionRes.finalDecision, 'VERIFIED');
+});
+
+test('Repository CI workflows, package-lock.json, and Node 22+ engine declaration are aligned', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')) as {
+    engines?: { node?: string };
+  };
+  const ciWorkflow = fs.readFileSync(path.join(process.cwd(), '.github/workflows/ci.yml'), 'utf8');
+  const rulesWorkflow = fs.readFileSync(path.join(process.cwd(), '.github/workflows/deploy-firestore-rules.yml'), 'utf8');
+
+  assert.equal(fs.existsSync(path.join(process.cwd(), 'package-lock.json')), true, 'package-lock.json must exist for npm ci');
+  assert.match(pkg.engines?.node || '', /22/, 'package.json engines.node must support CI Node 22');
+  assert.match(ciWorkflow, /node-version:\s*'?22'?/);
+  assert.match(ciWorkflow, /npm run validate:rules/);
+  assert.match(rulesWorkflow, /node-version:\s*'?22'?/);
+});

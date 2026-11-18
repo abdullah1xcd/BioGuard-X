@@ -132,8 +132,18 @@ export async function decodeAudioFileToPCM(fileOrBlob) {
   const ctx = new AudioCtx();
   try {
     const decoded = await ctx.decodeAudioData(arrayBuffer);
-    const ch = decoded.getChannelData(0);
-    return { samples: new Float32Array(ch), sampleRate: decoded.sampleRate };
+    const nCh = Math.max(1, decoded.numberOfChannels || 1);
+    const len = decoded.length;
+    const mono = new Float32Array(len);
+    if (nCh === 1) {
+      mono.set(decoded.getChannelData(0));
+    } else {
+      for (let c = 0; c < nCh; c++) {
+        const ch = decoded.getChannelData(c);
+        for (let i = 0; i < len; i++) mono[i] += ch[i] / nCh;
+      }
+    }
+    return { samples: mono, sampleRate: decoded.sampleRate };
   } finally {
     await ctx.close();
   }
