@@ -28,6 +28,16 @@
       href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap"
       rel="stylesheet"
     />
+    <style>
+      html, body {
+        margin: 0;
+        background: #070d1a;
+        color: #f1f5f9;
+        font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      }
+      [hidden] { display: none !important; }
+    </style>
+    <link rel="stylesheet" href="/src/css/styles.css" />
   </head>
   <body>
     <!-- Offline Status Banner (PWA) -->
@@ -47,15 +57,33 @@
         </div>
 
         <p class="auth-desc">
-          Sign in with your verified Google account via Firebase Authentication to access biometric enrollment, multimodal verification, 1:1 &amp; 1:N identity search, risk &amp; liveness analysis, and the AI Security Analyst.
+          Sign in with your verified Google account via Firebase Authentication to unlock the BioGuard X workspace (Dashboard, Biometric Enrollment, Multimodal Verification, Identity Search, and Analytics).
         </p>
 
+        <div id="auth-iframe-hint" class="notice-strip warning" hidden style="flex-direction:column;gap:4px;">
+          <strong>Embedded Preview Notice</strong>
+          <span>Browsers often block or silence Google Sign-In popups inside embedded iframes. If Sign in with Google does not respond, click <strong>Open App in New Tab</strong> below.</span>
+        </div>
+
         <div id="auth-error" class="notice-strip danger" hidden></div>
+        <div id="auth-status" class="notice-strip" hidden></div>
 
         <button id="google-signin-btn" class="btn btn-primary auth-signin-btn" type="button">
           <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M21.35 11.1h-9.17v2.73h6.51c-.33 3.81-3.5 5.44-6.5 5.44C8.36 19.27 5 16.25 5 12c0-4.1 3.2-7.27 7.2-7.27c3.09 0 4.9 1.97 4.9 1.97L19 4.72S16.56 2 12.1 2C6.42 2 2.03 6.8 2.03 12c0 5.05 4.13 10 10.22 10c5.35 0 9.25-3.67 9.25-9.09c0-1.15-.15-1.81-.15-1.81Z"/></svg>
-          <span>Sign in with Google</span>
+          <span id="google-signin-label">Sign in with Google</span>
         </button>
+
+        <a
+          id="open-tab-auth-link"
+          href="/"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="btn btn-secondary auth-signin-btn"
+          hidden
+          style="text-decoration:none;justify-content:center;"
+        >
+          Open App in New Tab (recommended if preview blocks Sign-In popup)
+        </a>
 
         <div class="auth-footnote">
           <span>Encrypted biometric templates remain on the trusted backend vault</span>

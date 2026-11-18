@@ -77,13 +77,13 @@ define(['./workbox-43e44e5a'], (function (workbox) { 'use strict';
    * See https://goo.gl/S9QRab
    */
   workbox.precacheAndRoute([{
-    "url": "build/pages_ops-pB-4mVvw.js",
+    "url": "build/pages_ops-t3t8vnpR.js",
     "revision": null
   }, {
-    "url": "build/pages_compare-y7KmCyUp.js",
+    "url": "build/pages_compare-5Y2m5keu.js",
     "revision": null
   }, {
-    "url": "build/pages_admin-BvJcqAHz.js",
+    "url": "build/pages_admin-B4mU6vwh.js",
     "revision": null
   }, {
     "url": "build/metrics-B66tfFiH.js",
@@ -92,14 +92,14 @@ define(['./workbox-43e44e5a'], (function (workbox) { 'use strict';
     "url": "build/index-MIPILidV.css",
     "revision": null
   }, {
-    "url": "build/index-B6vmKpi0.js",
+    "url": "build/index-BitDjy1x.js",
     "revision": null
   }, {
     "url": "build/human.esm-6BQ0uoNL.js",
     "revision": null
   }, {
     "url": "index.html",
-    "revision": "19a15ed95f493772dd81cab6204e74e1"
+    "revision": "a5ea97f5d36e27334dd49c1e42fa140b"
   }, {
     "url": "icon.svg",
     "revision": "0ffa5258381da71bb527865d7a90e591"

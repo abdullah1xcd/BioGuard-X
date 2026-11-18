@@ -297,7 +297,15 @@ export async function signInWithGoogle() {
   const isStandalone =
     typeof window !== 'undefined' &&
     (window.matchMedia?.('(display-mode: standalone)')?.matches === true || window.navigator?.standalone === true);
-  if (isStandalone) {
+  const inIframe = (() => {
+    try {
+      return typeof window !== 'undefined' && window.self !== window.top;
+    } catch {
+      return true;
+    }
+  })();
+
+  if (isStandalone && !inIframe) {
     try {
       await signInWithRedirect(auth, googleProvider);
       return null;
@@ -315,6 +323,25 @@ export async function signInWithGoogle() {
       code === 'auth/operation-not-supported-in-this-environment' ||
       code === 'auth/cancelled-popup-request'
     ) {
+      if (inIframe) {
+        const hostname = typeof window !== 'undefined' ? window.location?.hostname || '' : '';
+        const iframeErr = new Error(
+          `Sign-In popup was blocked inside the embedded preview (${hostname}). Click "Open App in New Tab" below or allow popups for this preview host to complete Google Sign-In.`,
+          { cause: err }
+        );
+        throw Object.assign(iframeErr, {
+          code: 'auth/popup-blocked',
+          authDiagnostic: {
+            code: 'auth/popup-blocked',
+            title: 'Preview Iframe Blocked Sign-In Popup',
+            explanation: 'Google Sign-In cannot redirect inside an embedded iframe because accounts.google.com blocks framing.',
+            remediation: 'Click "Open App in New Tab" below or allow popups for this site, then sign in with Google.',
+            hostname,
+            authDomain: firebaseConfig.authDomain,
+            formattedMessage: iframeErr.message,
+          },
+        });
+      }
       try {
         await signInWithRedirect(auth, googleProvider);
         return null;

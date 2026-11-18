@@ -1,4 +1,3 @@
-import '../css/styles.css';
 import {
   onAuthChanged,
   signInWithGoogle,
@@ -551,7 +550,26 @@ function initApp() {
   const authGate = document.getElementById('auth-gate');
   const appShell = document.getElementById('app-shell');
   const authError = document.getElementById('auth-error');
+  const authStatus = document.getElementById('auth-status');
+  const authIframeHint = document.getElementById('auth-iframe-hint');
   const signInBtn = document.getElementById('google-signin-btn');
+  const signInLabel = document.getElementById('google-signin-label');
+
+  let inIframe = false;
+  try {
+    inIframe = window.self !== window.top;
+  } catch {
+    inIframe = true;
+  }
+
+  const openTabLink = document.getElementById('open-tab-auth-link');
+  if (inIframe) {
+    if (authIframeHint) authIframeHint.hidden = false;
+    if (openTabLink) {
+      openTabLink.href = window.location.href;
+      openTabLink.hidden = false;
+    }
+  }
 
   resolveAuthRedirect().catch((err) => {
     if (authError && err?.message) {
@@ -562,20 +580,48 @@ function initApp() {
   });
 
   signInBtn?.addEventListener('click', async () => {
-    authError.hidden = true;
+    if (authError) authError.hidden = true;
+    if (authStatus) {
+      authStatus.hidden = false;
+      authStatus.textContent = inIframe
+        ? 'Opening Google Sign-In popup... If no popup appears, allow popups or click "Open App in New Tab" below.'
+        : 'Opening Google Sign-In...';
+    }
     signInBtn.disabled = true;
+    if (signInLabel) signInLabel.textContent = 'Waiting for Google Sign-In...';
+
+    const stallTimer = setTimeout(() => {
+      if (!appState.fbUser && signInBtn.disabled) {
+        signInBtn.disabled = false;
+        if (signInLabel) signInLabel.textContent = 'Sign in with Google';
+        if (authStatus) {
+          authStatus.hidden = false;
+          authStatus.textContent = inIframe
+            ? `No sign-in response yet inside preview (${window.location.hostname}). Your browser may have blocked the iframe popup — click "Open App in New Tab" below to sign in cleanly.`
+            : 'Still waiting for Google Sign-In popup. Make sure popups are enabled and try again.';
+        }
+      }
+    }, 8000);
+
     try {
       await signInWithGoogle();
     } catch (err) {
       const displayMsg = err?.authDiagnostic?.formattedMessage || err.message || 'Google Sign-In failed.';
-      authError.hidden = false;
-      authError.style.whiteSpace = 'pre-line';
-      authError.textContent = displayMsg;
+      if (authError) {
+        authError.hidden = false;
+        authError.style.whiteSpace = 'pre-line';
+        authError.textContent = displayMsg;
+      }
+      if (authStatus) authStatus.hidden = true;
       if (err?.code === 'auth/unauthorized-domain') {
         showToast(`Unauthorized domain (${err.authDiagnostic?.hostname || window.location.hostname}) — add in Firebase Console Authorized domains.`, 'danger');
+      } else {
+        showToast(err?.authDiagnostic?.title || 'Google Sign-In failed.', 'danger');
       }
     } finally {
+      clearTimeout(stallTimer);
       signInBtn.disabled = false;
+      if (signInLabel) signInLabel.textContent = 'Sign in with Google';
     }
   });
 
@@ -687,4 +733,8 @@ function initApp() {
   });
 }
 
-document.addEventListener('DOMContentLoaded', initApp);
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initApp);
+} else {
+  initApp();
+}
