@@ -2694,4 +2694,195 @@ test('Repository CI workflows, package-lock.json, and Node 22+ engine declaratio
   assert.match(ciWorkflow, /node-version:\s*'?22'?/);
   assert.match(ciWorkflow, /npm run validate:rules/);
   assert.match(rulesWorkflow, /node-version:\s*'?22'?/);
+  assert.match(rulesWorkflow, /src\/shared\/verificationRecord\.ts/);
 });
+
+test('Firestore rules enforce immutable verification_records, prevent privilege escalation, and validate VerificationRecord field bounds', async () => {
+  const { buildVerificationRecordPayload } = await import('../src/shared/verificationRecord.ts');
+  const {
+    EXPECTED_FIREBASE_PROJECT_ID,
+    EXPECTED_FIRESTORE_DATABASE_ID,
+    evaluateVerificationRecordCreateRule,
+  } = await import('../src/shared/firestoreDiagnostics.ts');
+
+  const rulesText = fs.readFileSync(path.join(process.cwd(), 'firestore.rules'), 'utf8');
+  const fbJson = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'firebase.json'), 'utf8')) as {
+    firestore?: { database?: string };
+  };
+  const fbRc = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.firebaserc'), 'utf8')) as {
+    projects?: { default?: string };
+  };
+  assert.equal(fbRc.projects?.default, EXPECTED_FIREBASE_PROJECT_ID);
+  assert.equal(fbJson.firestore?.database, EXPECTED_FIRESTORE_DATABASE_ID);
+  assert.notEqual(fbJson.firestore?.database, '(default)');
+
+  // verification_records must be strictly append-only (no client update or delete)
+  assert.match(
+    rulesText,
+    /match \/verification_records\/\{verificationId\}[\s\S]*?allow update, delete: if false;/
+  );
+  // Non-bootstrap user signup cannot self-assign admin/super_admin role
+  assert.match(
+    rulesText,
+    /match \/users\/\{userId\}[\s\S]*?\(incoming\(\)\.role == 'operator' \|\| \(isBootstrappedAdmin\(\) && incoming\(\)\.role == 'super_admin'\)\)/
+  );
+  // Standard owner updates cannot mutate role or status
+  assert.match(
+    rulesText,
+    /isOwner\(userId\) && existing\(\)\.status == 'active' &&[\s\S]*?affectedKeys\(\)\.hasOnly\(\['displayName', 'photoURL', 'theme', 'lastLoginAt'\]\)/
+  );
+
+  const serverTime = { _methodName: 'serverTimestamp' };
+  const uid = 'pNFDVh6FlAgbGQuN48H1qaXy7tv1';
+  const verId = 'ver_1794990001_bounds';
+  const identityRef = 'abdullah_primary';
+  const basePayload = buildVerificationRecordPayload({
+    uid,
+    verificationId: verId,
+    identityRef,
+    modalities: ['face'],
+    pipeline: 'hierarchical',
+    outcome: 'match',
+    finalDecision: 'VERIFIED',
+    livenessStatus: 'LIVENESS PASSED',
+    livenessDecision: 'PASSED',
+    challengeVerified: true,
+    datasetCategory: 'operational',
+    captureFailure: false,
+    reasonCode: 'single_modal_face_verified',
+    score: 0.92,
+    confidence: 0.91,
+    createdAt: serverTime,
+  });
+
+  const baseCtx = {
+    auth: { uid, email: 'operator@bioguard.example', email_verified: true },
+    pathUserId: uid,
+    pathVerificationId: verId,
+    requestTimeSentinel: serverTime,
+    userDoc: { uid, role: 'operator', status: 'active' },
+    identityDoc: { identityRef, status: 'active' },
+  };
+
+  assert.equal(
+    evaluateVerificationRecordCreateRule({
+      ...baseCtx,
+      resourceData: { ...basePayload, policyDecision: 'approved' },
+    }).allowed,
+    false
+  );
+  assert.equal(
+    evaluateVerificationRecordCreateRule({
+      ...baseCtx,
+      resourceData: { ...basePayload, score: 1.5 },
+    }).allowed,
+    false
+  );
+  assert.equal(
+    evaluateVerificationRecordCreateRule({
+      ...baseCtx,
+      resourceData: { ...basePayload, outcome: 'hacked' },
+    }).allowed,
+    false
+  );
+  assert.equal(
+    evaluateVerificationRecordCreateRule({
+      ...baseCtx,
+      resourceData: { ...basePayload, modalities: [] },
+    }).allowed,
+    false
+  );
+});
+
+test('Liveness challenge expiry/strictness and retry verificationId idempotency prevent silent bypass and duplicate records', async () => {
+  const {
+    computeVerificationAttemptSignature,
+    isChallengeUsable,
+    resolveVerificationAttemptPlan,
+    shouldBlockCaptureOnChallengeFailure,
+  } = await import('../src/shared/verificationAttempt.ts');
+
+  const pagesCoreText = fs.readFileSync(path.join(process.cwd(), 'src/js/pages_core.js'), 'utf8');
+  assert.doesNotMatch(pagesCoreText, /requestLivenessChallenge\([^)]*\)\.catch\(\s*\(\)\s*=>\s*null\s*\)/);
+  assert.match(pagesCoreText, /ensureActiveChallenge\(/);
+  assert.match(pagesCoreText, /resolveVerificationAttemptPlan\(/);
+
+  // 1. Challenge usability checks
+  const now = 1_700_000_000_000;
+  assert.deepEqual(isChallengeUsable(null, now), { valid: false, reason: 'missing' });
+  assert.deepEqual(isChallengeUsable({ challengeToken: 'tok', expiresAt: now + 60_000, consumed: true }, now), {
+    valid: false,
+    reason: 'consumed',
+  });
+  assert.deepEqual(isChallengeUsable({ challengeToken: 'tok', expiresAt: now - 1 }, now), {
+    valid: false,
+    reason: 'expired',
+  });
+  assert.deepEqual(isChallengeUsable({ challengeToken: 'tok', expiresAt: now + 2000 }, now, 5000), {
+    valid: false,
+    reason: 'expiring_soon',
+  });
+  assert.deepEqual(isChallengeUsable({ challengeToken: 'tok', expiresAt: now + 30_000 }, now, 5000), {
+    valid: true,
+  });
+
+  // 2. Strict liveness blocks capture on challenge issuance failure; relaxed only when explicitly false
+  assert.equal(shouldBlockCaptureOnChallengeFailure(true), true);
+  assert.equal(shouldBlockCaptureOnChallengeFailure(undefined), true);
+  assert.equal(shouldBlockCaptureOnChallengeFailure(false), false);
+
+  // 3. Retry idempotency & duplicate record prevention
+  const sigA = computeVerificationAttemptSignature({
+    identityRef: 'subj_01',
+    pipeline: 'hierarchical',
+    fusionPolicy: 'hierarchical_adaptive',
+    adaptiveEnabled: true,
+    groundTruth: 'unlabeled',
+    isTestProbe: false,
+    faceVec: [0.1, 0.2, 0.3, 0.4],
+    faceCaptureSource: 'live_camera',
+  });
+  const sigB = computeVerificationAttemptSignature({
+    identityRef: 'subj_01',
+    pipeline: 'hierarchical',
+    fusionPolicy: 'hierarchical_adaptive',
+    adaptiveEnabled: true,
+    groundTruth: 'unlabeled',
+    isTestProbe: false,
+    faceVec: [0.1, 0.2, 0.3, 0.9],
+    faceCaptureSource: 'live_camera',
+  });
+  assert.notEqual(sigA, sigB);
+
+  let counter = 0;
+  const mkId = () => `ver_test_${++counter}`;
+  const firstPlan = resolveVerificationAttemptPlan(null, sigA, mkId);
+  assert.deepEqual(firstPlan, { action: 'run_full', verificationId: 'ver_test_1' });
+
+  // Retry after Firestore persistence failure reuses same verificationId + cached API result
+  const retryPlan = resolveVerificationAttemptPlan(
+    { attemptKey: sigA, verificationId: 'ver_test_1', apiResult: { outcome: 'match' }, persisted: false },
+    sigA,
+    mkId
+  );
+  assert.equal(retryPlan.action, 'retry_persistence_only');
+  assert.equal(retryPlan.verificationId, 'ver_test_1');
+
+  // Repeated click after persistence succeeds is blocked as already_persisted
+  const dupPlan = resolveVerificationAttemptPlan(
+    { attemptKey: sigA, verificationId: 'ver_test_1', apiResult: { outcome: 'match' }, persisted: true },
+    sigA,
+    mkId
+  );
+  assert.equal(dupPlan.action, 'already_persisted');
+  assert.equal(dupPlan.verificationId, 'ver_test_1');
+
+  // New capture/signature generates a fresh verificationId
+  const nextPlan = resolveVerificationAttemptPlan(
+    { attemptKey: sigA, verificationId: 'ver_test_1', apiResult: { outcome: 'match' }, persisted: true },
+    sigB,
+    mkId
+  );
+  assert.deepEqual(nextPlan, { action: 'run_full', verificationId: 'ver_test_2' });
+});
+

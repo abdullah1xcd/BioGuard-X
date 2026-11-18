@@ -135,6 +135,7 @@ export function verifyMultimodalBiometrics({
   strictLiveness,
   modalityWeights,
   challengeToken,
+  idempotencyKey,
   samples,
   quality,
   adaptiveEnabled = true,
@@ -142,9 +143,13 @@ export function verifyMultimodalBiometrics({
   isTestProbe = false,
   benchmarkMeta,
 }) {
+  const safeIdemKey =
+    typeof idempotencyKey === 'string' && idempotencyKey.trim().length >= 8
+      ? idempotencyKey.trim()
+      : makeIdempotencyKey();
   return apiFetch('/api/v1/verification/multimodal', {
     method: 'POST',
-    headers: { 'Idempotency-Key': makeIdempotencyKey() },
+    headers: { 'Idempotency-Key': safeIdemKey },
     body: JSON.stringify({
       identityRef,
       pipeline,

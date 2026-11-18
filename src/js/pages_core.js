@@ -19,12 +19,19 @@ import {
   updateIdentityStatusOrName,
   deleteIdentityMetadata,
   recordVerificationMetadata,
+  makeVerificationRecordId,
   createSecurityAlert,
   createApprovalRequest,
   appendAuditLog,
   pushNotification,
   getFirestoreTelemetry,
 } from './firebase.js';
+import {
+  isChallengeUsable,
+  shouldBlockCaptureOnChallengeFailure,
+  computeVerificationAttemptSignature,
+  resolveVerificationAttemptPlan,
+} from '../shared/verificationAttempt.ts';
 import {
   PIPELINE_CATALOG,
   FUSION_POLICIES,
@@ -1235,6 +1242,13 @@ export function renderVerification(container, { appState, navigate }) {
   let lastWavUrl = null;
   let currentIsTestProbe = false;
   let activeChallenge = null;
+  let pendingAttempt = null;
+  let verifyingInFlight = false;
+  const invalidatePendingAttempt = () => {
+    pendingAttempt = null;
+    const btn = container.querySelector('#mv-run');
+    if (btn && !verifyingInFlight) btn.textContent = 'Verify Identity';
+  };
 
   const stopCamera = () => {
     if (guidanceTimer) {
@@ -1485,7 +1499,10 @@ export function renderVerification(container, { appState, navigate }) {
     syncActiveSummary();
   };
   syncPolicyDesc();
-  policySel.addEventListener('change', syncPolicyDesc);
+  policySel.addEventListener('change', () => {
+    invalidatePendingAttempt();
+    syncPolicyDesc();
+  });
 
   const syncAdaptiveUI = () => {
     const idObj = getSelectedIdentity();
@@ -1529,12 +1546,19 @@ export function renderVerification(container, { appState, navigate }) {
     if (bmMetaWrap) bmMetaWrap.hidden = gtSel.value === 'unlabeled';
   };
   syncBenchmarkFields();
-  gtSel.addEventListener('change', syncBenchmarkFields);
+  gtSel.addEventListener('change', () => {
+    invalidatePendingAttempt();
+    syncBenchmarkFields();
+  });
+  container.querySelector('#mv-adaptive')?.addEventListener('change', invalidatePendingAttempt);
+  bmSubjectIn?.addEventListener('input', invalidatePendingAttempt);
+  bmBatchIn?.addEventListener('input', invalidatePendingAttempt);
 
   idSel.addEventListener('change', () => {
     const idObj = getSelectedIdentity();
     selectedPipeline = recommendPipelineForModalities(idObj?.registeredModalities || []);
     activeChallenge = null;
+    invalidatePendingAttempt();
     if (faceChallengeBanner) faceChallengeBanner.hidden = true;
     if (voiceChallengeBanner) voiceChallengeBanner.hidden = true;
     syncAdaptiveUI();
@@ -1544,11 +1568,13 @@ export function renderVerification(container, { appState, navigate }) {
     btn.addEventListener('click', () => {
       if (btn.disabled) return;
       selectedPipeline = btn.dataset.pipe;
+      invalidatePendingAttempt();
       syncAdaptiveUI();
     });
   });
 
   const setFaceRealProbe = async (source, statusText, extraQuality = {}) => {
+    invalidatePendingAttempt();
     faceSt.className = 'state-text state-warning';
     faceSt.textContent = 'Analyzing...';
     faceQEl.textContent = 'Extracting FaceRes-1024D embedding...';
@@ -1574,6 +1600,7 @@ export function renderVerification(container, { appState, navigate }) {
   };
 
   const setVoiceProbe = (samples, rate, statusText, captureSource = 'upload', wavUrl = null) => {
+    invalidatePendingAttempt();
     try {
       const res = extractVoiceFeaturesFromPCM(samples, rate, captureSource);
       voiceVec = res.vector;
@@ -1605,6 +1632,7 @@ export function renderVerification(container, { appState, navigate }) {
   };
 
   const setFpProbe = (source, statusText, captureSource = 'upload') => {
+    invalidatePendingAttempt();
     try {
       const res = extractFingerprintFeatures(source, captureSource);
       fpTemplate = res.template;
@@ -1628,6 +1656,7 @@ export function renderVerification(container, { appState, navigate }) {
 
   const loadFaceMatch = () => {
     if (!idSel.value) return;
+    invalidatePendingAttempt();
     const idObj = getSelectedIdentity();
     const isLegacy = (idObj?.featureVersion || '').startsWith('v1.');
     faceVec = makeSeededVector(`face_v2_${idSel.value}`, isLegacy ? 208 : 1024);
@@ -1649,6 +1678,7 @@ export function renderVerification(container, { appState, navigate }) {
   };
   const loadVoiceMatch = () => {
     if (!idSel.value) return;
+    invalidatePendingAttempt();
     const p = synthesizeSampleVoicePCM(idSel.value, 3);
     currentIsTestProbe = true;
     gtSel.value = 'genuine';
@@ -1656,12 +1686,14 @@ export function renderVerification(container, { appState, navigate }) {
   };
   const loadFpMatch = () => {
     if (!idSel.value) return;
+    invalidatePendingAttempt();
     currentIsTestProbe = true;
     gtSel.value = 'genuine';
     setFpProbe(renderSampleFingerprintCanvas(idSel.value), 'QA Match Probe', 'test_sample');
   };
 
   const loadFaceImpostor = () => {
+    invalidatePendingAttempt();
     const idObj = getSelectedIdentity();
     const isLegacy = (idObj?.featureVersion || '').startsWith('v1.');
     faceVec = makeSeededVector(`impostor_f_${Date.now()}`, isLegacy ? 208 : 1024, 0.05);
@@ -1682,6 +1714,7 @@ export function renderVerification(container, { appState, navigate }) {
     faceQEl.textContent = `Synthetic impostor probe (${faceVec.length}-D)`;
   };
   const loadVoiceImpostor = () => {
+    invalidatePendingAttempt();
     voiceVec = makeSeededVector(`impostor_v_${Date.now()}`, 96, 0.05);
     voiceQuality = { durationSec: 2.0, meanRms: 0.14, speechSegments: 3, clippingRatio: 0, dynamicRangeDb: 18, voiceQualityScore: 84, captureSource: 'test_impostor' };
     currentIsTestProbe = true;
@@ -1691,6 +1724,7 @@ export function renderVerification(container, { appState, navigate }) {
     voiceQEl.textContent = 'Synthetic impostor probe (96-D)';
   };
   const loadFpImpostor = () => {
+    invalidatePendingAttempt();
     currentIsTestProbe = true;
     gtSel.value = 'impostor';
     const res = extractFingerprintFeatures(renderSampleFingerprintCanvas(`impostor_fp_${Date.now()}`), 'test_sample');
@@ -1737,22 +1771,73 @@ export function renderVerification(container, { appState, navigate }) {
     return 'Hold steady for 3-frame multi-frame liveness check';
   };
 
+  const ensureActiveChallenge = async (purpose = 'face') => {
+    const strictLiveness = appState.settings?.strictLiveness !== false;
+    const usability = isChallengeUsable(activeChallenge, Date.now(), 5000);
+    if (usability.valid) {
+      return { ok: true, challenge: activeChallenge };
+    }
+    if (activeChallenge) {
+      activeChallenge = null;
+      if (faceChallengeBanner) faceChallengeBanner.hidden = true;
+      if (voiceChallengeBanner) voiceChallengeBanner.hidden = true;
+    }
+
+    try {
+      activeChallenge = await requestLivenessChallenge(['face', 'voice']);
+      return { ok: true, challenge: activeChallenge };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Liveness challenge service unavailable.';
+      if (shouldBlockCaptureOnChallengeFailure(strictLiveness)) {
+        const blockMsg = `Mandatory liveness challenge could not be issued (${msg}). Live capture is blocked under Strict Liveness Policy — check your session or network and click Retry.`;
+        if (purpose === 'voice') {
+          voiceSt.className = 'state-text state-danger';
+          voiceSt.textContent = 'Challenge Required';
+          voiceQEl.textContent = blockMsg;
+          if (voiceChallengeBanner) {
+            voiceChallengeBanner.textContent = blockMsg;
+            voiceChallengeBanner.hidden = false;
+          }
+        } else {
+          faceSt.className = 'state-text state-danger';
+          faceSt.textContent = 'Challenge Required';
+          faceQEl.textContent = blockMsg;
+          if (faceChallengeBanner) {
+            faceChallengeBanner.textContent = blockMsg;
+            faceChallengeBanner.hidden = false;
+          }
+        }
+        showToast(blockMsg, 'danger');
+        return { ok: false, blocked: true, error: err };
+      }
+
+      const warnMsg = `Liveness challenge unavailable (${msg}) — continuing without challenge because Strict Liveness is disabled in Settings.`;
+      if (purpose === 'voice' && voiceChallengeBanner) {
+        voiceChallengeBanner.textContent = warnMsg;
+        voiceChallengeBanner.hidden = false;
+      } else if (purpose !== 'voice' && faceChallengeBanner) {
+        faceChallengeBanner.textContent = warnMsg;
+        faceChallengeBanner.hidden = false;
+      }
+      showToast(warnMsg, 'warning');
+      return { ok: true, challenge: null, warning: warnMsg };
+    }
+  };
+
   container.querySelector('#mv-face-cam').addEventListener('click', async () => {
     try {
       haltProbeCamera();
       faceSt.className = 'state-text state-warning';
       faceSt.textContent = 'Starting Camera...';
-      faceQEl.textContent = 'Loading face detection & liveness models...';
-      if (!activeChallenge) {
-        activeChallenge = await requestLivenessChallenge(['face', 'voice']).catch(() => null);
+      faceQEl.textContent = 'Issuing active liveness challenge & loading face models...';
+      const chRes = await ensureActiveChallenge('face');
+      if (!chRes.ok) {
+        haltProbeCamera();
+        return;
       }
-      if (faceChallengeBanner) {
-        if (activeChallenge?.faceChallenge) {
-          faceChallengeBanner.textContent = describeFaceChallenge(activeChallenge.faceChallenge);
-          faceChallengeBanner.hidden = false;
-        } else {
-          faceChallengeBanner.hidden = true;
-        }
+      if (faceChallengeBanner && activeChallenge?.faceChallenge) {
+        faceChallengeBanner.textContent = describeFaceChallenge(activeChallenge.faceChallenge);
+        faceChallengeBanner.hidden = false;
       }
       await ensureFaceEngineReady();
 
@@ -1814,12 +1899,36 @@ export function renderVerification(container, { appState, navigate }) {
         capturing = true;
         pauseGuidance();
         faceSnapBtn.disabled = true;
-        const targetCount = activeChallenge?.faceChallenge ? 4 : 3;
-        faceSnapBtn.textContent = `Capturing 0/${targetCount}...`;
-        faceSt.className = 'state-text state-warning';
-        faceSt.textContent = 'Analyzing Live Frames...';
-        msgBadge.textContent = 'Capturing live frames — hold steady...';
         try {
+          if (!isChallengeUsable(activeChallenge, Date.now(), 3000).valid) {
+            msgBadge.textContent = 'Refreshing expired liveness challenge...';
+            const refreshed = await ensureActiveChallenge('face');
+            if (!refreshed.ok) {
+              oval.classList.remove('ready');
+              msgBadge.textContent = 'Mandatory liveness challenge failed — click Retry Capture.';
+              if (activeStream && activeStream.getTracks().some((t) => t.readyState === 'live')) {
+                faceSnapBtn.disabled = false;
+                faceSnapBtn.textContent = 'Retry Capture';
+                startGuidance();
+              } else {
+                faceSnapBtn.disabled = false;
+                faceSnapBtn.textContent = 'Capture';
+                haltProbeCamera();
+              }
+              return;
+            }
+            if (faceChallengeBanner && activeChallenge?.faceChallenge) {
+              faceChallengeBanner.textContent = describeFaceChallenge(activeChallenge.faceChallenge);
+              faceChallengeBanner.hidden = false;
+            }
+          }
+
+          const targetCount = activeChallenge?.faceChallenge ? 4 : 3;
+          faceSnapBtn.textContent = `Capturing 0/${targetCount}...`;
+          faceSt.className = 'state-text state-warning';
+          faceSt.textContent = 'Analyzing Live Frames...';
+          msgBadge.textContent = 'Capturing live frames — hold steady...';
+
           const res = await captureMultiFrameFaceFeatures(v, {
             delayMs: 240,
             challenge: activeChallenge?.faceChallenge,
@@ -1836,6 +1945,7 @@ export function renderVerification(container, { appState, navigate }) {
           haltProbeCamera();
           faceSnapBtn.disabled = false;
           faceSnapBtn.textContent = 'Capture';
+          invalidatePendingAttempt();
           faceVec = res.vector;
           faceQuality = res.quality;
           currentIsTestProbe = false;
@@ -1850,6 +1960,7 @@ export function renderVerification(container, { appState, navigate }) {
             typeof faceQuality.antispoofScore === 'number' ? ` · AntiSpoof:${Math.round(faceQuality.antispoofScore * 100)}%` : ''
           }${typeof faceQuality.challengeCompleted === 'boolean' ? ` · Challenge:${faceQuality.challengeCompleted ? 'Completed' : 'Not Detected'}` : ''}`;
         } catch (err) {
+          invalidatePendingAttempt();
           faceVec = null;
           faceQuality = null;
           faceSt.className = 'state-text state-danger';
@@ -1899,8 +2010,9 @@ export function renderVerification(container, { appState, navigate }) {
   container.querySelector('#mv-voice-mic').addEventListener('click', async (e) => {
     const b = e.currentTarget; b.disabled = true;
     try {
-      if (!activeChallenge) {
-        activeChallenge = await requestLivenessChallenge(['face', 'voice']).catch(() => null);
+      const chRes = await ensureActiveChallenge('voice');
+      if (!chRes.ok) {
+        return;
       }
       if (voiceChallengeBanner && activeChallenge?.voicePassphrase) {
         voiceChallengeBanner.textContent = `Speak naturally for 2.4s (e.g., "${activeChallenge.voicePassphrase}") — text-independent voiceprint match (speech-to-text ASR is not enabled; pair with Live Face or relax Strict Liveness in Settings for voice-only testing).`;
@@ -1936,6 +2048,7 @@ export function renderVerification(container, { appState, navigate }) {
   container.querySelector('#mv-fp-imp')?.addEventListener('click', loadFpImpostor);
 
   container.querySelector('#mv-run').addEventListener('click', async () => {
+    if (verifyingInFlight) return;
     const identityRef = idSel.value;
     if (!identityRef) return;
     const runBtn = container.querySelector('#mv-run');
@@ -1943,7 +2056,37 @@ export function renderVerification(container, { appState, navigate }) {
     const adaptiveEnabled = container.querySelector('#mv-adaptive').checked;
     const fusionPolicy = policySel.value;
     const groundTruth = gtSel.value;
-    runBtn.disabled = true; runBtn.textContent = 'Verifying...';
+    const subjectKeyInput = bmSubjectIn?.value.trim() || '';
+    const batchIdInput = bmBatchIn?.value.trim() || '';
+
+    const attemptKey = computeVerificationAttemptSignature({
+      identityRef,
+      pipeline: selectedPipeline,
+      fusionPolicy,
+      adaptiveEnabled,
+      groundTruth,
+      isTestProbe: currentIsTestProbe,
+      subjectKey: subjectKeyInput,
+      benchmarkBatchId: batchIdInput,
+      faceVec,
+      faceCaptureSource: faceQuality?.captureSource,
+      voiceVec,
+      voiceCaptureSource: voiceQuality?.captureSource,
+      fpTemplate,
+      fpCaptureSource: fpQuality?.captureSource,
+    });
+    const plan = resolveVerificationAttemptPlan(pendingAttempt, attemptKey, makeVerificationRecordId);
+    if (plan.action === 'already_persisted') {
+      showToast(
+        `Verification record ${plan.verificationId} is already saved for these probes. Capture a new probe or change options to run again.`,
+        'warning'
+      );
+      return;
+    }
+
+    verifyingInFlight = true;
+    runBtn.disabled = true;
+    runBtn.textContent = plan.action === 'retry_persistence_only' ? 'Saving Record...' : 'Verifying...';
 
     const samples = {};
     const quality = {};
@@ -1962,38 +2105,79 @@ export function renderVerification(container, { appState, navigate }) {
 
     try {
       const s = appState.settings || {};
-      const submittedChallengeToken = activeChallenge?.challengeToken;
-      activeChallenge = null;
-      const subjectKeyInput = bmSubjectIn?.value.trim() || '';
-      const batchIdInput = bmBatchIn?.value.trim() || '';
-      const benchmarkMeta =
-        groundTruth !== 'unlabeled' && (subjectKeyInput || batchIdInput)
-          ? {
-              ...(subjectKeyInput ? { subjectKey: subjectKeyInput } : {}),
-              ...(batchIdInput ? { batchId: batchIdInput } : {}),
-            }
-          : undefined;
+      let res;
+      if (plan.action === 'retry_persistence_only') {
+        res = plan.apiResult;
+      } else {
+        if (activeChallenge) {
+          const chStatus = isChallengeUsable(activeChallenge, Date.now(), 0);
+          if (!chStatus.valid) {
+            activeChallenge = null;
+            if (faceChallengeBanner) faceChallengeBanner.hidden = true;
+            if (voiceChallengeBanner) voiceChallengeBanner.hidden = true;
+            const chErr = new Error(
+              chStatus.reason === 'consumed'
+                ? 'Active liveness challenge was already used. Re-capture live biometric probe to obtain a fresh challenge.'
+                : 'Active liveness challenge expired before verification submission. Re-capture live biometric probe to obtain a fresh challenge.'
+            );
+            chErr.code = chStatus.reason === 'consumed' ? 'challenge_replay_detected' : 'challenge_expired';
+            chErr.operationStage = 'liveness_challenge';
+            throw chErr;
+          }
+        } else if (s.strictLiveness !== false && faceQuality?.isLiveCapture) {
+          const missingChErr = new Error(
+            'Live face capture has no active liveness challenge token. Click Live Camera to capture with a fresh active challenge.'
+          );
+          missingChErr.code = 'liveness_challenge_missing';
+          missingChErr.operationStage = 'liveness_challenge';
+          throw missingChErr;
+        }
 
-      const res = await verifyMultimodalBiometrics({
-        identityRef,
-        pipeline: selectedPipeline,
-        fusionPolicy,
-        thresholds: {
-          face: s.faceThreshold ?? 0.72,
-          voice: s.voiceThreshold ?? 0.70,
-          fingerprint: s.fingerprintThreshold ?? 0.72,
-          threeModal: s.threeModalThreshold ?? 0.74,
-        },
-        strictLiveness: s.strictLiveness !== false,
-        modalityWeights: s.modalityWeights,
-        challengeToken: submittedChallengeToken,
-        samples,
-        quality,
-        adaptiveEnabled,
-        groundTruth,
-        isTestProbe: currentIsTestProbe,
-        benchmarkMeta,
-      });
+        const submittedChallengeToken = activeChallenge?.challengeToken;
+        if (activeChallenge) {
+          activeChallenge.consumed = true;
+          activeChallenge = null;
+        }
+        if (faceChallengeBanner) faceChallengeBanner.hidden = true;
+        if (voiceChallengeBanner) voiceChallengeBanner.hidden = true;
+
+        pendingAttempt = {
+          attemptKey,
+          verificationId: plan.verificationId,
+          apiResult: null,
+          persisted: false,
+        };
+
+        const benchmarkMeta =
+          groundTruth !== 'unlabeled' && (subjectKeyInput || batchIdInput)
+            ? {
+                ...(subjectKeyInput ? { subjectKey: subjectKeyInput } : {}),
+                ...(batchIdInput ? { batchId: batchIdInput } : {}),
+              }
+            : undefined;
+
+        res = await verifyMultimodalBiometrics({
+          identityRef,
+          pipeline: selectedPipeline,
+          fusionPolicy,
+          thresholds: {
+            face: s.faceThreshold ?? 0.72,
+            voice: s.voiceThreshold ?? 0.70,
+            fingerprint: s.fingerprintThreshold ?? 0.72,
+            threeModal: s.threeModalThreshold ?? 0.74,
+          },
+          strictLiveness: s.strictLiveness !== false,
+          modalityWeights: s.modalityWeights,
+          challengeToken: submittedChallengeToken,
+          samples,
+          quality,
+          adaptiveEnabled,
+          groundTruth,
+          isTestProbe: currentIsTestProbe,
+          benchmarkMeta,
+        });
+        pendingAttempt.apiResult = res;
+      }
 
       const finalDecision =
         res.finalDecision ||
@@ -2010,6 +2194,7 @@ export function renderVerification(container, { appState, navigate }) {
         typeof res.provenance?.isTestProbe === 'boolean' ? res.provenance.isTestProbe : currentIsTestProbe;
 
       const verId = await recordVerificationMetadata({
+        verificationId: pendingAttempt ? pendingAttempt.verificationId : plan.verificationId,
         identityRef,
         modalities: res.modalitiesEvaluated,
         pipeline: res.pipeline,
@@ -2044,6 +2229,9 @@ export function renderVerification(container, { appState, navigate }) {
         livenessScore: res.liveness?.score,
         adaptiveApplied: res.adaptiveApplied,
       });
+      if (pendingAttempt) {
+        pendingAttempt.persisted = true;
+      }
 
       await appendAuditLog({
         action: 'biometric_verification',
@@ -2319,6 +2507,8 @@ export function renderVerification(container, { appState, navigate }) {
           ? 'Verification Record Validation Error'
           : stage === 'verification_record_creation'
           ? 'Firestore Verification Record Permission / Write Error'
+          : stage === 'liveness_challenge'
+          ? 'Active Liveness Challenge Required'
           : stage === 'audit_logging'
           ? 'Audit Log Persistence Error'
           : code.startsWith('firestore_') || err?.diagnosticCode
@@ -2330,7 +2520,11 @@ export function renderVerification(container, { appState, navigate }) {
       resultEl.innerHTML = diagView.html;
       showToast(diagView.toastText, 'danger');
     } finally {
-      runBtn.disabled = false; runBtn.textContent = 'Verify Identity';
+      verifyingInFlight = false;
+      runBtn.disabled = false;
+      runBtn.textContent = pendingAttempt && !pendingAttempt.persisted && pendingAttempt.apiResult
+        ? 'Retry Save Verification'
+        : 'Verify Identity';
     }
   });
 

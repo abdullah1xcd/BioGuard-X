@@ -7,6 +7,7 @@ on:
       - 'firestore.rules'
       - 'firebase.json'
       - '.firebaserc'
+      - 'src/shared/verificationRecord.ts'
       - '.github/workflows/deploy-firestore-rules.yml'
   workflow_dispatch:
 
@@ -80,4 +81,9 @@ jobs:
         run: npx firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}" --non-interactive --dry-run
 
       - name: Deploy Firestore rules ONLY to named database
-        run: npm run deploy:rules -- --project "${FIREBASE_PROJECT_ID}" --non-interactive
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run deploy:rules -- --project "${FIREBASE_PROJECT_ID}" --non-interactive | tee /tmp/firestore-rules-deploy.log
+          grep -qE "released rules firestore\.rules|Deploy complete" /tmp/firestore-rules-deploy.log
+          echo "Verified Firestore rules deployment for project=${FIREBASE_PROJECT_ID} database=${FIRESTORE_DATABASE_ID}."

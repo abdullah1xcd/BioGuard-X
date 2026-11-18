@@ -26,6 +26,7 @@ import {
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import {
+  VALID_FIRESTORE_ID_RE,
   buildVerificationRecordPayload,
   validateVerificationRecordDoc,
 } from '../shared/verificationRecord.ts';
@@ -324,6 +325,10 @@ function makeId(prefix) {
   return `${prefix}_${Date.now()}_${rand}`.replace(/[^a-zA-Z0-9_-]/g, '');
 }
 
+export function makeVerificationRecordId() {
+  return makeId('ver');
+}
+
 const VALID_IDENTITY_RE = /^[a-zA-Z0-9_-]{2,64}$/;
 const SUPPORTED_MODALITIES = new Set(['face', 'voice', 'fingerprint']);
 
@@ -557,6 +562,7 @@ export function subscribeIdentities(_role, uid, onData, onErr) {
 
 // Verification Records (isolated per Google UID)
 export async function recordVerificationMetadata({
+  verificationId: requestedVerificationId,
   identityRef,
   modalities,
   pipeline,
@@ -686,7 +692,18 @@ export async function recordVerificationMetadata({
     });
   }
 
-  const verificationId = makeId('ver');
+  let verificationId = makeVerificationRecordId();
+  if (requestedVerificationId !== undefined && requestedVerificationId !== null) {
+    const cleanVerId = String(requestedVerificationId).trim();
+    if (!VALID_FIRESTORE_ID_RE.test(cleanVerId)) {
+      throw makeDiagnosticError(
+        'Verification record rejected: invalid verificationId format.',
+        'verification_record_validation',
+        'verification_record_schema_invalid'
+      );
+    }
+    verificationId = cleanVerId;
+  }
   const path = `users/${uid}/verification_records/${verificationId}`;
   const t0 = performance.now();
   let debugSummary = null;
