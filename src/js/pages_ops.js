@@ -53,6 +53,7 @@ export function renderAnalytics(container, { appState }) {
         <p class="page-subtitle">Measured classification accuracy, operational verification rates, and ROC analysis from persisted Firestore records.</p>
       </div>
       <div class="page-actions">
+        <button type="button" class="btn btn-secondary" id="an-print-report">Print / Save PDF</button>
         <button type="button" class="btn btn-secondary" id="an-export-csv">Export CSV</button>
         <button type="button" class="btn btn-secondary" id="an-export-json">Export Report (JSON)</button>
       </div>
@@ -468,6 +469,16 @@ export function renderAnalytics(container, { appState }) {
       scopeFilter = btn.dataset.scope;
       renderStats();
     });
+  });
+
+  container.querySelector('#an-print-report').addEventListener('click', () => {
+    const cleanup = () => {
+      container.classList.remove('print-report-mode');
+      window.removeEventListener('afterprint', cleanup);
+    };
+    container.classList.add('print-report-mode');
+    window.addEventListener('afterprint', cleanup);
+    window.print();
   });
 
   container.querySelector('#an-export-csv').addEventListener('click', () => {
