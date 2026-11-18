@@ -71,6 +71,10 @@ export function renderCompareIdentities(container, { appState, navigate }) {
           </div>
         </div>
 
+        <div class="notice-strip warning" role="note">
+          <div><strong>Biometric model limitation</strong><div>Voice comparison currently uses handcrafted acoustic features (MFCC/pitch statistics), not a validated speaker-verification model. Treat voice similarity as experimental evidence, not proof of identity. Production-grade speaker verification requires a trained speaker embedding model and validation on representative recordings.</div></div>
+        </div>
+
         <div class="form-grid">
           <div class="form-field">
             <label class="field-label" for="cmp-ref-a">Identity A</label>
@@ -244,6 +248,12 @@ export function renderCompareIdentities(container, { appState, navigate }) {
     const refB = container.querySelector('#cmp-ref-b').value;
     const fusionPolicy = container.querySelector('#cmp-policy-1').value;
     const outEl = container.querySelector('#cmp-1to1-result');
+
+    if (!refA || !refB || refA === refB) {
+      outEl.innerHTML = `<div class="notice-strip warning" role="alert"><div><strong>Choose two different identities</strong><div>Identity A and Identity B must reference two distinct enrolled profiles. Comparing a profile with itself cannot test whether the matcher distinguishes different people.</div></div></div>`;
+      showToast('Select two different identities before comparing.', 'warning');
+      return;
+    }
 
     btn.disabled = true;
     btn.textContent = 'Comparing...';
