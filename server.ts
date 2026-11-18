@@ -2137,6 +2137,18 @@ export function isOriginAllowed(origin: string, hostHeader?: string): boolean {
   const cleanHost = (hostHeader || '').trim().toLowerCase();
   if (cleanHost && parsed.host.toLowerCase() === cleanHost) return true;
 
+  // Allow exact Vercel deployment hostnames when running behind Vercel proxies
+  const vercelHosts = [
+    process.env.VERCEL_URL,
+    process.env.VERCEL_BRANCH_URL,
+    process.env.VERCEL_PROJECT_PRODUCTION_URL,
+  ]
+    .map((h) => String(h || '').trim().toLowerCase().replace(/^https?:\/\//, '').split('/')[0])
+    .filter(Boolean);
+  if (parsed.protocol === 'https:' && vercelHosts.includes(parsed.host.toLowerCase())) {
+    return true;
+  }
+
   if (
     process.env.NODE_ENV !== 'production' &&
     (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')
@@ -2515,8 +2527,19 @@ app.post(
 
     await saveVaultEntry(req.auth!.uid, entry, req.auth!.idToken);
 
-    const registeredModalities = Object.keys(entry.modalities).filter(
-      (m) => (entry.modalities[m as keyof typeof entry.modalities]?.length || 0) > 0
+    // Read-back verification: confirm ciphertext round-trip decrypts cleanly from encrypted vault
+    const verifiedEntry = await loadVaultEntry(req.auth!.uid, identityRef, req.auth!.idToken);
+    if (!verifiedEntry) {
+      throw new BackendHttpError(
+        500,
+        'vault_readback_failed',
+        `Vault write for "${identityRef}" could not be verified on read-back.`,
+        { authorizationStage: 'vault_persistence', operation: 'get', path: `users/${req.auth!.uid}/biometric_vault/${identityRef}` }
+      );
+    }
+
+    const registeredModalities = Object.keys(verifiedEntry.modalities).filter(
+      (m) => (verifiedEntry.modalities[m as keyof typeof verifiedEntry.modalities]?.length || 0) > 0
     );
 
     const processingTimeMs = Number((performance.now() - t0).toFixed(1));
@@ -2524,7 +2547,8 @@ app.post(
       status: 'enrolled',
       identityRef,
       registeredModalities,
-      featureVersion: entry.featureVersion,
+      featureVersion: verifiedEntry.featureVersion,
+      persistedVerified: true,
       qualityChecks: qualityReport.checks,
       qualityWarnings: qualityReport.warnings,
       qualityScores: qualityReport.qualityScores,
@@ -3065,6 +3089,14 @@ app.post(
       res.status(400).json({ error: 'invalid_identity_ref', message: 'Valid identityRefA and identityRefB are required.', requestId });
       return;
     }
+    if (refA === refB) {
+      res.status(400).json({
+        error: 'same_identity_comparison_not_allowed',
+        message: `Cannot compare "${refA}" against itself. Select two distinct identities for 1:1 comparison.`,
+        requestId,
+      });
+      return;
+    }
 
     const [entryA, entryB, workspacePolicy] = await Promise.all([
       loadVaultEntry(req.auth!.uid, refA, req.auth!.idToken),
@@ -3266,7 +3298,11 @@ app.post(
 
 // 7. Vault Identity Status & Admin Deletion
 app.get('/api/v1/identities/:identityRef/vault', requireAuth, requireCapability('view_identities'), asyncHandler(async (req: AuthedRequest, res: Response) => {
-  const identityRef = String(req.params.identityRef || '');
+  const identityRef = String(req.params.identityRef || '').trim();
+  if (!/^[a-zA-Z0-9_-]{2,64}$/.test(identityRef)) {
+    res.status(400).json({ error: 'invalid_identity_ref', message: 'Valid identityRef is required.' });
+    return;
+  }
   const entry = await loadVaultEntry(req.auth!.uid, identityRef, req.auth!.idToken);
   if (!entry) {
     res.json({ identityRef, inVault: false, modalities: [] });
@@ -3286,14 +3322,26 @@ app.get('/api/v1/identities/:identityRef/vault', requireAuth, requireCapability(
 }));
 
 app.delete('/api/v1/identities/:identityRef', requireAuth, requireCapability('delete_identity'), asyncHandler(async (req: AuthedRequest, res: Response) => {
-  const identityRef = String(req.params.identityRef || '');
+  const identityRef = String(req.params.identityRef || '').trim();
+  if (!/^[a-zA-Z0-9_-]{2,64}$/.test(identityRef)) {
+    res.status(400).json({ error: 'invalid_identity_ref', message: 'Valid identityRef is required.' });
+    return;
+  }
   const existing = await loadVaultEntry(req.auth!.uid, identityRef, req.auth!.idToken);
   if (!existing) {
     res.status(404).json({ error: 'not_found', message: 'Identity not present in biometric vault.' });
     return;
   }
   await deleteVaultEntry(req.auth!.uid, identityRef, req.auth!.idToken);
-  res.json({ status: 'deleted_from_vault', identityRef });
+  const residual = await loadVaultEntry(req.auth!.uid, identityRef, req.auth!.idToken);
+  if (residual) {
+    throw new BackendHttpError(
+      500,
+      'vault_delete_verification_failed',
+      `Encrypted template for "${identityRef}" could not be confirmed deleted from vault.`
+    );
+  }
+  res.json({ status: 'deleted_from_vault', identityRef, confirmedDeleted: true });
 }));
 
 // 8. Server-Verified Admin Role & Status Management

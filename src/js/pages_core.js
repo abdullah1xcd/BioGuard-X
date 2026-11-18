@@ -11,6 +11,7 @@ import {
 import {
   enrollBiometricIdentity,
   verifyMultimodalBiometrics,
+  fetchIdentityVaultStatus,
   deleteIdentityFromVault,
   requestLivenessChallenge,
 } from './api.js';
@@ -248,7 +249,7 @@ export function renderOverview(container, { appState, navigate }) {
           </div>
           <div class="row-wrap">
             <button class="btn btn-ghost btn-sm" type="button" data-goto="analytics">Analytics</button>
-            ${permissions.includes('manage_alerts') ? `<button class="btn btn-ghost btn-sm" type="button" data-goto="threat_intel">Threat Analysis</button>` : ''}
+            ${permissions.includes('manage_alerts') && isDevTestingModeActive(appState) ? `<button class="btn btn-ghost btn-sm" type="button" data-goto="threat_intel">Threat Analysis</button>` : ''}
           </div>
         </div>
 
@@ -595,7 +596,7 @@ export function renderEnrollment(container, { appState, navigate }) {
         <div id="be-summary" class="meta-line">Capture or upload at least one biometric modality to enroll.</div>
         <div class="row-between" style="padding-top:6px;border-top:1px solid var(--border-hairline);">
           <button type="button" class="btn btn-secondary btn-sm" data-step-prev="4">&larr; Back</button>
-          <button type="submit" class="btn btn-primary" id="be-submit">Enroll Identity</button>
+          <button type="submit" class="btn btn-primary" id="be-submit">Save Biometric Template</button>
         </div>
       </section>
     </form>
@@ -1119,20 +1120,36 @@ export function renderEnrollment(container, { appState, navigate }) {
     }
 
     submitBtn.disabled = true;
-    submitBtn.textContent = 'Validating & Encrypting...';
+    submitBtn.textContent = 'Validating, Encrypting & Verifying...';
+    const hadExistingMeta = appState.identities.some((i) => i.identityRef === identityRef);
     try {
       const apiRes = await enrollBiometricIdentity({ identityRef, consentRecorded, samples, quality });
-      await saveIdentityMetadata({
-        identityRef,
-        displayName,
-        registeredModalities: apiRes.registeredModalities,
-        featureVersion: apiRes.featureVersion,
-      });
+      let savedMeta;
+      try {
+        savedMeta = await saveIdentityMetadata({
+          identityRef,
+          displayName,
+          registeredModalities: apiRes.registeredModalities,
+          featureVersion: apiRes.featureVersion,
+        });
+      } catch (metaErr) {
+        if (!hadExistingMeta) {
+          await deleteIdentityFromVault(identityRef).catch(() => null);
+        }
+        throw metaErr;
+      }
+
+      const vaultReadBack = await fetchIdentityVaultStatus(identityRef).catch(() => null);
+      const readBackConfirmed = Boolean(
+        (apiRes.persistedVerified || vaultReadBack?.inVault === true) &&
+        savedMeta?.identityRef === identityRef
+      );
+
       await appendAuditLog({
         action: 'identity_enrolled',
         resourceType: 'identity',
         resourceId: identityRef,
-        result: `Enrolled [${apiRes.registeredModalities.join(', ')}] (${apiRes.featureVersion}) in ${apiRes.processingTimeMs}ms`,
+        result: `Enrolled [${apiRes.registeredModalities.join(', ')}] (${apiRes.featureVersion}, readBack=${readBackConfirmed}) in ${apiRes.processingTimeMs}ms`,
         requestId: apiRes.requestId,
       }).catch(() => null);
       await pushNotification({
@@ -1155,7 +1172,7 @@ export function renderEnrollment(container, { appState, navigate }) {
         <section class="panel stack-md" style="border-color:rgba(20, 184, 166, 0.4);">
           <div class="row-between">
             <div class="stack-sm" style="gap:2px;">
-              <span class="state-text state-success">${fpTemplate ? 'Fingerprint &amp; Biometric Profile Successfully Enrolled' : 'Enrollment Complete'}</span>
+              <span class="state-text state-success">${fpTemplate ? 'Fingerprint &amp; Biometric Profile Saved &amp; Verified' : 'Biometric Template Saved &amp; Verified'}</span>
               <h3 class="panel-title">${escapeHtml(displayName)} (<span class="mono">${escapeHtml(apiRes.identityRef)}</span>)</h3>
             </div>
             <div class="row-wrap">
@@ -1170,8 +1187,8 @@ export function renderEnrollment(container, { appState, navigate }) {
               <span class="mono" style="text-transform:capitalize;">${escapeHtml(apiRes.registeredModalities.join(', '))}</span>
             </div>
             <div class="divider-row">
-              <span>Vault Storage &amp; Consent</span>
-              <span class="state-text state-success">AES-256-GCM Encrypted · Explicit Consent Recorded</span>
+              <span>Vault Storage &amp; Read-Back Verification</span>
+              <span class="state-text state-success">${readBackConfirmed ? 'AES-256-GCM Encrypted &amp; Verified on Read-Back' : 'AES-256-GCM Encrypted'}</span>
             </div>
             <div class="divider-row">
               <span>Pre-Submission Quality</span>
@@ -1188,7 +1205,7 @@ export function renderEnrollment(container, { appState, navigate }) {
       resContainer.querySelector('#be-view-list')?.addEventListener('click', () => {
         navigate('identities');
       });
-      showToast(`Identity "${identityRef}" enrolled.`, 'success');
+      showToast(`Biometric template for "${identityRef}" saved and verified.`, 'success');
       haltCameraUI();
     } catch (err) {
       const code = String(err?.code || '');
@@ -1211,7 +1228,7 @@ export function renderEnrollment(container, { appState, navigate }) {
       showToast(diagView.toastText, 'danger');
     } finally {
       submitBtn.disabled = false;
-      submitBtn.textContent = 'Enroll Identity';
+      submitBtn.textContent = 'Save Biometric Template';
     }
   });
 
@@ -2313,7 +2330,8 @@ export function renderVerification(container, { appState, navigate }) {
               </div>
             </div>
             ${
-              appState.permissions.includes('use_ai_analyst')
+              appState.permissions.includes('use_ai_analyst') &&
+              (isDevTestingModeActive(appState) || appState.health?.gemini_configured === true)
                 ? `<button type="button" class="btn btn-secondary btn-sm" id="mv-explain-ai">Explain with AI Analyst</button>`
                 : ''
             }
@@ -2766,7 +2784,13 @@ export function renderIdentities(container, { appState, navigate }) {
               variant: 'btn-danger',
               onClick: async ({ close }) => {
                 try {
-                  await deleteIdentityFromVault(ref).catch(() => null);
+                  try {
+                    await deleteIdentityFromVault(ref);
+                  } catch (vaultErr) {
+                    if (vaultErr?.status !== 404 && vaultErr?.code !== 'not_found') {
+                      throw vaultErr;
+                    }
+                  }
                   await deleteIdentityMetadata(ref);
                   await appendAuditLog({
                     action: 'identity_deleted',

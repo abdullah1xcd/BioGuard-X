@@ -81,7 +81,12 @@ export function renderCompareIdentities(container, { appState, navigate }) {
           <div class="form-field">
             <label class="field-label" for="cmp-ref-b">Identity B</label>
             <select class="select" id="cmp-ref-b">
-              ${identities.map((i, idx) => `<option value="${escapeHtml(i.identityRef)}" ${idx === (identities.length > 1 ? 1 : 0) ? 'selected' : ''}>${escapeHtml(i.displayName)} (${escapeHtml(i.identityRef)}) · [${escapeHtml((i.registeredModalities || []).join(', '))}]</option>`).join('')}
+              ${(() => {
+                const defaultB = identities.find((x) => x.identityRef !== preselected)?.identityRef || preselected;
+                return identities
+                  .map((i) => `<option value="${escapeHtml(i.identityRef)}" ${i.identityRef === defaultB ? 'selected' : ''}>${escapeHtml(i.displayName)} (${escapeHtml(i.identityRef)}) · [${escapeHtml((i.registeredModalities || []).join(', '))}]</option>`)
+                  .join('');
+              })()}
             </select>
           </div>
         </div>
@@ -244,6 +249,12 @@ export function renderCompareIdentities(container, { appState, navigate }) {
     const refB = container.querySelector('#cmp-ref-b').value;
     const fusionPolicy = container.querySelector('#cmp-policy-1').value;
     const outEl = container.querySelector('#cmp-1to1-result');
+
+    if (refA === refB) {
+      outEl.innerHTML = `<div class="notice-strip warning"><div><strong>Two Distinct Identities Required</strong><div>Identity A and Identity B both point to <span class="mono">${escapeHtml(refA)}</span>. Self-comparison is blocked to ensure genuine cross-identity evaluation.</div></div></div>`;
+      showToast('Select two different identities for 1:1 comparison.', 'warning');
+      return;
+    }
 
     btn.disabled = true;
     btn.textContent = 'Comparing...';

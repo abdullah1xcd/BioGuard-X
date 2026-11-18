@@ -206,6 +206,10 @@ export function identifyBiometricProbe({
   });
 }
 
+export function fetchIdentityVaultStatus(identityRef) {
+  return apiFetch(`/api/v1/identities/${encodeURIComponent(identityRef)}/vault`);
+}
+
 export function deleteIdentityFromVault(identityRef) {
   return apiFetch(`/api/v1/identities/${encodeURIComponent(identityRef)}`, {
     method: 'DELETE',

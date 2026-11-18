@@ -711,6 +711,20 @@ export function renderSettings(container, { appState, navigate, applyTheme, setD
       </section>`
         : ''
     }
+
+    <details class="advanced-details">
+      <summary>Optional Governance &amp; Security Panels (Audit Logs, Access Control, Approvals, Alerts)</summary>
+      <div class="advanced-details-body">
+        <div class="meta-line">These auxiliary tools remain accessible here while keeping primary navigation focused on core biometric verification workflows.</div>
+        <div class="row-wrap">
+          <button type="button" class="btn btn-secondary btn-sm" data-st-route="audit_trail">Audit Logs</button>
+          <button type="button" class="btn btn-secondary btn-sm" data-st-route="approvals">Approval Requests</button>
+          <button type="button" class="btn btn-secondary btn-sm" data-st-route="access_control">Access Control</button>
+          ${appState.permissions.includes('manage_alerts') ? `<button type="button" class="btn btn-secondary btn-sm" data-st-route="threat_intel">Threat Monitoring</button>` : ''}
+          ${appState.permissions.includes('use_ai_analyst') ? `<button type="button" class="btn btn-secondary btn-sm" data-st-route="ai_analyst">AI Security Analyst</button>` : ''}
+        </div>
+      </div>
+    </details>
   `;
 
   const diagListEl = container.querySelector('#st-diag-list');
@@ -831,6 +845,9 @@ export function renderSettings(container, { appState, navigate, applyTheme, setD
   container.querySelector('#st-pwa-install')?.addEventListener('click', triggerPwaInstall);
   container.querySelector('#st-share-link')?.addEventListener('click', shareOrCopyPortableLink);
   container.querySelector('#st-open-automation')?.addEventListener('click', () => navigate('automation'));
+  container.querySelectorAll('[data-st-route]').forEach((b) => {
+    b.addEventListener('click', () => navigate(b.dataset.stRoute));
+  });
 
   container.querySelector('#st-toggle-devmode')?.addEventListener('click', () => {
     if (!canDevMode || typeof setDevTestingMode !== 'function') return;

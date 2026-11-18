@@ -2886,3 +2886,430 @@ test('Liveness challenge expiry/strictness and retry verificationId idempotency 
   assert.deepEqual(nextPlan, { action: 'run_full', verificationId: 'ver_test_2' });
 });
 
+test('Firebase Auth diagnostic helper explains auth/unauthorized-domain and auth flow failures clearly', async () => {
+  const { formatFirebaseAuthDiagnostic } = await import('../src/shared/firestoreDiagnostics.ts');
+
+  const domainDiag = formatFirebaseAuthDiagnostic(
+    { code: 'auth/unauthorized-domain', message: 'Firebase: Error (auth/unauthorized-domain).' },
+    'bioguard-x-preview.vercel.app',
+    'basic-climber-rmbw7.firebaseapp.com'
+  );
+  assert.equal(domainDiag.code, 'auth/unauthorized-domain');
+  assert.equal(domainDiag.hostname, 'bioguard-x-preview.vercel.app');
+  assert.equal(domainDiag.authDomain, 'basic-climber-rmbw7.firebaseapp.com');
+  assert.match(domainDiag.remediation, /Authorized domains/i);
+  assert.match(domainDiag.remediation, /bioguard-x-preview\.vercel\.app/);
+  assert.match(domainDiag.remediation, /basic-climber-rmbw7/);
+  assert.match(domainDiag.formattedMessage, /auth\/unauthorized-domain/);
+
+  const popupDiag = formatFirebaseAuthDiagnostic(
+    { code: 'auth/popup-closed-by-user', message: 'Popup closed' },
+    'localhost'
+  );
+  assert.equal(popupDiag.code, 'auth/popup-closed-by-user');
+  assert.match(popupDiag.explanation, /closed/i);
+
+  const netDiag = formatFirebaseAuthDiagnostic(
+    { code: 'auth/network-request-failed', message: 'Network error' },
+    'localhost'
+  );
+  assert.equal(netDiag.code, 'auth/network-request-failed');
+  assert.match(netDiag.title, /Network Failure/i);
+});
+
+test('Server CORS allows configured Vercel deployment hosts without wildcards and rejects arbitrary hosts', async () => {
+  process.env.BIOGUARD_SKIP_LISTEN = '1';
+  const prevVercel = process.env.VERCEL_URL;
+  const prevBranch = process.env.VERCEL_BRANCH_URL;
+  const prevProd = process.env.VERCEL_PROJECT_PRODUCTION_URL;
+  try {
+    process.env.VERCEL_URL = 'bioguard-git-feature-abc.vercel.app';
+    process.env.VERCEL_BRANCH_URL = 'bioguard-submission.vercel.app';
+    process.env.VERCEL_PROJECT_PRODUCTION_URL = 'bioguard-x.vercel.app';
+
+    const { isOriginAllowed } = await import('../server.ts');
+    assert.equal(isOriginAllowed('https://bioguard-x.vercel.app', 'other-internal.host'), true);
+    assert.equal(isOriginAllowed('https://bioguard-submission.vercel.app', 'other-internal.host'), true);
+    assert.equal(isOriginAllowed('https://bioguard-git-feature-abc.vercel.app', 'other-internal.host'), true);
+    assert.equal(isOriginAllowed('https://attacker-other.vercel.app', 'other-internal.host'), false);
+    assert.equal(isOriginAllowed('http://bioguard-x.vercel.app', 'other-internal.host'), false);
+  } finally {
+    if (prevVercel === undefined) delete process.env.VERCEL_URL;
+    else process.env.VERCEL_URL = prevVercel;
+    if (prevBranch === undefined) delete process.env.VERCEL_BRANCH_URL;
+    else process.env.VERCEL_BRANCH_URL = prevBranch;
+    if (prevProd === undefined) delete process.env.VERCEL_PROJECT_PRODUCTION_URL;
+    else process.env.VERCEL_PROJECT_PRODUCTION_URL = prevProd;
+  }
+});
+
+test('End-to-end HTTP Biometric Pipeline: enroll read-back, genuine/impostor verify, self-compare guard, delete confirmation & RBAC', async () => {
+  process.env.BIOGUARD_SKIP_LISTEN = '1';
+  const prevSecret = process.env.BIOGUARD_VAULT_SECRET;
+  process.env.BIOGUARD_VAULT_SECRET = 'test-e2e-vault-secret-minimum-32-chars-9999';
+
+  const { default: app } = await import('../server.ts');
+
+  // Normalized 1024-D synthetic face vectors (distinct directions + small sensor jitter)
+  const makeFaceVec = (seedOffset: number, jitterSeed = 0): number[] => {
+    const vec = new Array<number>(1024);
+    let s = (seedOffset * 997 + jitterSeed * 31 + 17) >>> 0;
+    let norm = 0;
+    for (let i = 0; i < 1024; i++) {
+      s = (s * 1664525 + 1013904223) >>> 0;
+      const noise = jitterSeed === 0 ? 0 : ((s / 0xffffffff) - 0.5) * 0.04;
+      const base = Math.sin((i + 1) * (0.031 + seedOffset * 0.19)) + 0.5 * Math.cos((i + 3) * (0.073 + seedOffset * 0.27));
+      const v = base + noise;
+      vec[i] = v;
+      norm += v * v;
+    }
+    const scale = 1 / (Math.sqrt(norm) || 1);
+    return vec.map((v) => Number((v * scale).toFixed(6)));
+  };
+
+  const aliceEnrollVec = makeFaceVec(1, 0);
+  const aliceFreshProbeVec = makeFaceVec(1, 3);
+  const bobEnrollVec = makeFaceVec(9, 0);
+
+  // In-memory Firestore REST + Identity Toolkit mock scoped strictly to Google endpoints
+  const firestoreDocs = new Map<string, Record<string, unknown>>();
+  const tokens: Record<string, { localId: string; email: string; emailVerified: boolean; role: string }> = {
+    'tok-operator': { localId: 'uid_op_1', email: 'operator@bioguard.test', emailVerified: true, role: 'operator' },
+    'tok-viewer': { localId: 'uid_view_1', email: 'viewer@bioguard.test', emailVerified: true, role: 'viewer' },
+  };
+  for (const t of Object.values(tokens)) {
+    firestoreDocs.set(`users/${t.localId}`, {
+      fields: {
+        role: { stringValue: t.role },
+        status: { stringValue: 'active' },
+      },
+    });
+  }
+
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<globalThis.Response> => {
+    const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+
+    if (urlStr.startsWith('https://identitytoolkit.googleapis.com/v1/accounts:lookup')) {
+      const parsed = JSON.parse(String(init?.body || '{}')) as { idToken?: string };
+      const u = parsed.idToken ? tokens[parsed.idToken] : undefined;
+      if (!u) {
+        return new Response(JSON.stringify({ error: { message: 'INVALID_ID_TOKEN' } }), { status: 400 });
+      }
+      return new Response(JSON.stringify({ users: [{ localId: u.localId, email: u.email, emailVerified: u.emailVerified }] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (urlStr.startsWith('https://firestore.googleapis.com/v1/')) {
+      const marker = '/documents/';
+      const idx = urlStr.indexOf(marker);
+      const rawRel = idx >= 0 ? urlStr.slice(idx + marker.length).split('?')[0] : '';
+      const docPath = decodeURIComponent(rawRel);
+      const method = (init?.method || 'GET').toUpperCase();
+
+      // Collection list query on biometric_vault
+      if (method === 'GET' && /\/biometric_vault$/.test(docPath)) {
+        const prefix = `${docPath}/`;
+        const documents = Array.from(firestoreDocs.entries())
+          .filter(([k]) => k.startsWith(prefix))
+          .map(([k, v]) => ({ name: k, ...v }));
+        return new Response(JSON.stringify({ documents }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (method === 'GET') {
+        const doc = firestoreDocs.get(docPath);
+        if (!doc) {
+          return new Response(JSON.stringify({ error: { code: 404, status: 'NOT_FOUND', message: 'Not found' } }), { status: 404 });
+        }
+        return new Response(JSON.stringify({ name: docPath, updateTime: '2026-01-01T00:00:00Z', ...doc }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (method === 'PATCH') {
+        const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+        firestoreDocs.set(docPath, body);
+        return new Response(JSON.stringify({ name: docPath, ...body }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (method === 'DELETE') {
+        const existed = firestoreDocs.delete(docPath);
+        if (!existed) {
+          return new Response(JSON.stringify({ error: { code: 404, status: 'NOT_FOUND', message: 'Not found' } }), { status: 404 });
+        }
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+    }
+
+    return origFetch(input as RequestInfo, init);
+  }) as typeof fetch;
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address() as AddressInfo;
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  const authHeaders = (token = 'tok-operator') => ({
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  });
+
+  const buildChallengeTrajectory = (faceChallenge: string) => {
+    if (faceChallenge === 'blink') {
+      return [
+        { tMs: 0, yawDeg: 0, ear: 0.31 },
+        { tMs: 260, yawDeg: 0.4, ear: 0.16 },
+        { tMs: 560, yawDeg: 0.1, ear: 0.30 },
+      ];
+    }
+    if (faceChallenge === 'turn_left') {
+      return [
+        { tMs: 0, yawDeg: 0, ear: 0.30 },
+        { tMs: 260, yawDeg: -8.5, ear: 0.30 },
+        { tMs: 560, yawDeg: -14.2, ear: 0.30 },
+      ];
+    }
+    return [
+      { tMs: 0, yawDeg: 0, ear: 0.30 },
+      { tMs: 260, yawDeg: 8.5, ear: 0.30 },
+      { tMs: 560, yawDeg: 14.2, ear: 0.30 },
+    ];
+  };
+
+  try {
+    // 1. Viewer role is denied enrollment write (403)
+    const viewerEnrollRes = await origFetch(`${baseUrl}/api/v1/identities/enroll`, {
+      method: 'POST',
+      headers: authHeaders('tok-viewer'),
+      body: JSON.stringify({ identityRef: 'alice_primary', samples: { face: aliceEnrollVec } }),
+    });
+    assert.equal(viewerEnrollRes.status, 403);
+
+    // 2. Enroll Alice + Bob and verify read-back persistence
+    const enrollAliceRes = await origFetch(`${baseUrl}/api/v1/identities/enroll`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        identityRef: 'alice_primary',
+        consentRecorded: true,
+        samples: { face: aliceEnrollVec },
+        quality: { face: { faceQualityScore: 88, contrastStd: 38, sharpness: 18, isLiveCapture: true } },
+      }),
+    });
+    assert.equal(enrollAliceRes.status, 201);
+    const enrollAliceJson = (await enrollAliceRes.json()) as {
+      persistedVerified: boolean;
+      registeredModalities: string[];
+    };
+    assert.equal(enrollAliceJson.persistedVerified, true);
+    assert.deepEqual(enrollAliceJson.registeredModalities, ['face']);
+
+    const vaultStatusRes = await origFetch(`${baseUrl}/api/v1/identities/alice_primary/vault`, {
+      headers: authHeaders(),
+    });
+    assert.equal(vaultStatusRes.status, 200);
+    const vaultStatusJson = (await vaultStatusRes.json()) as { inVault: boolean; modalities: string[] };
+    assert.equal(vaultStatusJson.inVault, true);
+    assert.deepEqual(vaultStatusJson.modalities, ['face']);
+
+    const enrollBobRes = await origFetch(`${baseUrl}/api/v1/identities/enroll`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        identityRef: 'bob_primary',
+        consentRecorded: true,
+        samples: { face: bobEnrollVec },
+        quality: { face: { faceQualityScore: 85, contrastStd: 35, sharpness: 16, isLiveCapture: false } },
+      }),
+    });
+    assert.equal(enrollBobRes.status, 201);
+
+    // 3. Issue live challenge and run genuine live face verification for Alice -> VERIFIED
+    const chal1Res = await origFetch(`${baseUrl}/api/v1/liveness/challenge`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ modalities: ['face'] }),
+    });
+    assert.equal(chal1Res.status, 201);
+    const chal1 = (await chal1Res.json()) as { challengeToken: string; faceChallenge: string };
+
+    const genuineRes = await origFetch(`${baseUrl}/api/v1/verification/multimodal`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        identityRef: 'alice_primary',
+        pipeline: 'face_only',
+        strictLiveness: true,
+        challengeToken: chal1.challengeToken,
+        samples: { face: aliceFreshProbeVec },
+        quality: {
+          face: {
+            faceQualityScore: 87,
+            contrastStd: 36,
+            sharpness: 17,
+            isLiveCapture: true,
+            frameMotionScore: 0.04,
+            antispoofScore: 0.91,
+            livenessNetScore: 0.89,
+            spoofRiskFlag: false,
+            challengeEvidence: { frames: buildChallengeTrajectory(chal1.faceChallenge) },
+          },
+        },
+      }),
+    });
+    assert.equal(genuineRes.status, 200);
+    const genuineJson = (await genuineRes.json()) as { outcome: string; finalDecision: string; score: number };
+    assert.equal(genuineJson.outcome, 'match');
+    assert.equal(genuineJson.finalDecision, 'VERIFIED');
+    assert.ok(genuineJson.score >= 0.9, `Expected fresh genuine face score >= 0.9, got ${genuineJson.score}`);
+
+    // 4. Verify impostor probe (Bob's face against Alice) -> REJECTED
+    const chal2Res = await origFetch(`${baseUrl}/api/v1/liveness/challenge`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ modalities: ['face'] }),
+    });
+    assert.equal(chal2Res.status, 201);
+    const chal2 = (await chal2Res.json()) as { challengeToken: string; faceChallenge: string };
+
+    const impostorRes = await origFetch(`${baseUrl}/api/v1/verification/multimodal`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        identityRef: 'alice_primary',
+        pipeline: 'face_only',
+        strictLiveness: true,
+        challengeToken: chal2.challengeToken,
+        samples: { face: bobEnrollVec },
+        quality: {
+          face: {
+            faceQualityScore: 86,
+            contrastStd: 35,
+            sharpness: 16,
+            isLiveCapture: true,
+            frameMotionScore: 0.03,
+            antispoofScore: 0.9,
+            livenessNetScore: 0.88,
+            spoofRiskFlag: false,
+            challengeEvidence: { frames: buildChallengeTrajectory(chal2.faceChallenge) },
+          },
+        },
+      }),
+    });
+    assert.equal(impostorRes.status, 200);
+    const impostorJson = (await impostorRes.json()) as { outcome: string; finalDecision: string };
+    assert.equal(impostorJson.outcome, 'no_match');
+    assert.equal(impostorJson.finalDecision, 'REJECTED');
+
+    // 5. Static / incomplete liveness on matching face yields honest INCONCLUSIVE under strict liveness
+    const staticIncRes = await origFetch(`${baseUrl}/api/v1/verification/multimodal`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        identityRef: 'alice_primary',
+        pipeline: 'face_only',
+        strictLiveness: true,
+        samples: { face: aliceFreshProbeVec },
+        quality: {
+          face: { faceQualityScore: 85, contrastStd: 34, sharpness: 15, isLiveCapture: false },
+        },
+      }),
+    });
+    assert.equal(staticIncRes.status, 200);
+    const staticIncJson = (await staticIncRes.json()) as { finalDecision: string; livenessStatus: string };
+    assert.equal(staticIncJson.livenessStatus, 'INCONCLUSIVE');
+    assert.equal(staticIncJson.finalDecision, 'INCONCLUSIVE');
+
+    // 6. 1:1 Identity Compare rejects self-comparison (refA === refB) with HTTP 400 and compares distinct subjects
+    const selfCmpRes = await origFetch(`${baseUrl}/api/v1/identities/compare`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ identityRefA: 'alice_primary', identityRefB: 'alice_primary' }),
+    });
+    assert.equal(selfCmpRes.status, 400);
+    const selfCmpJson = (await selfCmpRes.json()) as { error: string };
+    assert.equal(selfCmpJson.error, 'same_identity_comparison_not_allowed');
+
+    const distinctCmpRes = await origFetch(`${baseUrl}/api/v1/identities/compare`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ identityRefA: 'alice_primary', identityRefB: 'bob_primary' }),
+    });
+    assert.equal(distinctCmpRes.status, 200);
+    const distinctCmpJson = (await distinctCmpRes.json()) as { outcome: string; fusedScore: number };
+    assert.equal(distinctCmpJson.outcome, 'no_match');
+
+    // 7. Reject invalid identityRef on vault status/delete and confirm deletion read-back
+    const badRefRes = await origFetch(`${baseUrl}/api/v1/identities/bad!ref/vault`, { headers: authHeaders() });
+    assert.equal(badRefRes.status, 400);
+
+    const delRes = await origFetch(`${baseUrl}/api/v1/identities/alice_primary`, {
+      method: 'DELETE',
+      headers: authHeaders(),
+    });
+    assert.equal(delRes.status, 200);
+    const delJson = (await delRes.json()) as { confirmedDeleted: boolean };
+    assert.equal(delJson.confirmedDeleted, true);
+
+    const afterDelVaultRes = await origFetch(`${baseUrl}/api/v1/identities/alice_primary/vault`, {
+      headers: authHeaders(),
+    });
+    assert.equal(afterDelVaultRes.status, 200);
+    const afterDelVaultJson = (await afterDelVaultRes.json()) as { inVault: boolean };
+    assert.equal(afterDelVaultJson.inVault, false);
+
+    const verifyMissingRes = await origFetch(`${baseUrl}/api/v1/verification/multimodal`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        identityRef: 'alice_primary',
+        pipeline: 'face_only',
+        samples: { face: aliceFreshProbeVec },
+      }),
+    });
+    assert.equal(verifyMissingRes.status, 404);
+  } finally {
+    globalThis.fetch = origFetch;
+    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    if (prevSecret === undefined) delete process.env.BIOGUARD_VAULT_SECRET;
+    else process.env.BIOGUARD_VAULT_SECRET = prevSecret;
+  }
+});
+
+test('Submission UI & safety wiring: core 7-page sidebar, enrollment rollback, analytics PDF export, and print CSS', () => {
+  const appText = fs.readFileSync(path.join(process.cwd(), 'src/js/app.js'), 'utf8');
+  const coreText = fs.readFileSync(path.join(process.cwd(), 'src/js/pages_core.js'), 'utf8');
+  const opsText = fs.readFileSync(path.join(process.cwd(), 'src/js/pages_ops.js'), 'utf8');
+  const cmpText = fs.readFileSync(path.join(process.cwd(), 'src/js/pages_compare.js'), 'utf8');
+  const cssText = fs.readFileSync(path.join(process.cwd(), 'src/css/styles.css'), 'utf8');
+
+  // Optional governance pages remain implemented & gated behind Dev Mode in primary sidebar
+  for (const optionalRoute of ['threat_intel', 'ai_analyst', 'approvals', 'audit_trail', 'access_control', 'automation']) {
+    assert.match(appText, new RegExp(`id:\\s*'${optionalRoute}'[\\s\\S]*?showInSidebar:\\s*\\(state\\)\\s*=>\\s*isDevTestingModeActive\\(state\\)`));
+  }
+
+  // Enrollment split-brain rollback + vault read-back confirmation
+  assert.match(coreText, /Save Biometric Template/);
+  assert.match(coreText, /fetchIdentityVaultStatus\(/);
+  assert.match(coreText, /deleteIdentityFromVault\(identityRef\)\.catch/);
+
+  // Analytics permission guard, Print / Save PDF trigger, and print media styles
+  assert.match(opsText, /permissions\.includes\('view_analytics'\)/);
+  assert.match(opsText, /an-print-pdf/);
+  assert.match(opsText, /window\.print\(\)/);
+  assert.match(cssText, /@media print/);
+
+  // 1:1 Comparison guards against same-identity comparison
+  assert.match(cmpText, /refA === refB/);
+});
+
+

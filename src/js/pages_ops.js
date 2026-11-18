@@ -41,6 +41,11 @@ function getRecommendedAction(alert) {
 
 // 5. ANALYTICS & SECURITY REPORTS
 export function renderAnalytics(container, { appState }) {
+  if (!appState.permissions.includes('view_analytics')) {
+    container.innerHTML = `<div class="notice-strip danger"><div><strong>Permission Denied</strong><div>Your role (${escapeHtml(appState.profile?.role || 'viewer')}) does not have permission to view biometric analytics reports.</div></div></div>`;
+    return;
+  }
+
   let daysFilter = 'all';
   let scopeFilter = 'all'; // 'all' | 'labeled' | 'operational'
   let customStart = '';
@@ -55,6 +60,7 @@ export function renderAnalytics(container, { appState }) {
       <div class="page-actions">
         <button type="button" class="btn btn-secondary" id="an-export-csv">Export CSV</button>
         <button type="button" class="btn btn-secondary" id="an-export-json">Export Report (JSON)</button>
+        <button type="button" class="btn btn-primary" id="an-print-pdf">Print / Save PDF</button>
       </div>
     </div>
 
@@ -82,12 +88,13 @@ export function renderAnalytics(container, { appState }) {
     </section>
 
     <details class="advanced-details">
-      <summary>Methodology &amp; Statistical Integrity Definitions</summary>
+      <summary>Methodology, Modality Prototype Scope &amp; Statistical Definitions</summary>
       <div class="advanced-details-body" style="font-size:12.5px;color:var(--text-secondary);">
         <div><strong>1. Model Similarity:</strong> Normalized biometric feature closeness (not an identity probability).</div>
         <div><strong>2. Verification Confidence:</strong> Composite index from threshold margin, signal quality, liveness checks, and modality agreement.</div>
-        <div><strong>3. Classification Accuracy (TAR/FAR/FRR/EER/F1):</strong> Computed exclusively from ground-truth labeled Genuine vs. Impostor trials using subject-disjoint evaluation methodology.</div>
-        <div><strong>4. Operational Success Rate:</strong> Fraction of live operational attempts resulting in a match.</div>
+        <div><strong>3. Classification Accuracy (TAR/FAR/FRR/EER/F1):</strong> Computed exclusively from ground-truth labeled Genuine vs. Impostor benchmark trials using subject-disjoint evaluation methodology.</div>
+        <div><strong>4. Operational Match Rate:</strong> Fraction of live operational attempts resulting in a verified match.</div>
+        <div><strong>5. Prototype Scope:</strong> Voice verification uses classical 96-D 16kHz CMVN MFCC+Delta+F0 acoustic matching without speech-to-text ASR (liveness remains <span class="mono">INCONCLUSIVE</span>). Fingerprint verification runs classical Gabor enhancement + Zhang-Suen thinning + 2NN-RANSAC on uploaded ridge images without browser hardware PAD sensors (<span class="mono">NOT SUPPORTED</span>).</div>
       </div>
     </details>
 
@@ -522,6 +529,10 @@ export function renderAnalytics(container, { appState }) {
     };
     downloadFile('bioguardx_security_report.json', JSON.stringify(report, null, 2), 'application/json');
     showToast('Exported Security Report JSON.', 'success');
+  });
+
+  container.querySelector('#an-print-pdf')?.addEventListener('click', () => {
+    window.print();
   });
 
   return () => clearCharts();
@@ -1012,8 +1023,14 @@ export function renderApprovals(container, { appState }) {
               const reviewNotes = bodyEl.querySelector('#ap-notes').value.trim();
               try {
                 if (decision === 'approved' && req.requestType === 'biometric_deletion') {
-                  await deleteIdentityFromVault(req.targetIdentityRef).catch(() => null);
-                  await deleteIdentityMetadata(req.targetIdentityRef).catch(() => null);
+                  try {
+                    await deleteIdentityFromVault(req.targetIdentityRef);
+                  } catch (vaultErr) {
+                    if (vaultErr?.status !== 404 && vaultErr?.code !== 'not_found') {
+                      throw vaultErr;
+                    }
+                  }
+                  await deleteIdentityMetadata(req.targetIdentityRef);
                 }
                 await reviewApprovalRequest(requestId, { status: decision, reviewNotes });
                 await appendAuditLog({

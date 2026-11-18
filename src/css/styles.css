@@ -1648,3 +1648,46 @@ html.light .btn-primary {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }
+
+@media print {
+  body {
+    background: #ffffff !important;
+    color: #0f172a !important;
+  }
+  .sidebar,
+  .topbar,
+  .mobile-bottom-nav,
+  .sidebar-backdrop,
+  .toast-region,
+  .page-actions,
+  .segmented,
+  #an-custom-dates,
+  .offline-banner {
+    display: none !important;
+  }
+  .app-shell,
+  .workspace-main,
+  .main-content {
+    display: block !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+    background: #ffffff !important;
+  }
+  .panel,
+  .kpi-strip,
+  .dataset-card {
+    background: #ffffff !important;
+    color: #0f172a !important;
+    border-color: #cbd5e1 !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  .panel-subtitle,
+  .meta-line,
+  .kpi-meta {
+    color: #475569 !important;
+  }
+}
+

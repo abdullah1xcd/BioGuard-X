@@ -42,6 +42,7 @@ const NAV_GROUPS = [
         label: 'Analytics & Reports',
         icon: 'barChart',
         load: async () => (await import('./pages_ops.js')).renderAnalytics,
+        requirePermission: 'view_analytics',
       },
     ],
   },
@@ -61,40 +62,8 @@ const NAV_GROUPS = [
     ],
   },
   {
-    section: 'Security & Administration',
+    section: 'Configuration',
     items: [
-      {
-        id: 'threat_intel',
-        label: 'Threat Monitoring',
-        icon: 'radar',
-        load: async () => (await import('./pages_ops.js')).renderThreatIntel,
-        requirePermission: 'manage_alerts',
-      },
-      {
-        id: 'ai_analyst',
-        label: 'AI Security Analyst',
-        icon: 'cpu',
-        load: async () => (await import('./pages_admin.js')).renderAiAnalyst,
-        requirePermission: 'use_ai_analyst',
-      },
-      {
-        id: 'approvals',
-        label: 'Approval Requests',
-        icon: 'checkSquare',
-        load: async () => (await import('./pages_ops.js')).renderApprovals,
-      },
-      {
-        id: 'audit_trail',
-        label: 'Audit Logs',
-        icon: 'scroll',
-        load: async () => (await import('./pages_ops.js')).renderAuditTrail,
-      },
-      {
-        id: 'access_control',
-        label: 'Access Control',
-        icon: 'lock',
-        load: async () => (await import('./pages_admin.js')).renderAccessControl,
-      },
       {
         id: 'settings',
         label: 'Settings',
@@ -104,15 +73,52 @@ const NAV_GROUPS = [
     ],
   },
   {
-    section: 'Advanced Administration',
+    section: 'Optional Security & Governance',
     items: [
+      {
+        id: 'threat_intel',
+        label: 'Threat Monitoring',
+        icon: 'radar',
+        load: async () => (await import('./pages_ops.js')).renderThreatIntel,
+        requirePermission: 'manage_alerts',
+        showInSidebar: (state) => isDevTestingModeActive(state),
+      },
+      {
+        id: 'ai_analyst',
+        label: 'AI Security Analyst',
+        icon: 'cpu',
+        load: async () => (await import('./pages_admin.js')).renderAiAnalyst,
+        requirePermission: 'use_ai_analyst',
+        showInSidebar: (state) => isDevTestingModeActive(state),
+      },
+      {
+        id: 'approvals',
+        label: 'Approval Requests',
+        icon: 'checkSquare',
+        load: async () => (await import('./pages_ops.js')).renderApprovals,
+        showInSidebar: (state) => isDevTestingModeActive(state),
+      },
+      {
+        id: 'audit_trail',
+        label: 'Audit Logs',
+        icon: 'scroll',
+        load: async () => (await import('./pages_ops.js')).renderAuditTrail,
+        showInSidebar: (state) => isDevTestingModeActive(state),
+      },
+      {
+        id: 'access_control',
+        label: 'Access Control',
+        icon: 'lock',
+        load: async () => (await import('./pages_admin.js')).renderAccessControl,
+        showInSidebar: (state) => isDevTestingModeActive(state),
+      },
       {
         id: 'automation',
         label: 'Automation Center',
         icon: 'workflow',
         load: async () => (await import('./pages_ops.js')).renderAutomationCenter,
         requirePermission: 'manage_workflows',
-        showInSidebar: (state) => (state.workflows && state.workflows.length > 0) || isDevTestingModeActive(state),
+        showInSidebar: (state) => isDevTestingModeActive(state),
       },
     ],
   },
@@ -550,7 +556,8 @@ function initApp() {
   resolveAuthRedirect().catch((err) => {
     if (authError && err?.message) {
       authError.hidden = false;
-      authError.textContent = err.message;
+      authError.style.whiteSpace = 'pre-line';
+      authError.textContent = err?.authDiagnostic?.formattedMessage || err.message;
     }
   });
 
@@ -560,8 +567,13 @@ function initApp() {
     try {
       await signInWithGoogle();
     } catch (err) {
+      const displayMsg = err?.authDiagnostic?.formattedMessage || err.message || 'Google Sign-In failed.';
       authError.hidden = false;
-      authError.textContent = err.message || 'Google Sign-In failed.';
+      authError.style.whiteSpace = 'pre-line';
+      authError.textContent = displayMsg;
+      if (err?.code === 'auth/unauthorized-domain') {
+        showToast(`Unauthorized domain (${err.authDiagnostic?.hostname || window.location.hostname}) — add in Firebase Console Authorized domains.`, 'danger');
+      }
     } finally {
       signInBtn.disabled = false;
     }

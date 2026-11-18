@@ -642,3 +642,81 @@ export function evaluateVerificationRecordCreateRule(
     deniedReasons,
   };
 }
+
+export interface FirebaseAuthDiagnostic {
+  code: string;
+  title: string;
+  explanation: string;
+  remediation: string;
+  hostname: string;
+  authDomain: string;
+  formattedMessage: string;
+}
+
+export function formatFirebaseAuthDiagnostic(
+  error: unknown,
+  currentHostname?: string,
+  configuredAuthDomain?: string
+): FirebaseAuthDiagnostic {
+  const errObj = (error && typeof error === 'object' ? error : {}) as { code?: unknown; message?: unknown };
+  const rawCode = String(errObj.code || '').trim();
+  const rawMsg = error instanceof Error ? error.message : String(errObj.message || error || 'Google Sign-In failed.');
+  const hostname = String(currentHostname || '').trim() || 'current-host';
+  const authDomain = String(configuredAuthDomain || '').trim() || `${EXPECTED_FIREBASE_PROJECT_ID}.firebaseapp.com`;
+
+  if (rawCode === 'auth/unauthorized-domain' || /unauthorized[-_ ]domain/i.test(rawMsg)) {
+    const title = 'Firebase Auth Domain Not Authorized (auth/unauthorized-domain)';
+    const explanation = `Google Sign-In was blocked because "${hostname}" is not listed under Authorized Domains for Firebase project "${EXPECTED_FIREBASE_PROJECT_ID}" (authDomain: "${authDomain}").`;
+    const remediation = `Open Firebase Console -> Project "${EXPECTED_FIREBASE_PROJECT_ID}" -> Authentication -> Settings -> Authorized domains -> Add domain "${hostname}" (along with localhost and any Vercel/Cloud Run preview hostnames), then reload and sign in again.`;
+    return {
+      code: 'auth/unauthorized-domain',
+      title,
+      explanation,
+      remediation,
+      hostname,
+      authDomain,
+      formattedMessage: `${title}\n${explanation}\nHow to fix: ${remediation}`,
+    };
+  }
+
+  if (rawCode === 'auth/popup-closed-by-user') {
+    const title = 'Sign-In Popup Closed';
+    const explanation = 'The Google Sign-In popup window was closed before authentication completed.';
+    const remediation = 'Click "Sign in with Google" and finish selecting your verified Google account.';
+    return {
+      code: rawCode,
+      title,
+      explanation,
+      remediation,
+      hostname,
+      authDomain,
+      formattedMessage: `${title}: ${explanation} ${remediation}`,
+    };
+  }
+
+  if (rawCode === 'auth/network-request-failed') {
+    const title = 'Firebase Auth Network Failure';
+    const explanation = 'The browser could not reach Firebase Authentication servers during Google Sign-In.';
+    const remediation = 'Verify internet connectivity and ensure third-party popups/cookies are not blocked by browser extensions.';
+    return {
+      code: rawCode,
+      title,
+      explanation,
+      remediation,
+      hostname,
+      authDomain,
+      formattedMessage: `${title}: ${explanation} ${remediation}`,
+    };
+  }
+
+  return {
+    code: rawCode || 'auth/error',
+    title: 'Google Sign-In Error',
+    explanation: rawMsg,
+    remediation: 'Retry Google Sign-In or check Firebase Authentication configuration.',
+    hostname,
+    authDomain,
+    formattedMessage: rawMsg,
+  };
+}
+

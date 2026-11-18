@@ -33,6 +33,7 @@ import {
 import {
   BOOTSTRAPPED_ADMIN_EMAIL,
   classifyFirestoreDiagnostic,
+  formatFirebaseAuthDiagnostic,
   isBootstrapAdminEmail,
   sanitizeDiagnosticPayload,
   validateClientFirebaseConfig,
@@ -272,13 +273,23 @@ export async function testFirestoreConnection() {
   }
 }
 
+export function formatFirebaseAuthError(err) {
+  const hostname = typeof window !== 'undefined' ? window.location?.hostname || '' : '';
+  const diag = formatFirebaseAuthDiagnostic(err, hostname, firebaseConfig.authDomain);
+  const out = new Error(diag.formattedMessage, { cause: err });
+  return Object.assign(out, {
+    code: diag.code,
+    authDiagnostic: diag,
+  });
+}
+
 export async function resolveAuthRedirect() {
   try {
     const result = await getRedirectResult(auth);
     return result?.user || null;
   } catch (err) {
     console.warn('Google redirect sign-in returned error:', err?.message || err);
-    throw err;
+    throw formatFirebaseAuthError(err);
   }
 }
 
@@ -287,8 +298,12 @@ export async function signInWithGoogle() {
     typeof window !== 'undefined' &&
     (window.matchMedia?.('(display-mode: standalone)')?.matches === true || window.navigator?.standalone === true);
   if (isStandalone) {
-    await signInWithRedirect(auth, googleProvider);
-    return null;
+    try {
+      await signInWithRedirect(auth, googleProvider);
+      return null;
+    } catch (err) {
+      throw formatFirebaseAuthError(err);
+    }
   }
   try {
     const cred = await signInWithPopup(auth, googleProvider);
@@ -300,10 +315,14 @@ export async function signInWithGoogle() {
       code === 'auth/operation-not-supported-in-this-environment' ||
       code === 'auth/cancelled-popup-request'
     ) {
-      await signInWithRedirect(auth, googleProvider);
-      return null;
+      try {
+        await signInWithRedirect(auth, googleProvider);
+        return null;
+      } catch (redirErr) {
+        throw formatFirebaseAuthError(redirErr);
+      }
     }
-    throw err;
+    throw formatFirebaseAuthError(err);
   }
 }
 
@@ -492,6 +511,7 @@ export async function saveIdentityMetadata({ identityRef, displayName, registere
   }
 
   const path = `users/${uid}/identities/${cleanRef}`;
+  const t0 = performance.now();
   try {
     const ref = doc(db, 'users', uid, 'identities', cleanRef);
     const snap = await getDoc(ref);
@@ -516,7 +536,26 @@ export async function saveIdentityMetadata({ identityRef, displayName, registere
         updatedAt: serverTimestamp(),
       });
     }
+
+    // Confirm persistence by reading the saved metadata document back from Firestore
+    let confirmedSnap;
+    try {
+      confirmedSnap = await getDocFromServer(ref);
+    } catch {
+      confirmedSnap = await getDoc(ref);
+    }
+    if (!confirmedSnap.exists() || confirmedSnap.data()?.identityRef !== cleanRef) {
+      throw makeDiagnosticError(
+        `Identity metadata write for "${cleanRef}" could not be confirmed on Firestore read-back.`,
+        'identity_enrollment',
+        'identity_metadata_readback_failed',
+        { path }
+      );
+    }
+    trackFsOp('write', t0, true);
+    return confirmedSnap.data();
   } catch (err) {
+    trackFsOp('write', t0, false);
     if (err?.operationStage) throw err;
     handleFirestoreError(err, OperationType.WRITE, path, 'identity_enrollment');
   }
@@ -540,9 +579,25 @@ export async function deleteIdentityMetadata(identityRef) {
   const uid = auth.currentUser?.uid;
   if (!uid) throw new Error('Not signed in');
   const path = `users/${uid}/identities/${identityRef}`;
+  const docRef = doc(db, 'users', uid, 'identities', identityRef);
   try {
-    await deleteDoc(doc(db, 'users', uid, 'identities', identityRef));
+    await deleteDoc(docRef);
+    let checkSnap = null;
+    try {
+      checkSnap = await getDocFromServer(docRef);
+    } catch {
+      checkSnap = await getDoc(docRef).catch(() => null);
+    }
+    if (checkSnap && checkSnap.exists()) {
+      throw makeDiagnosticError(
+        `Identity metadata "${identityRef}" still exists after deletion request.`,
+        'identity_deletion',
+        'identity_delete_verification_failed',
+        { path }
+      );
+    }
   } catch (err) {
+    if (err?.operationStage) throw err;
     handleFirestoreError(err, OperationType.DELETE, path);
   }
 }
