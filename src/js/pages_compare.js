@@ -387,6 +387,7 @@ export function renderCompareIdentities(container, { appState, navigate }) {
       haltIdnCam();
       fSt.className = 'state-text state-warning';
       fSt.textContent = 'Starting Camera...';
+      fQ.textContent = 'Loading face detection & recognition models...';
       await ensureFaceEngineReady();
       activeStream = await openCameraStream();
       const wrap = document.createElement('div');
@@ -400,41 +401,93 @@ export function renderCompareIdentities(container, { appState, navigate }) {
       wrap.appendChild(v); wrap.appendChild(oval); wrap.appendChild(msgBadge);
       fLive.innerHTML = ''; fLive.appendChild(wrap);
       fLive.hidden = false; fSnap.hidden = false; fStop.hidden = false;
-      fSt.textContent = 'Preview';
+      fSnap.disabled = false;
+      fSnap.textContent = 'Capture';
+      fSt.className = 'state-text state-neutral';
+      fSt.textContent = 'Live Preview';
 
-      guidanceTimer = setInterval(async () => {
-        if (!activeStream) return;
-        try {
-          const g = await inspectLiveFaceGuidance(v);
-          msgBadge.textContent = g.message;
-          oval.classList.toggle('ready', Boolean(g.ready));
-        } catch {
-          // Ignore single frame errors
+      let capturing = false;
+      const pauseGuidance = () => {
+        if (guidanceTimer) {
+          clearInterval(guidanceTimer);
+          guidanceTimer = null;
         }
-      }, 450);
+      };
+      const startGuidance = () => {
+        pauseGuidance();
+        if (!activeStream) return;
+        guidanceTimer = setInterval(async () => {
+          if (!activeStream || capturing) return;
+          try {
+            const g = await inspectLiveFaceGuidance(v);
+            if (!g.paused) {
+              msgBadge.textContent = g.message;
+              oval.classList.toggle('ready', Boolean(g.ready));
+            }
+          } catch {
+            // Ignore transient preview frame errors
+          }
+        }, 480);
+      };
+      startGuidance();
 
       fSnap.onclick = async () => {
+        if (capturing) return;
+        capturing = true;
+        pauseGuidance();
         fSnap.disabled = true;
+        fSnap.textContent = 'Capturing 0/3...';
+        fSt.className = 'state-text state-warning';
+        fSt.textContent = 'Extracting 1024-D Features...';
+        msgBadge.textContent = 'Capturing live frames — hold steady...';
         try {
-          const res = await captureMultiFrameFaceFeatures(v, 220);
+          const res = await captureMultiFrameFaceFeatures(v, {
+            delayMs: 210,
+            onProgress: (info) => {
+              fSnap.textContent =
+                info.stage === 'frame_retry'
+                  ? `Retrying (${info.validCount}/${info.targetFrames})...`
+                  : `Capturing ${info.validCount}/${info.targetFrames}...`;
+              if (info.lastFailureMessage) {
+                msgBadge.textContent = info.lastFailureMessage;
+              }
+            },
+          });
           haltIdnCam();
+          fSnap.disabled = false;
+          fSnap.textContent = 'Capture';
           faceVec = res.vector;
           faceQuality = res.quality;
           fSt.className = 'state-text state-success';
           fSt.textContent = 'Live 3-Frame ✓';
           fQ.textContent = `Q:${faceQuality.faceQualityScore}/100 · Cons:${faceQuality.frameConsistencyCosine}`;
         } catch (err) {
+          faceVec = null;
+          faceQuality = null;
           fSt.className = 'state-text state-danger';
           fSt.textContent = err.feedbackLabel || 'Rejected';
           fQ.textContent = err.message;
+          msgBadge.textContent = `${err.feedbackLabel || 'Rejected'} — adjust pose/lighting and retry`;
+          oval.classList.remove('ready');
           showToast(err.message, 'danger');
+          if (activeStream && activeStream.getTracks().some((t) => t.readyState === 'live')) {
+            fSnap.disabled = false;
+            fSnap.textContent = 'Retry Capture';
+            startGuidance();
+          } else {
+            fSnap.disabled = false;
+            fSnap.textContent = 'Capture';
+            haltIdnCam();
+          }
         } finally {
-          fSnap.disabled = false;
-          haltIdnCam();
+          capturing = false;
         }
       };
     } catch (err) {
       haltIdnCam();
+      fSt.className = 'state-text state-danger';
+      fSt.textContent = err.feedbackLabel || 'Camera Error';
+      fQ.textContent = err.message;
       showToast(`Camera error: ${err.message}`, 'warning');
     }
   });

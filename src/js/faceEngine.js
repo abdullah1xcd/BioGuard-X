@@ -2,7 +2,21 @@
 // Powered by @vladmandic/human (BlazeFace + FaceMesh 468 landmarks + HSE-FaceRes 1024-D + AntiSpoof + Liveness)
 // Model weights served locally from /models/human/ (zero external CDN runtime dependency)
 
-import { l2Normalize } from '../shared/voiceDsp.ts';
+import {
+  FACE_EMBEDDING_DIM,
+  createFaceError,
+  createMutexQueue,
+  evaluateFacePoseAndQuality,
+  getFaceDiagnosticsConfig,
+  logFaceDiagnostic,
+  orchestrateMultiFrameCapture,
+  runSerialized,
+  setFaceDiagnosticsConfig,
+  validateFaceEmbedding,
+  validateFaceLandmarks,
+} from '../shared/facePipeline.ts';
+
+export { setFaceDiagnosticsConfig, getFaceDiagnosticsConfig };
 
 let HumanCtor = null;
 async function getHumanCtor() {
@@ -17,49 +31,187 @@ let humanInstance = null;
 let initPromise = null;
 let modelLoadStatus = 'idle'; // 'idle' | 'loading' | 'ready' | 'error'
 let modelLoadError = '';
+let activeBackend = 'webgl';
+let cpuFallbackAttempted = false;
+let captureInFlightCount = 0;
 
-const HUMAN_CONFIG = {
-  backend: 'webgl',
-  modelBasePath: '/models/human/',
-  debug: false,
-  async: true,
-  warmup: 'face',
-  cacheModels: true,
-  cacheSensitivity: 0.7,
-  filter: { enabled: true, equalization: true, autoBrightness: true },
-  face: {
-    enabled: true,
-    detector: {
-      enabled: true,
-      rotation: true, // Aligns tilted faces prior to embedding extraction
-      maxDetected: 5,
-      minConfidence: 0.42,
-      iouThreshold: 0.3,
-      scale: 1.4,
+const detectMutex = createMutexQueue();
+
+// Scratch canvases reused for ROI quality & frame motion so retries do not leak DOM allocations
+let roiScratchCanvas = null;
+let motionScratchCanvas = null;
+
+function getScratchCanvas(kind, size) {
+  if (typeof document === 'undefined') return null;
+  if (kind === 'roi') {
+    if (!roiScratchCanvas) {
+      roiScratchCanvas = document.createElement('canvas');
+    }
+    roiScratchCanvas.width = size;
+    roiScratchCanvas.height = size;
+    return roiScratchCanvas;
+  }
+  if (!motionScratchCanvas) {
+    motionScratchCanvas = document.createElement('canvas');
+  }
+  motionScratchCanvas.width = size;
+  motionScratchCanvas.height = size;
+  return motionScratchCanvas;
+}
+
+function createBaseConfig(backend = 'webgl') {
+  return {
+    backend,
+    modelBasePath: '/models/human/',
+    debug: false,
+    async: true,
+    warmup: backend === 'cpu' ? 'none' : 'face',
+    cacheModels: true,
+    // Strictly disable inter-frame pixel caching so every capture & verification runs real inference
+    cacheSensitivity: 0,
+    // Disable Human's internal GL filter mutations (autoBrightness mutates config every frame)
+    filter: {
+      enabled: false,
+      equalization: false,
+      autoBrightness: false,
       return: false,
     },
+    face: {
+      enabled: true,
+      detector: {
+        enabled: true,
+        rotation: true,
+        maxDetected: 5,
+        minConfidence: 0.42,
+        iouThreshold: 0.3,
+        scale: 1.4,
+        skipFrames: 0,
+        skipTime: 0,
+        return: false,
+      },
+      mesh: {
+        enabled: true,
+        keepInvalid: false,
+      },
+      attention: { enabled: false },
+      iris: { enabled: false },
+      description: {
+        enabled: true,
+        minConfidence: 0.1,
+        skipFrames: 0,
+        skipTime: 0,
+      },
+      emotion: { enabled: false },
+      antispoof: {
+        enabled: true,
+        skipFrames: 0,
+        skipTime: 0,
+      },
+      liveness: {
+        enabled: true,
+        skipFrames: 0,
+        skipTime: 0,
+      },
+      gear: { enabled: false },
+    },
+    body: { enabled: false },
+    hand: { enabled: false },
+    object: { enabled: false },
+    gesture: { enabled: false },
+    segmentation: { enabled: false },
+  };
+}
+
+const EXTRACTION_DETECT_OVERRIDE = {
+  cacheSensitivity: 0,
+  filter: { enabled: false, equalization: false, autoBrightness: false, return: false },
+  face: {
+    enabled: true,
+    detector: { enabled: true, rotation: true, skipFrames: 0, skipTime: 0 },
     mesh: { enabled: true, keepInvalid: false },
-    attention: { enabled: false },
-    iris: { enabled: false },
-    description: { enabled: true, minConfidence: 0.25 },
-    emotion: { enabled: false },
-    antispoof: { enabled: true },
-    liveness: { enabled: true },
-    gear: { enabled: false },
+    description: { enabled: true, minConfidence: 0.1, skipFrames: 0, skipTime: 0 },
+    antispoof: { enabled: true, skipFrames: 0, skipTime: 0 },
+    liveness: { enabled: true, skipFrames: 0, skipTime: 0 },
   },
-  body: { enabled: false },
-  hand: { enabled: false },
-  object: { enabled: false },
-  gesture: { enabled: false },
-  segmentation: { enabled: false },
 };
 
+const GUIDANCE_DETECT_OVERRIDE = {
+  cacheSensitivity: 0,
+  filter: { enabled: false, equalization: false, autoBrightness: false, return: false },
+  face: {
+    enabled: true,
+    detector: { enabled: true, rotation: true, skipFrames: 0, skipTime: 0 },
+    mesh: { enabled: true, keepInvalid: false },
+    description: { enabled: false },
+    antispoof: { enabled: false },
+    liveness: { enabled: false },
+  },
+};
+
+function restoreFullFaceConfig(h) {
+  if (!h?.config) return;
+  h.config.cacheSensitivity = 0;
+  if (h.config.filter) {
+    h.config.filter.enabled = false;
+    h.config.filter.equalization = false;
+    h.config.filter.autoBrightness = false;
+  }
+  if (h.config.face?.detector) {
+    h.config.face.detector.enabled = true;
+    h.config.face.detector.skipFrames = 0;
+    h.config.face.detector.skipTime = 0;
+  }
+  if (h.config.face?.mesh) {
+    h.config.face.mesh.enabled = true;
+  }
+  if (h.config.face?.description) {
+    h.config.face.description.enabled = true;
+    h.config.face.description.skipFrames = 0;
+    h.config.face.description.skipTime = 0;
+  }
+  if (h.config.face?.antispoof) {
+    h.config.face.antispoof.enabled = true;
+    h.config.face.antispoof.skipFrames = 0;
+    h.config.face.antispoof.skipTime = 0;
+  }
+  if (h.config.face?.liveness) {
+    h.config.face.liveness.enabled = true;
+    h.config.face.liveness.skipFrames = 0;
+    h.config.face.liveness.skipTime = 0;
+  }
+}
+
 export function getFaceEngineStatus() {
+  const modelsLoaded = humanInstance?.models?.models
+    ? Object.entries(humanInstance.models.models)
+        .filter(([, m]) => Boolean(m))
+        .map(([k]) => k)
+    : [];
   return {
     status: modelLoadStatus,
     error: modelLoadError,
+    backend: activeBackend,
+    modelsLoaded,
     modelName: 'BlazeFace + FaceMesh + HSE-FaceRes (1024-D) + AntiSpoof',
   };
+}
+
+async function initHumanWithBackend(Human, backend) {
+  const h = new Human(createBaseConfig(backend));
+  await h.load();
+  // Ensure description model (faceres) actually loaded cleanly
+  if (!h.models?.models?.faceres) {
+    restoreFullFaceConfig(h);
+    await h.load();
+  }
+  if (backend !== 'cpu') {
+    await h.warmup().catch((err) => {
+      logFaceDiagnostic('warn', 'warmup', `Warmup warning on ${backend}: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    });
+  }
+  restoreFullFaceConfig(h);
+  return h;
 }
 
 export async function ensureFaceEngineReady(onProgress) {
@@ -72,41 +224,160 @@ export async function ensureFaceEngineReady(onProgress) {
     if (onProgress) onProgress('Loading pretrained face recognition & anti-spoof models...');
     try {
       const Human = await getHumanCtor();
-      const h = new Human(HUMAN_CONFIG);
+      let h;
       try {
-        await h.load();
-      } catch {
-        // Fallback to CPU backend if WebGL is unavailable in headless/restricted contexts
-        h.config.backend = 'cpu';
-        await h.load();
+        activeBackend = 'webgl';
+        h = await initHumanWithBackend(Human, 'webgl');
+        cpuFallbackAttempted = false;
+      } catch (webglErr) {
+        logFaceDiagnostic('warn', 'init', `WebGL face backend unavailable, falling back to CPU: ${webglErr instanceof Error ? webglErr.message : String(webglErr)}`);
+        activeBackend = 'cpu';
+        cpuFallbackAttempted = true;
+        h = await initHumanWithBackend(Human, 'cpu');
       }
-      await h.warmup().catch(() => null);
+
+      if (!h?.models?.models?.blazeface || !h?.models?.models?.facemesh || !h?.models?.models?.faceres) {
+        throw createFaceError(
+          'model_not_ready',
+          'Model Not Ready',
+          'Pretrained face detection or embedding model failed to finish loading from /models/human/.',
+          {
+            recoverable: false,
+            details: {
+              backend: activeBackend,
+              hasBlazeface: Boolean(h?.models?.models?.blazeface),
+              hasFacemesh: Boolean(h?.models?.models?.facemesh),
+              hasFaceres: Boolean(h?.models?.models?.faceres),
+            },
+          }
+        );
+      }
+
       humanInstance = h;
       modelLoadStatus = 'ready';
+      logFaceDiagnostic('info', 'init', `Face engine ready on backend=${activeBackend}`, {
+        backend: activeBackend,
+        models: Object.keys(h.models.models).filter((k) => Boolean(h.models.models[k])),
+      });
       return h;
     } catch (err) {
       modelLoadStatus = 'error';
       modelLoadError = err instanceof Error ? err.message : 'Failed to load face ML models.';
+      humanInstance = null;
       initPromise = null;
-      throw new Error(`Face model initialization failed: ${modelLoadError}`, { cause: err });
+      logFaceDiagnostic('error', 'init', `Face engine initialization failed: ${modelLoadError}`);
+      if (err?.code) throw err;
+      throw createFaceError(
+        'model_not_ready',
+        'Model Not Ready',
+        `Face model initialization failed: ${modelLoadError}`,
+        { recoverable: false, cause: err }
+      );
     }
   })();
 
   return initPromise;
 }
 
-function measureRoiImageQuality(source, box) {
-  const w = source.videoWidth || source.naturalWidth || source.width || 320;
-  const h = source.videoHeight || source.naturalHeight || source.height || 240;
-  const bx = Math.max(0, Math.floor(box?.[0] ?? 0));
-  const by = Math.max(0, Math.floor(box?.[1] ?? 0));
-  const bw = Math.max(32, Math.min(w - bx, Math.floor(box?.[2] ?? w)));
-  const bh = Math.max(32, Math.min(h - by, Math.floor(box?.[3] ?? h)));
+async function switchToCpuFallback(reason) {
+  if (cpuFallbackAttempted || activeBackend === 'cpu') return null;
+  cpuFallbackAttempted = true;
+  logFaceDiagnostic('warn', 'backend_fallback', `Switching face engine to CPU fallback: ${reason}`);
+  const Human = await getHumanCtor();
+  humanInstance = null;
+  initPromise = null;
+  activeBackend = 'cpu';
+  modelLoadStatus = 'loading';
+  const h = await initHumanWithBackend(Human, 'cpu');
+  humanInstance = h;
+  modelLoadStatus = 'ready';
+  return h;
+}
+
+function validateAndGetSourceDims(source) {
+  if (!source) {
+    throw createFaceError(
+      'unsupported_image_format',
+      'Invalid Input',
+      'No image or video frame was provided for face analysis.',
+      { recoverable: false }
+    );
+  }
+
+  const isVideo = typeof HTMLVideoElement !== 'undefined' && source instanceof HTMLVideoElement;
+  if (isVideo) {
+    if (source.readyState < 2 || !source.videoWidth || !source.videoHeight) {
+      throw createFaceError(
+        'camera_frame_not_ready',
+        'Camera Not Ready',
+        'Camera frame is not decoded yet. Wait a moment for live video dimensions to stabilize.'
+      );
+    }
+    return { width: source.videoWidth, height: source.videoHeight, kind: 'video' };
+  }
+
+  const isImg = typeof HTMLImageElement !== 'undefined' && source instanceof HTMLImageElement;
+  if (isImg) {
+    if (!source.complete || !source.naturalWidth || !source.naturalHeight) {
+      throw createFaceError(
+        'unsupported_image_format',
+        'Invalid Image',
+        'Uploaded image failed to decode or has zero dimensions.',
+        { recoverable: false }
+      );
+    }
+    return { width: source.naturalWidth, height: source.naturalHeight, kind: 'image' };
+  }
+
+  const width = source.videoWidth || source.naturalWidth || source.width || 0;
+  const height = source.videoHeight || source.naturalHeight || source.height || 0;
+  if (!width || !height) {
+    throw createFaceError(
+      'unsupported_image_format',
+      'Invalid Image',
+      'Unsupported image or frame format (zero width or height).',
+      { recoverable: false }
+    );
+  }
+  return { width, height, kind: 'canvas' };
+}
+
+async function runSerializedDetect(source, mode = 'extract') {
+  return runSerialized(detectMutex, async () => {
+    const h = await ensureFaceEngineReady();
+    if (!h?.models?.models?.faceres && mode === 'extract') {
+      restoreFullFaceConfig(h);
+      await h.load();
+    }
+    const override = mode === 'guidance' ? GUIDANCE_DETECT_OVERRIDE : EXTRACTION_DETECT_OVERRIDE;
+    try {
+      const result = await h.detect(source, override);
+      return { result, backend: activeBackend };
+    } finally {
+      // Never leave singleton Human instance with description/antispoof/liveness disabled
+      restoreFullFaceConfig(h);
+    }
+  });
+}
+
+function measureRoiImageQuality(source, box, dims) {
+  const w = dims?.width || source.videoWidth || source.naturalWidth || source.width || 320;
+  const h = dims?.height || source.videoHeight || source.naturalHeight || source.height || 240;
+
+  const rawX = Math.floor(box?.[0] ?? 0);
+  const rawY = Math.floor(box?.[1] ?? 0);
+  const rawW = Math.floor(box?.[2] ?? w);
+  const rawH = Math.floor(box?.[3] ?? h);
+
+  const bx = Math.max(0, Math.min(w - 1, rawX));
+  const by = Math.max(0, Math.min(h - 1, rawY));
+  const adjW = rawX < 0 ? rawW + rawX : rawW;
+  const adjH = rawY < 0 ? rawH + rawY : rawH;
+  const bw = Math.max(16, Math.min(w - bx, adjW));
+  const bh = Math.max(16, Math.min(h - by, adjH));
 
   const sampleSize = 96;
-  const canvas = document.createElement('canvas');
-  canvas.width = sampleSize;
-  canvas.height = sampleSize;
+  const canvas = getScratchCanvas('roi', sampleSize);
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   ctx.drawImage(source, bx, by, bw, bh, 0, 0, sampleSize, sampleSize);
   const { data } = ctx.getImageData(0, 0, sampleSize, sampleSize);
@@ -138,8 +409,8 @@ function measureRoiImageQuality(source, box) {
     meanBrightness: Number(mean.toFixed(1)),
     contrastStd,
     sharpness,
-    faceWidthPx: bw,
-    faceHeightPx: bh,
+    faceWidthPx: rawW,
+    faceHeightPx: rawH,
   };
 }
 
@@ -179,55 +450,76 @@ function measureEyeAspectRatio(face) {
   return null;
 }
 
-// Fast live-preview check for webcam guidance overlay
+// Fast live-preview check for webcam guidance overlay (automatically yields when capture is running)
 export async function inspectLiveFaceGuidance(videoEl) {
-  if (!videoEl || videoEl.readyState < 2) {
-    return { status: 'waiting', feedbackLabel: 'Initializing Camera', message: 'Initializing camera feed...', ready: false };
+  if (captureInFlightCount > 0) {
+    return {
+      status: 'capturing',
+      feedbackLabel: 'Capturing...',
+      message: 'Analyzing live frames — hold steady...',
+      ready: false,
+      paused: true,
+    };
   }
-  const h = await ensureFaceEngineReady();
-  const res = await h.detect(videoEl, {
-    face: {
-      description: { enabled: false },
-      antispoof: { enabled: false },
-      liveness: { enabled: false },
-    },
-  });
-  const faces = res.face || [];
+  if (!videoEl || videoEl.readyState < 2 || !videoEl.videoWidth || !videoEl.videoHeight) {
+    return {
+      status: 'waiting',
+      feedbackLabel: 'Initializing Camera',
+      message: 'Initializing camera feed...',
+      ready: false,
+    };
+  }
+
+  const { result: res } = await runSerializedDetect(videoEl, 'guidance');
+  const faces = res?.face || [];
   if (faces.length === 0) {
-    return { status: 'no_face', feedbackLabel: 'Face Not Detected', message: 'No face detected — position face inside guide oval', ready: false, count: 0 };
+    return {
+      status: 'no_face',
+      feedbackLabel: 'Face Not Detected',
+      message: 'No face detected — position face inside guide oval',
+      ready: false,
+      count: 0,
+    };
   }
   if (faces.length > 1) {
-    return { status: 'multi_face', feedbackLabel: 'Multiple Faces Detected', message: `Multiple faces detected (${faces.length}) — ensure single subject only`, ready: false, count: faces.length, faces };
+    return {
+      status: 'multi_face',
+      feedbackLabel: 'Multiple Faces Detected',
+      message: `Multiple faces detected (${faces.length}) — ensure single subject only`,
+      ready: false,
+      count: faces.length,
+    };
   }
+
   const f = faces[0];
   const [rx, ry, rw, rh] = f.boxRaw || [0, 0, 0, 0];
   const cx = rx + rw / 2;
   const cy = ry + rh / 2;
   const yawDeg = Math.round(((f.rotation?.angle?.yaw || 0) * 180) / Math.PI);
   const pitchDeg = Math.round(((f.rotation?.angle?.pitch || 0) * 180) / Math.PI);
-  const roiQ = measureRoiImageQuality(videoEl, f.box);
+  const dims = { width: videoEl.videoWidth, height: videoEl.videoHeight };
+  const roiQ = measureRoiImageQuality(videoEl, f.box, dims);
 
   if (rw < 0.16 || rh < 0.2) {
-    return { status: 'too_far', feedbackLabel: 'Face Too Far', message: 'Move slightly closer to camera', ready: false, face: f, roiQ };
+    return { status: 'too_far', feedbackLabel: 'Face Too Far', message: 'Move slightly closer to camera', ready: false, roiQ };
   }
-  if (cx < 0.25 || cx > 0.75 || cy < 0.22 || cy > 0.78) {
-    return { status: 'off_center', feedbackLabel: 'Pose Off-Center', message: 'Center your face inside the oval guide', ready: false, face: f, roiQ };
+  if (cx < 0.22 || cx > 0.78 || cy < 0.2 || cy > 0.8) {
+    return { status: 'off_center', feedbackLabel: 'Pose Off-Center', message: 'Center your face inside the oval guide', ready: false, roiQ };
   }
   if (Math.abs(yawDeg) > 25 || Math.abs(pitchDeg) > 22) {
-    return { status: 'pose_angle', feedbackLabel: 'Pose Off-Center', message: `Look straight ahead (yaw ${yawDeg}°, pitch ${pitchDeg}°)`, ready: false, face: f, roiQ };
+    return { status: 'pose_angle', feedbackLabel: 'Pose Off-Center', message: `Look straight ahead (yaw ${yawDeg}°, pitch ${pitchDeg}°)`, ready: false, roiQ };
   }
-  if (roiQ.meanBrightness < 38) {
-    return { status: 'dark', feedbackLabel: 'Poor Lighting', message: 'Low lighting — move to brighter even light', ready: false, face: f, roiQ };
+  if (roiQ.meanBrightness < 32 || roiQ.meanBrightness > 235) {
+    return { status: 'dark', feedbackLabel: 'Poor Lighting', message: 'Adjust lighting — use even front illumination', ready: false, roiQ };
   }
-  if (roiQ.sharpness < 4.5) {
-    return { status: 'blur', feedbackLabel: 'Blurry Capture', message: 'Image looks blurry — hold steady briefly', ready: false, face: f, roiQ };
+  if (roiQ.sharpness < 3.2) {
+    return { status: 'blur', feedbackLabel: 'Motion Blur', message: 'Image looks soft — hold steady briefly', ready: false, roiQ };
   }
   return {
     status: 'ready',
     feedbackLabel: 'Face Quality Good',
     message: 'Face aligned · Good lighting · Ready to capture',
     ready: true,
-    face: f,
     roiQ,
     count: 1,
   };
@@ -235,139 +527,180 @@ export async function inspectLiveFaceGuidance(videoEl) {
 
 // Extract authoritative 1024-D pretrained deep face embedding + quality + anti-spoof metadata
 export async function extractPretrainedFaceFeatures(source, extraMeta = {}) {
-  const h = await ensureFaceEngineReady();
-  const res = await h.detect(source);
-  const faces = res.face || [];
+  const dims = validateAndGetSourceDims(source);
+
+  let detected;
+  try {
+    detected = await runSerializedDetect(source, 'extract');
+  } catch (err) {
+    if (err?.code) throw err;
+    if (activeBackend !== 'cpu' && !cpuFallbackAttempted) {
+      await runSerialized(detectMutex, () =>
+        switchToCpuFallback(err instanceof Error ? err.message : 'inference exception')
+      );
+      detected = await runSerializedDetect(source, 'extract');
+    } else {
+      throw createFaceError(
+        'embedding_model_inference_failed',
+        'Model Inference Failure',
+        `Face inference engine error: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err }
+      );
+    }
+  }
+
+  let { result: res } = detected;
+  let faces = res?.face || [];
 
   if (faces.length === 0) {
-    const err = new Error('Face Not Detected: Upload or capture a clear frontal face photo.');
-    err.code = 'no_face_detected';
-    err.feedbackLabel = 'Face Not Detected';
-    throw err;
+    throw createFaceError(
+      'no_face_detected',
+      'Face Not Detected',
+      'Face Not Detected: Position a single clear frontal face inside the frame.'
+    );
   }
   if (faces.length > 1) {
-    const err = new Error(`Multiple Faces Detected (${faces.length}): Biometric enrollment and verification require exactly one subject.`);
-    err.code = 'multiple_faces_detected';
-    err.feedbackLabel = 'Multiple Faces Detected';
-    throw err;
+    throw createFaceError(
+      'multiple_faces_detected',
+      'Multiple Faces Detected',
+      `Multiple Faces Detected (${faces.length}): Biometric enrollment and verification require exactly one subject.`
+    );
   }
 
-  const face = faces[0];
-  if (!face.embedding || face.embedding.length !== 1024) {
-    const err = new Error('Blurry Capture: Face embedding extraction failed (landmark alignment confidence too low).');
-    err.code = 'embedding_failed';
-    err.feedbackLabel = 'Blurry Capture';
-    throw err;
+  let face = faces[0];
+  let landmarkInfo = validateFaceLandmarks(face, dims.width);
+
+  let embeddingResult;
+  try {
+    embeddingResult = validateFaceEmbedding(face.embedding, FACE_EMBEDDING_DIM, {
+      descriptionEnabled: humanInstance?.config?.face?.description?.enabled,
+      backend: activeBackend,
+    });
+  } catch (embErr) {
+    logFaceDiagnostic('warn', 'extract', `Initial embedding validation failed: ${embErr.message}`, {
+      code: embErr.code,
+      backend: activeBackend,
+      landmarkCount: landmarkInfo.landmarkCount,
+      detConf: landmarkInfo.detectionConfidence,
+    });
+
+    // Recover automatically from transient WebGL NaN/context failure via one-time CPU fallback
+    if (
+      activeBackend !== 'cpu' &&
+      !cpuFallbackAttempted &&
+      (embErr.code === 'embedding_model_inference_failed' ||
+        embErr.code === 'invalid_embedding_nan' ||
+        embErr.code === 'degenerate_embedding_vector')
+    ) {
+      await runSerialized(detectMutex, () => switchToCpuFallback(embErr.code));
+      const retry = await runSerializedDetect(source, 'extract');
+      res = retry.result;
+      faces = res?.face || [];
+      if (faces.length !== 1) throw embErr;
+      face = faces[0];
+      landmarkInfo = validateFaceLandmarks(face, dims.width);
+      embeddingResult = validateFaceEmbedding(face.embedding, FACE_EMBEDDING_DIM, {
+        descriptionEnabled: humanInstance?.config?.face?.description?.enabled,
+        backend: activeBackend,
+      });
+    } else {
+      throw embErr;
+    }
   }
 
-  const yawDeg = Number((((face.rotation?.angle?.yaw || 0) * 180) / Math.PI).toFixed(1));
-  const pitchDeg = Number((((face.rotation?.angle?.pitch || 0) * 180) / Math.PI).toFixed(1));
-  const rollDeg = Number((((face.rotation?.angle?.roll || 0) * 180) / Math.PI).toFixed(1));
+  const pose = {
+    yawDeg: Number((((face.rotation?.angle?.yaw || 0) * 180) / Math.PI).toFixed(1)),
+    pitchDeg: Number((((face.rotation?.angle?.pitch || 0) * 180) / Math.PI).toFixed(1)),
+    rollDeg: Number((((face.rotation?.angle?.roll || 0) * 180) / Math.PI).toFixed(1)),
+  };
 
-  if (Math.abs(yawDeg) > 36 || Math.abs(pitchDeg) > 32) {
-    const err = new Error(`Pose Off-Center: Extreme face angle rejected (yaw ${yawDeg}°, pitch ${pitchDeg}°). Face the camera directly.`);
-    err.code = 'extreme_face_pose';
-    err.feedbackLabel = 'Pose Off-Center';
-    throw err;
-  }
+  const roiQ = measureRoiImageQuality(source, face.box, dims);
+  const antispoofScore = typeof face.real === 'number' && Number.isFinite(face.real) ? Number(face.real.toFixed(3)) : null;
+  const livenessNetScore = typeof face.live === 'number' && Number.isFinite(face.live) ? Number(face.live.toFixed(3)) : null;
 
-  const roiQ = measureRoiImageQuality(source, face.box);
-  if (roiQ.faceWidthPx < 44 || roiQ.faceHeightPx < 44) {
-    const err = new Error(`Face Too Far: Detected face resolution too small (${roiQ.faceWidthPx}×${roiQ.faceHeightPx}px). Provide a closer or higher-resolution image.`);
-    err.code = 'low_face_resolution';
-    err.feedbackLabel = 'Face Too Far';
-    throw err;
-  }
-  if (roiQ.meanBrightness < 26 || roiQ.meanBrightness > 238) {
-    const err = new Error(`Poor Lighting: Unbalanced illumination (brightness ${roiQ.meanBrightness}/255). Use even front lighting.`);
-    err.code = 'poor_illumination';
-    err.feedbackLabel = 'Poor Lighting';
-    throw err;
-  }
-  if (roiQ.contrastStd < 7 || roiQ.sharpness < 3.5) {
-    const err = new Error(`Blurry Capture: Face ROI too blurry or flat (contrast=${roiQ.contrastStd}, sharpness=${roiQ.sharpness}).`);
-    err.code = 'blurry_face_roi';
-    err.feedbackLabel = 'Blurry Capture';
-    throw err;
-  }
+  const qualityEval = evaluateFacePoseAndQuality({
+    pose,
+    roiQ,
+    detectionConfidence: landmarkInfo.detectionConfidence,
+    antispoofScore,
+    livenessNetScore,
+    isLiveCapture: Boolean(extraMeta?.isLiveCapture),
+  });
 
-  const antispoofScore = typeof face.real === 'number' ? Number(face.real.toFixed(3)) : null;
-  const livenessNetScore = typeof face.live === 'number' ? Number(face.live.toFixed(3)) : null;
   const eyeAspectRatio = measureEyeAspectRatio(face);
-  const detConf = Number((face.faceScore || face.boxScore || face.score || 0).toFixed(3));
-  const posePenalty = (Math.abs(yawDeg) + Math.abs(pitchDeg) + Math.abs(rollDeg)) * 0.45;
-  const faceQualityScore = Math.max(
-    15,
-    Math.min(
-      100,
-      Math.round(
-        detConf * 45 +
-          Math.min(1, roiQ.sharpness / 18) * 25 +
-          Math.min(1, roiQ.contrastStd / 38) * 20 +
-          10 -
-          posePenalty
-      )
-    )
-  );
 
-  const spoofRiskFlag =
-    (antispoofScore !== null && antispoofScore < 0.45) ||
-    roiQ.sharpness < 5.5 ||
-    roiQ.contrastStd < 12;
-
-  const feedbackLabel = spoofRiskFlag
-    ? 'Spoof / Quality Warning'
-    : faceQualityScore >= 70
-      ? 'Face Quality Good'
-      : 'Acceptable Face Capture';
-
-  const imgW = source.videoWidth || source.naturalWidth || source.width || 640;
-  const rawNoseX = Array.isArray(face.mesh?.[1]) ? face.mesh[1][0] : undefined;
-  const noseXNorm =
-    typeof rawNoseX === 'number' && Number.isFinite(rawNoseX) && imgW > 0
-      ? Number(Math.max(0, Math.min(1, rawNoseX / imgW)).toFixed(4))
-      : undefined;
+  logFaceDiagnostic('debug', 'extract', 'Face embedding extracted', {
+    dim: embeddingResult.dim,
+    backend: activeBackend,
+    landmarkCount: landmarkInfo.landmarkCount,
+    detectionConfidence: landmarkInfo.detectionConfidence,
+    yawDeg: pose.yawDeg,
+    pitchDeg: pose.pitchDeg,
+    sharpness: roiQ.sharpness,
+    contrastStd: roiQ.contrastStd,
+    meanBrightness: roiQ.meanBrightness,
+    faceQualityScore: qualityEval.faceQualityScore,
+  });
 
   return {
-    vector: l2Normalize(Array.from(face.embedding)),
-    dim: face.embedding.length,
+    vector: embeddingResult.vector,
+    dim: embeddingResult.dim,
     featureVersion: 'v2.0-multimodal',
     box: face.box,
     boxRaw: face.boxRaw,
     quality: {
       ...roiQ,
-      detectionConfidence: detConf,
-      poseYawDeg: yawDeg,
-      posePitchDeg: pitchDeg,
-      poseRollDeg: rollDeg,
+      detectionConfidence: landmarkInfo.detectionConfidence,
+      landmarkCount: landmarkInfo.landmarkCount,
+      poseYawDeg: pose.yawDeg,
+      posePitchDeg: pose.pitchDeg,
+      poseRollDeg: pose.rollDeg,
       eyeAspectRatio,
-      ...(noseXNorm !== undefined ? { noseXNorm } : {}),
+      ...(landmarkInfo.noseXNorm !== undefined ? { noseXNorm: landmarkInfo.noseXNorm } : {}),
       antispoofScore,
       livenessNetScore,
-      faceQualityScore,
-      spoofRiskFlag,
-      feedbackLabel,
+      faceQualityScore: qualityEval.faceQualityScore,
+      spoofRiskFlag: qualityEval.spoofRiskFlag,
+      feedbackLabel: qualityEval.feedbackLabel,
       model: 'blazeface+facemesh+faceres1024',
+      backend: activeBackend,
       ...extraMeta,
     },
   };
 }
 
 function snapshotVideoToCanvas(videoEl) {
+  if (!videoEl || videoEl.readyState < 2 || !videoEl.videoWidth || !videoEl.videoHeight) {
+    throw createFaceError(
+      'camera_frame_not_ready',
+      'Camera Not Ready',
+      'Camera frame not ready for capture. Wait for video stream dimensions to initialize.'
+    );
+  }
   const canvas = document.createElement('canvas');
-  canvas.width = videoEl.videoWidth || 640;
-  canvas.height = videoEl.videoHeight || 480;
-  canvas.getContext('2d').drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+  canvas.width = videoEl.videoWidth;
+  canvas.height = videoEl.videoHeight;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
   return canvas;
+}
+
+function releaseCanvasSnapshot(canvas) {
+  if (!canvas || typeof canvas !== 'object') return;
+  try {
+    canvas.width = 0;
+    canvas.height = 0;
+  } catch {
+    // Ignore detached canvas cleanup errors
+  }
 }
 
 function computeCanvasMotion(cA, cB) {
   const size = 64;
+  const tmp = getScratchCanvas('motion', size);
+  const ctx = tmp.getContext('2d', { willReadFrequently: true });
   const sample = (c) => {
-    const tmp = document.createElement('canvas');
-    tmp.width = size;
-    tmp.height = size;
-    const ctx = tmp.getContext('2d', { willReadFrequently: true });
+    ctx.clearRect(0, 0, size, size);
     ctx.drawImage(c, 0, 0, size, size);
     const { data } = ctx.getImageData(0, 0, size, size);
     const out = new Float32Array(size * size);
@@ -383,138 +716,33 @@ function computeCanvasMotion(cA, cB) {
   return Number((diff / a.length).toFixed(4));
 }
 
-function dotCosine(a, b) {
-  let s = 0;
-  const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) s += a[i] * b[i];
-  return Number(s.toFixed(4));
-}
-
-// Multi-frame live webcam capture: extracts 3–4 frames apart, checks motion, blink/head-turn challenge & inter-frame consistency
+// Resilient multi-frame live webcam capture: evaluates each frame independently with bounded retries,
+// preserves dynamic challenge trajectory timing & inter-frame consistency, and keeps camera stable.
 export async function captureMultiFrameFaceFeatures(videoEl, opts = 220) {
-  if (!videoEl || videoEl.readyState < 2) {
-    const err = new Error('Camera feed not ready for capture.');
-    err.code = 'camera_not_ready';
-    throw err;
-  }
-  const challenge = typeof opts === 'object' && opts ? opts.challenge : undefined;
-  const delayMs = typeof opts === 'number' ? opts : (opts?.delayMs ?? (challenge ? 260 : 220));
-  const targetFrames = challenge ? 4 : 3;
-
-  const frames = [];
-  const frameTimes = [];
-  for (let i = 0; i < targetFrames; i++) {
-    frameTimes.push(Date.now());
-    frames.push(snapshotVideoToCanvas(videoEl));
-    if (i < targetFrames - 1) {
-      await new Promise((r) => setTimeout(r, delayMs));
-    }
-  }
-
-  let frameMotionScore = 0;
-  const motionFromPrevList = [0];
-  for (let i = 0; i < frames.length - 1; i++) {
-    const pairMotion = computeCanvasMotion(frames[i], frames[i + 1]);
-    motionFromPrevList.push(pairMotion);
-    frameMotionScore = Math.max(frameMotionScore, pairMotion);
-  }
-  frameMotionScore = Number(frameMotionScore.toFixed(4));
-
-  const extracted = [];
-  for (let i = 0; i < frames.length; i++) {
-    const feat = await extractPretrainedFaceFeatures(frames[i], {
-      captureSource: 'webcam',
-      isLiveCapture: true,
-      frameMotionScore,
-    });
-    extracted.push({
-      feat,
-      canvas: frames[i],
-      tMs: frameTimes[i],
-      motionFromPrev: motionFromPrevList[i] ?? 0,
-    });
-  }
-
-  let frameConsistencyCosine = 1;
-  for (let i = 0; i < extracted.length - 1; i++) {
-    const cos = dotCosine(extracted[i].feat.vector, extracted[i + 1].feat.vector);
-    frameConsistencyCosine = Math.min(frameConsistencyCosine, cos);
-  }
-  frameConsistencyCosine = Number(frameConsistencyCosine.toFixed(4));
-
-  const minConsistency = challenge === 'turn_left' || challenge === 'turn_right' ? 0.72 : 0.78;
-  if (frameConsistencyCosine < minConsistency) {
-    const err = new Error(
-      `Multi-frame consistency check failed (cosine=${frameConsistencyCosine} < ${minConsistency}). Hold steady in front of camera.`
+  if (!videoEl || videoEl.readyState < 2 || !videoEl.videoWidth || !videoEl.videoHeight) {
+    throw createFaceError(
+      'camera_not_ready',
+      'Camera Not Ready',
+      'Camera feed not ready for capture.'
     );
-    err.code = 'multi_frame_inconsistent';
-    err.feedbackLabel = 'Blurry Capture';
-    throw err;
   }
 
-  const earValues = extracted
-    .map((x) => x.feat.quality?.eyeAspectRatio)
-    .filter((v) => typeof v === 'number' && Number.isFinite(v));
-  const eyeAspectRatioMin = earValues.length ? Number(Math.min(...earValues).toFixed(4)) : null;
-  const eyeAspectRatioDelta =
-    earValues.length >= 2 ? Number((Math.max(...earValues) - Math.min(...earValues)).toFixed(4)) : 0;
-  const blinkDetected = earValues.length >= 2 && (eyeAspectRatioMin < 0.23 || eyeAspectRatioDelta >= 0.045);
-
-  const yawValues = extracted
-    .map((x) => x.feat.quality?.poseYawDeg)
-    .filter((v) => typeof v === 'number' && Number.isFinite(v));
-  const headYawDeltaDeg =
-    yawValues.length >= 2 ? Number((Math.max(...yawValues) - Math.min(...yawValues)).toFixed(1)) : 0;
-
-  // Build ordered challenge trajectory evidence before sorting extracted frames by quality
-  const challengeFrames = extracted.map((item, idx) => {
-    const q = item.feat.quality || {};
-    const prevT = idx > 0 ? extracted[idx - 1].tMs : item.tMs - 1;
-    const tMs = Math.max(prevT + 1, item.tMs);
-    item.tMs = tMs;
-    return {
-      tMs,
-      yawDeg: typeof q.poseYawDeg === 'number' ? q.poseYawDeg : 0,
-      ...(typeof q.posePitchDeg === 'number' ? { pitchDeg: q.posePitchDeg } : {}),
-      ...(typeof q.eyeAspectRatio === 'number' ? { ear: q.eyeAspectRatio } : {}),
-      ...(typeof q.noseXNorm === 'number' ? { noseXNorm: q.noseXNorm } : {}),
-      motionFromPrev: item.motionFromPrev,
-    };
-  });
-
-  let challengeCompleted;
-  if (challenge === 'blink') {
-    challengeCompleted = blinkDetected;
-  } else if (challenge === 'turn_left' || challenge === 'turn_right') {
-    challengeCompleted = headYawDeltaDeg >= 5;
+  captureInFlightCount += 1;
+  try {
+    await ensureFaceEngineReady();
+    return await orchestrateMultiFrameCapture({
+      captureSnapshot: () => snapshotVideoToCanvas(videoEl),
+      extractFrame: (snapshot, { frameMotionScore }) =>
+        extractPretrainedFaceFeatures(snapshot, {
+          captureSource: 'webcam',
+          isLiveCapture: true,
+          frameMotionScore,
+        }),
+      computeMotion: computeCanvasMotion,
+      releaseSnapshot: releaseCanvasSnapshot,
+      options: opts,
+    });
+  } finally {
+    captureInFlightCount = Math.max(0, captureInFlightCount - 1);
   }
-
-  // Prefer the most frontal frame as biometric embedding, retaining dynamic challenge telemetry
-  extracted.sort((a, b) => {
-    const scoreA = (a.feat.quality?.faceQualityScore || 0) - Math.abs(a.feat.quality?.poseYawDeg || 0) * 0.5;
-    const scoreB = (b.feat.quality?.faceQualityScore || 0) - Math.abs(b.feat.quality?.poseYawDeg || 0) * 0.5;
-    return scoreB - scoreA;
-  });
-  const best = extracted[0];
-  best.feat.quality.multiFrameVerified = true;
-  best.feat.quality.frameCount = frames.length;
-  best.feat.quality.frameConsistencyCosine = frameConsistencyCosine;
-  best.feat.quality.frameMotionScore = frameMotionScore;
-  best.feat.quality.isLiveCapture = true;
-  best.feat.quality.captureSource = 'webcam';
-  best.feat.quality.challengeEvidence = { frames: challengeFrames };
-  if (eyeAspectRatioMin !== null) best.feat.quality.eyeAspectRatioMin = eyeAspectRatioMin;
-  best.feat.quality.eyeAspectRatioDelta = eyeAspectRatioDelta;
-  best.feat.quality.blinkDetected = blinkDetected;
-  best.feat.quality.headYawDeltaDeg = headYawDeltaDeg;
-  if (challenge) {
-    best.feat.quality.challengeType = challenge;
-    best.feat.quality.challengeCompleted = Boolean(challengeCompleted);
-  }
-
-  return {
-    ...best.feat,
-    canvas: best.canvas,
-  };
 }
-

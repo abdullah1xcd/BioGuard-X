@@ -98,13 +98,24 @@ export function loadImageFile(file) {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
     const img = new Image();
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      resolve(img);
+    img.onload = async () => {
+      try {
+        if (typeof img.decode === 'function') {
+          await img.decode().catch(() => null);
+        }
+        if (!img.naturalWidth || !img.naturalHeight) {
+          throw new Error('Decoded image has zero dimensions.');
+        }
+        resolve(img);
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error('Could not decode image file.'));
+      } finally {
+        URL.revokeObjectURL(url);
+      }
     };
     img.onerror = () => {
       URL.revokeObjectURL(url);
-      reject(new Error('Could not decode image file.'));
+      reject(new Error('Could not decode image file (unsupported or corrupt format).'));
     };
     img.src = url;
   });
@@ -381,6 +392,7 @@ export async function openCameraStream() {
     throw new Error('Camera API is unavailable in this browser context. Use HTTPS or install the app.');
   }
   const attempts = [
+    { video: { facingMode: { ideal: 'user' }, width: { ideal: 1280, min: 320 }, height: { ideal: 720, min: 240 } }, audio: false },
     { video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false },
     { video: { facingMode: 'user' }, audio: false },
     { video: true, audio: false },
@@ -394,7 +406,13 @@ export async function openCameraStream() {
       if (err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError') {
         throw new Error('Camera permission was denied. Allow camera access in your browser/device settings.', { cause: err });
       }
+      if (err?.name === 'NotReadableError' || err?.name === 'TrackStartError') {
+        throw new Error('Camera hardware is busy or in use by another application.', { cause: err });
+      }
     }
+  }
+  if (lastErr?.name === 'NotFoundError' || lastErr?.name === 'DevicesNotFoundError') {
+    throw new Error('No camera device was found on this device.', { cause: lastErr });
   }
   throw lastErr || new Error('Unable to access device camera.');
 }
@@ -406,9 +424,47 @@ export async function createLiveVideoElement(stream) {
   v.muted = true;
   v.setAttribute('autoplay', '');
   v.setAttribute('playsinline', '');
+  v.setAttribute('webkit-playsinline', '');
   v.setAttribute('muted', '');
   v.srcObject = stream;
+
+  await new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      v.removeEventListener('loadedmetadata', onMeta);
+      v.removeEventListener('canplay', onMeta);
+      resolve();
+    };
+    const onMeta = () => {
+      if (v.videoWidth > 0 && v.videoHeight > 0) finish();
+    };
+    v.addEventListener('loadedmetadata', onMeta);
+    v.addEventListener('canplay', onMeta);
+    if (v.readyState >= 1 && v.videoWidth > 0) {
+      finish();
+      return;
+    }
+    setTimeout(finish, 2500);
+  });
+
   await v.play().catch(() => null);
+
+  // Brief wait after play() in case Safari delays first decoded frame size
+  if (!v.videoWidth || !v.videoHeight) {
+    await new Promise((resolve) => {
+      const started = Date.now();
+      const poll = () => {
+        if ((v.videoWidth > 0 && v.videoHeight > 0) || Date.now() - started >= 1500) {
+          resolve();
+        } else {
+          setTimeout(poll, 60);
+        }
+      };
+      poll();
+    });
+  }
   return v;
 }
 

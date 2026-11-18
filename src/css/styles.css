@@ -875,7 +875,8 @@ html.light .btn-primary {
 .preview-frame {
   width: 100%;
   aspect-ratio: 4 / 3;
-  max-height: 240px;
+  min-height: 180px;
+  max-height: 260px;
   background: #060b16;
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-sm);
@@ -898,6 +899,7 @@ html.light .btn-primary {
 
 .fingerprint-frame {
   aspect-ratio: 1 / 1;
+  min-height: 160px;
   max-height: 200px;
   max-width: 200px;
 }
@@ -911,6 +913,7 @@ html.light .btn-primary {
   position: relative;
   width: 100%;
   height: 100%;
+  min-height: 180px;
 }
 
 .face-guide-wrap video {
@@ -920,9 +923,9 @@ html.light .btn-primary {
 .face-guide-oval {
   position: absolute;
   left: 50%;
-  top: 46%;
-  width: 44%;
-  height: 70%;
+  top: 45%;
+  width: min(44%, 155px);
+  height: 68%;
   transform: translate(-50%, -50%);
   border: 2px dashed rgba(245, 158, 11, 0.85);
   border-radius: 50%;

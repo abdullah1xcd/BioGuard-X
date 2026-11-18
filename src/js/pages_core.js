@@ -844,7 +844,7 @@ export function renderEnrollment(container, { appState, navigate }) {
       haltCameraUI();
       faceSt.className = 'state-text state-warning';
       faceSt.textContent = 'Starting Camera...';
-      faceQEl.textContent = 'Initializing face detection models...';
+      faceQEl.textContent = 'Loading face detection, landmark & recognition models...';
       await ensureFaceEngineReady();
 
       activeStream = await openCameraStream();
@@ -864,45 +864,88 @@ export function renderEnrollment(container, { appState, navigate }) {
       facePrev.appendChild(wrap);
       faceSt.className = 'state-text state-neutral';
       faceSt.textContent = 'Live Preview';
+      faceQEl.textContent = 'Align face in oval guide, then click Capture 3 Frames.';
       camSnap.disabled = false;
+      camSnap.textContent = 'Capture 3 Frames';
       camStopBtn.hidden = false;
 
-      guidanceTimer = setInterval(async () => {
-        if (!activeStream) return;
-        try {
-          const g = await inspectLiveFaceGuidance(v);
-          msgBadge.textContent = g.message;
-          oval.classList.toggle('ready', Boolean(g.ready));
-        } catch {
-          // Ignore single frame errors
+      let capturing = false;
+      const pauseGuidance = () => {
+        if (guidanceTimer) {
+          clearInterval(guidanceTimer);
+          guidanceTimer = null;
         }
-      }, 450);
+      };
+      const startGuidance = () => {
+        pauseGuidance();
+        if (!activeStream) return;
+        guidanceTimer = setInterval(async () => {
+          if (!activeStream || capturing) return;
+          try {
+            const g = await inspectLiveFaceGuidance(v);
+            if (!g.paused) {
+              msgBadge.textContent = g.message;
+              oval.classList.toggle('ready', Boolean(g.ready));
+            }
+          } catch {
+            // Ignore transient preview frame errors
+          }
+        }, 480);
+      };
+      startGuidance();
 
       camSnap.onclick = async () => {
+        if (capturing) return;
+        capturing = true;
+        pauseGuidance();
         camSnap.disabled = true;
-        camSnap.textContent = 'Capturing 3 Frames...';
+        camSnap.textContent = 'Capturing 0/3...';
         faceSt.className = 'state-text state-warning';
-        faceSt.textContent = 'Checking 3-Frame Liveness...';
+        faceSt.textContent = 'Extracting 1024-D Features...';
+        msgBadge.textContent = 'Capturing live frames — hold steady...';
         try {
-          const res = await captureMultiFrameFaceFeatures(v, 220);
+          const res = await captureMultiFrameFaceFeatures(v, {
+            delayMs: 210,
+            onProgress: (info) => {
+              camSnap.textContent =
+                info.stage === 'frame_retry'
+                  ? `Retrying (${info.validCount}/${info.targetFrames})...`
+                  : `Capturing ${info.validCount}/${info.targetFrames}...`;
+              if (info.lastFailureMessage) {
+                msgBadge.textContent = info.lastFailureMessage;
+              }
+            },
+          });
           haltCameraUI();
           applyFaceExtraction(res, res.canvas, 'Live Capture Verified');
         } catch (err) {
           faceVec = null;
           faceQuality = null;
+          faceClearBtn.hidden = true;
           faceSt.className = 'state-text state-danger';
-          faceSt.textContent = err.feedbackLabel || 'Rejected';
+          faceSt.textContent = err.feedbackLabel || 'Capture Rejected';
           faceQEl.textContent = err.message;
+          msgBadge.textContent = `${err.feedbackLabel || 'Rejected'} — adjust pose/lighting and retry`;
+          oval.classList.remove('ready');
+          updateSummary();
           showToast(err.message, 'danger');
+          if (activeStream && activeStream.getTracks().some((t) => t.readyState === 'live')) {
+            camSnap.disabled = false;
+            camSnap.textContent = 'Retry Capture';
+            startGuidance();
+          } else {
+            haltCameraUI();
+            camSnap.textContent = 'Capture 3 Frames';
+          }
         } finally {
-          camSnap.textContent = 'Capture 3 Frames';
-          haltCameraUI();
+          capturing = false;
         }
       };
     } catch (err) {
       haltCameraUI();
       faceSt.className = 'state-text state-danger';
-      faceSt.textContent = 'Camera Error';
+      faceSt.textContent = err.feedbackLabel || 'Camera Error';
+      faceQEl.textContent = err.message;
       showToast(`Camera error: ${err.message}`, 'warning');
     }
   });
@@ -1487,7 +1530,7 @@ export function renderVerification(container, { appState, navigate }) {
       faceVec = null;
       faceQuality = null;
       faceSt.className = 'state-text state-danger';
-      faceSt.textContent = 'Rejected';
+      faceSt.textContent = err.feedbackLabel || 'Rejected';
       faceQEl.textContent = err.message;
       showToast(err.message, 'danger');
     }
@@ -1662,6 +1705,7 @@ export function renderVerification(container, { appState, navigate }) {
       haltProbeCamera();
       faceSt.className = 'state-text state-warning';
       faceSt.textContent = 'Starting Camera...';
+      faceQEl.textContent = 'Loading face detection & liveness models...';
       if (!activeChallenge) {
         activeChallenge = await requestLivenessChallenge(['face', 'voice']).catch(() => null);
       }
@@ -1694,34 +1738,67 @@ export function renderVerification(container, { appState, navigate }) {
       faceLiveWrap.appendChild(wrap);
       faceLiveWrap.hidden = false;
       faceSnapBtn.hidden = false;
+      faceSnapBtn.disabled = false;
+      faceSnapBtn.textContent = 'Capture';
       faceStopBtn.hidden = false;
       faceSt.className = 'state-text state-neutral';
       faceSt.textContent = 'Live Preview';
+      faceQEl.textContent = 'Center face inside oval guide and click Capture.';
 
-      guidanceTimer = setInterval(async () => {
-        if (!activeStream) return;
-        try {
-          const g = await inspectLiveFaceGuidance(v);
-          msgBadge.textContent = activeChallenge?.faceChallenge && g.ready
-            ? `${g.message} · ${describeFaceChallenge(activeChallenge.faceChallenge)}`
-            : g.message;
-          oval.classList.toggle('ready', Boolean(g.ready));
-        } catch {
-          // Ignore single frame errors
+      let capturing = false;
+      const pauseGuidance = () => {
+        if (guidanceTimer) {
+          clearInterval(guidanceTimer);
+          guidanceTimer = null;
         }
-      }, 450);
+      };
+      const startGuidance = () => {
+        pauseGuidance();
+        if (!activeStream) return;
+        guidanceTimer = setInterval(async () => {
+          if (!activeStream || capturing) return;
+          try {
+            const g = await inspectLiveFaceGuidance(v);
+            if (!g.paused) {
+              msgBadge.textContent = activeChallenge?.faceChallenge && g.ready
+                ? `${g.message} · ${describeFaceChallenge(activeChallenge.faceChallenge)}`
+                : g.message;
+              oval.classList.toggle('ready', Boolean(g.ready));
+            }
+          } catch {
+            // Ignore transient preview frame errors
+          }
+        }, 480);
+      };
+      startGuidance();
 
       faceSnapBtn.onclick = async () => {
+        if (capturing) return;
+        capturing = true;
+        pauseGuidance();
         faceSnapBtn.disabled = true;
-        faceSnapBtn.textContent = activeChallenge?.faceChallenge ? 'Checking 4 Frames...' : 'Checking 3 Frames...';
+        const targetCount = activeChallenge?.faceChallenge ? 4 : 3;
+        faceSnapBtn.textContent = `Capturing 0/${targetCount}...`;
         faceSt.className = 'state-text state-warning';
         faceSt.textContent = 'Analyzing Live Frames...';
+        msgBadge.textContent = 'Capturing live frames — hold steady...';
         try {
           const res = await captureMultiFrameFaceFeatures(v, {
-            delayMs: 260,
+            delayMs: 240,
             challenge: activeChallenge?.faceChallenge,
+            onProgress: (info) => {
+              faceSnapBtn.textContent =
+                info.stage === 'frame_retry'
+                  ? `Retrying (${info.validCount}/${info.targetFrames})...`
+                  : `Capturing ${info.validCount}/${info.targetFrames}...`;
+              if (info.lastFailureMessage) {
+                msgBadge.textContent = info.lastFailureMessage;
+              }
+            },
           });
           haltProbeCamera();
+          faceSnapBtn.disabled = false;
+          faceSnapBtn.textContent = 'Capture';
           faceVec = res.vector;
           faceQuality = res.quality;
           currentIsTestProbe = false;
@@ -1741,17 +1818,27 @@ export function renderVerification(container, { appState, navigate }) {
           faceSt.className = 'state-text state-danger';
           faceSt.textContent = err.feedbackLabel || 'Rejected';
           faceQEl.textContent = err.message;
+          msgBadge.textContent = `${err.feedbackLabel || 'Rejected'} — adjust pose/lighting and retry`;
+          oval.classList.remove('ready');
           showToast(err.message, 'danger');
+          if (activeStream && activeStream.getTracks().some((t) => t.readyState === 'live')) {
+            faceSnapBtn.disabled = false;
+            faceSnapBtn.textContent = 'Retry Capture';
+            startGuidance();
+          } else {
+            faceSnapBtn.disabled = false;
+            faceSnapBtn.textContent = 'Capture';
+            haltProbeCamera();
+          }
         } finally {
-          faceSnapBtn.disabled = false;
-          faceSnapBtn.textContent = 'Capture';
-          haltProbeCamera();
+          capturing = false;
         }
       };
     } catch (err) {
       haltProbeCamera();
       faceSt.className = 'state-text state-danger';
-      faceSt.textContent = 'Camera Error';
+      faceSt.textContent = err.feedbackLabel || 'Camera Error';
+      faceQEl.textContent = err.message;
       showToast(`Camera error: ${err.message}`, 'warning');
     }
   });

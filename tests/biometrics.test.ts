@@ -1972,4 +1972,257 @@ test('VerificationRecord builder & validator stay strictly synchronized with fir
   assert.equal(check2.valid, true, `Expected multimodal record valid, got: ${check2.errors.join('; ')}`);
 });
 
+test('Face Pipeline: embedding, landmark & quality validation never mislabels model errors as Blurry Capture', async () => {
+  const {
+    FACE_EMBEDDING_DIM,
+    evaluateFacePoseAndQuality,
+    validateFaceEmbedding,
+    validateFaceLandmarks,
+  } = await import('../src/shared/facePipeline.ts');
+
+  const hasCode = (err: unknown, code: string) =>
+    typeof err === 'object' && err !== null && 'code' in err && (err as { code?: string }).code === code;
+
+  assert.throws(
+    () => validateFaceEmbedding([], FACE_EMBEDDING_DIM, { descriptionEnabled: false, backend: 'webgl' }),
+    (err: unknown) =>
+      hasCode(err, 'embedding_model_inference_failed') &&
+      err instanceof Error &&
+      !/Blurry/i.test(err.message) &&
+      /disabled/i.test(err.message)
+  );
+
+  assert.throws(
+    () => validateFaceEmbedding(new Float32Array(512).fill(0.25), FACE_EMBEDDING_DIM, { backend: 'webgl' }),
+    (err: unknown) => hasCode(err, 'invalid_embedding_dimension')
+  );
+
+  const nanVec = new Array(FACE_EMBEDDING_DIM).fill(0.1);
+  nanVec[42] = Number.NaN;
+  assert.throws(
+    () => validateFaceEmbedding(nanVec, FACE_EMBEDDING_DIM, { backend: 'webgl' }),
+    (err: unknown) => hasCode(err, 'invalid_embedding_nan')
+  );
+
+  assert.throws(
+    () => validateFaceEmbedding(new Array(FACE_EMBEDDING_DIM).fill(0), FACE_EMBEDDING_DIM),
+    (err: unknown) => hasCode(err, 'degenerate_embedding_vector')
+  );
+
+  const validRaw = Array.from({ length: FACE_EMBEDDING_DIM }, (_, i) => Math.sin(i * 0.37) + (i % 5) * 0.1);
+  const emb = validateFaceEmbedding(validRaw, FACE_EMBEDDING_DIM);
+  assert.equal(emb.dim, 1024);
+  const norm = Math.sqrt(emb.vector.reduce((s, v) => s + v * v, 0));
+  assert.ok(Math.abs(norm - 1) < 1e-5, `Expected unit norm vector, got ${norm}`);
+
+  assert.throws(
+    () => validateFaceLandmarks({ mesh: [[10, 10, 0]], box: [0, 0, 100, 100], boxScore: 0.9 }, 640),
+    (err: unknown) => hasCode(err, 'landmark_detection_failed')
+  );
+
+  const fullMesh = Array.from({ length: 468 }, (_, i) => [100 + (i % 20), 80 + Math.floor(i / 20), 0]);
+  const lm = validateFaceLandmarks({ mesh: fullMesh, box: [80, 60, 140, 160], faceScore: 0.94 }, 640);
+  assert.equal(lm.landmarkCount, 468);
+  assert.equal(lm.detectionConfidence, 0.94);
+
+  // Crisp webcam feed passes without any spoof/quality warning
+  const qCrisp = evaluateFacePoseAndQuality({
+    pose: { yawDeg: 4, pitchDeg: -2, rollDeg: 1 },
+    roiQ: { meanBrightness: 122, contrastStd: 24, sharpness: 8.5, faceWidthPx: 140, faceHeightPx: 160 },
+    detectionConfidence: 0.93,
+    antispoofScore: 0.88,
+    livenessNetScore: 0.91,
+    isLiveCapture: true,
+  });
+  assert.ok(qCrisp.faceQualityScore >= 70);
+  assert.equal(qCrisp.spoofRiskFlag, false);
+
+  // Soft mobile webcam feed (sharpness=3.1) is tolerated (not falsely rejected as blur), flagging quality warning
+  const qSoft = evaluateFacePoseAndQuality({
+    pose: { yawDeg: 4, pitchDeg: -2, rollDeg: 1 },
+    roiQ: { meanBrightness: 122, contrastStd: 22.5, sharpness: 3.1, faceWidthPx: 140, faceHeightPx: 160 },
+    detectionConfidence: 0.93,
+    antispoofScore: 0.88,
+    livenessNetScore: 0.91,
+    isLiveCapture: true,
+  });
+  assert.ok(qSoft.faceQualityScore >= 50);
+  assert.equal(qSoft.spoofRiskFlag, true);
+
+  assert.throws(
+    () =>
+      evaluateFacePoseAndQuality({
+        pose: { yawDeg: 42, pitchDeg: 0, rollDeg: 0 },
+        roiQ: { meanBrightness: 120, contrastStd: 25, sharpness: 12, faceWidthPx: 150, faceHeightPx: 150 },
+        detectionConfidence: 0.9,
+        antispoofScore: 0.9,
+        livenessNetScore: 0.9,
+      }),
+    (err: unknown) => hasCode(err, 'extreme_face_pose')
+  );
+});
+
+test('Face Pipeline: mutex queue strictly serializes concurrent detect() calls even after errors', async () => {
+  const { createMutexQueue, runSerialized } = await import('../src/shared/facePipeline.ts');
+  const queue = createMutexQueue();
+  let active = 0;
+  let maxActive = 0;
+  const order: number[] = [];
+
+  const runTask = (id: number, shouldFail = false) =>
+    runSerialized(queue, async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((r) => setTimeout(r, 5));
+      order.push(id);
+      active -= 1;
+      if (shouldFail) throw new Error(`boom-${id}`);
+      return id * 10;
+    });
+
+  const settled = await Promise.allSettled([runTask(1), runTask(2, true), runTask(3)]);
+  assert.equal(maxActive, 1, 'Expected mutex to prevent overlapping detect() executions');
+  assert.deepEqual(order, [1, 2, 3]);
+  assert.equal(settled[0].status, 'fulfilled');
+  assert.equal(settled[1].status, 'rejected');
+  assert.equal(settled[2].status, 'fulfilled');
+  if (settled[2].status === 'fulfilled') assert.equal(settled[2].value, 30);
+});
+
+test('Face Pipeline: resilient multi-frame orchestrator retries transient failures, preserves blink/turn trajectory, enforces identity consistency & redacts telemetry', async () => {
+  const {
+    createFaceError,
+    logFaceDiagnostic,
+    orchestrateMultiFrameCapture,
+    sanitizeTelemetryMeta,
+    setFaceDiagnosticsConfig,
+  } = await import('../src/shared/facePipeline.ts');
+  type DiagEvent = import('../src/shared/facePipeline.ts').FaceDiagnosticEvent;
+
+  const hasCode = (err: unknown, code: string) =>
+    typeof err === 'object' && err !== null && 'code' in err && (err as { code?: string }).code === code;
+
+  const events: DiagEvent[] = [];
+  setFaceDiagnosticsConfig({
+    level: 'debug',
+    sink: (ev) => events.push(ev),
+  });
+
+  try {
+    const baseVec = Array.from({ length: 1024 }, (_, i) => Math.cos(i * 0.21));
+    const normBase = Math.sqrt(baseVec.reduce((s, v) => s + v * v, 0));
+    const unitBase = baseVec.map((v) => v / normBase);
+
+    let snapIdx = 0;
+    let fakeClock = 10_000;
+    const released: number[] = [];
+
+    // Attempts 1 & 3 transiently fail, attempts 2, 4, 5, 6 succeed with a blink on frame 4!
+    const captureResult = await orchestrateMultiFrameCapture<{ id: number; released: boolean }>({
+      now: () => fakeClock,
+      sleep: async (ms) => {
+        fakeClock += ms;
+      },
+      captureSnapshot: () => ({ id: ++snapIdx, released: false }),
+      computeMotion: (a, b) => Number((0.02 + Math.abs(b.id - a.id) * 0.01).toFixed(4)),
+      releaseSnapshot: (s) => {
+        s.released = true;
+        released.push(s.id);
+      },
+      extractFrame: async (snap, { frameMotionScore }) => {
+        if (snap.id === 1) {
+          throw createFaceError('no_face_detected', 'Face Not Detected', 'Transient blank frame');
+        }
+        if (snap.id === 3) {
+          throw createFaceError('blurry_face_roi', 'Motion Blur', 'Transient motion blur');
+        }
+        const isBlink = snap.id === 4;
+        return {
+          vector: unitBase,
+          dim: 1024,
+          featureVersion: 'v2.0-multimodal',
+          quality: {
+            faceQualityScore: snap.id === 5 ? 92 : 84,
+            poseYawDeg: snap.id === 5 ? 1 : 4,
+            posePitchDeg: 0,
+            eyeAspectRatio: isBlink ? 0.17 : 0.31,
+            antispoofScore: 0.91,
+            livenessNetScore: 0.92,
+            frameMotionScore,
+          },
+        };
+      },
+      options: { challenge: 'blink', delayMs: 220 },
+    });
+
+    assert.equal(captureResult.quality.frameCount, 4);
+    assert.equal(captureResult.quality.attemptsUsed, 6);
+    assert.equal(captureResult.quality.discardedFrames, 2);
+    assert.equal(captureResult.quality.blinkDetected, true);
+    assert.equal(captureResult.quality.challengeCompleted, true);
+    assert.equal(captureResult.quality.frameConsistencyCosine, 1);
+    assert.ok(captureResult.canvas.id === 5, 'Should select sharpest frontal frame as primary template');
+    assert.ok(released.includes(1) && released.includes(3), 'Rejected frame snapshots must be released');
+
+    // Different-identity injection MUST still fail strict inter-frame identity consistency!
+    const impostorVec = unitBase.map((v, i) => (i % 2 === 0 ? -v : v));
+    let callNum = 0;
+    await assert.rejects(
+      () =>
+        orchestrateMultiFrameCapture<{ id: number }>({
+          now: () => (fakeClock += 220),
+          sleep: async () => undefined,
+          captureSnapshot: () => ({ id: ++callNum }),
+          computeMotion: () => 0.03,
+          extractFrame: async (snap) => ({
+            vector: snap.id === 2 ? impostorVec : unitBase,
+            dim: 1024,
+            featureVersion: 'v2.0-multimodal',
+            quality: { faceQualityScore: 88, poseYawDeg: 0 },
+          }),
+          options: 200,
+        }),
+      (err: unknown) => hasCode(err, 'multi_frame_inconsistent')
+    );
+
+    // Bounded retries cleanly terminate on repeated failure
+    let failCount = 0;
+    await assert.rejects(
+      () =>
+        orchestrateMultiFrameCapture<{ id: number }>({
+          now: () => (fakeClock += 200),
+          sleep: async () => undefined,
+          captureSnapshot: () => ({ id: ++failCount }),
+          computeMotion: () => 0.02,
+          extractFrame: async () => {
+            throw createFaceError('embedding_model_inference_failed', 'Model Inference Failure', 'Test inference down');
+          },
+          options: { maxAttempts: 4 },
+        }),
+      (err: unknown) => hasCode(err, 'embedding_model_inference_failed') && failCount === 4
+    );
+
+    // Zero raw embeddings/pixels/images leaked in diagnostic logs
+    const safeMeta = sanitizeTelemetryMeta({
+      vector: unitBase,
+      embedding: unitBase,
+      rawImage: 'data:image/png;base64,AAA',
+      backend: 'webgl',
+      landmarkCount: 468,
+    });
+    assert.equal(safeMeta?.vector, '[REDACTED]');
+    assert.equal(safeMeta?.embedding, '[REDACTED]');
+    assert.equal(safeMeta?.backend, 'webgl');
+    assert.equal(safeMeta?.landmarkCount, 468);
+
+    logFaceDiagnostic('info', 'test', 'Check redaction', { descriptor: [1, 2, 3], ok: true });
+    const serializedEvents = JSON.stringify(events);
+    assert.equal(serializedEvents.includes('0.21'), false);
+    assert.ok(events.some((e) => e.meta?.descriptor === '[REDACTED]'));
+  } finally {
+    setFaceDiagnosticsConfig({ level: 'warn', sink: undefined });
+  }
+});
+
+
 
