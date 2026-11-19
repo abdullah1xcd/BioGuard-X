@@ -283,6 +283,48 @@ export function formatFirebaseAuthError(err) {
   });
 }
 
+export function isEmbeddedPreview() {
+  try {
+    return typeof window !== 'undefined' && window.self !== window.top;
+  } catch {
+    return true;
+  }
+}
+
+let prewarmPromise = null;
+
+export function prewarmGoogleAuthPopup() {
+  if (typeof window === 'undefined' || typeof document === 'undefined') {
+    return Promise.resolve(false);
+  }
+  if (prewarmPromise) return prewarmPromise;
+
+  prewarmPromise = (async () => {
+    try {
+      if (auth._initializationPromise) {
+        await auth._initializationPromise;
+      }
+      const resolver = auth._popupRedirectResolver;
+      if (resolver && typeof resolver._initialize === 'function') {
+        await resolver._initialize(auth);
+      }
+      if (resolver && typeof resolver._originValidation === 'function') {
+        resolver._originValidation(auth).catch(() => null);
+      }
+      return true;
+    } catch {
+      prewarmPromise = null;
+      return false;
+    }
+  })();
+
+  return prewarmPromise;
+}
+
+if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  void prewarmGoogleAuthPopup();
+}
+
 export async function resolveAuthRedirect() {
   try {
     const result = await getRedirectResult(auth);
@@ -297,13 +339,7 @@ export async function signInWithGoogle() {
   const isStandalone =
     typeof window !== 'undefined' &&
     (window.matchMedia?.('(display-mode: standalone)')?.matches === true || window.navigator?.standalone === true);
-  const inIframe = (() => {
-    try {
-      return typeof window !== 'undefined' && window.self !== window.top;
-    } catch {
-      return true;
-    }
-  })();
+  const inIframe = isEmbeddedPreview();
 
   if (isStandalone && !inIframe) {
     try {
@@ -318,30 +354,42 @@ export async function signInWithGoogle() {
     return cred.user;
   } catch (err) {
     const code = err?.code || '';
-    if (
+    const isIframeRestrictedCode =
       code === 'auth/popup-blocked' ||
       code === 'auth/operation-not-supported-in-this-environment' ||
-      code === 'auth/cancelled-popup-request'
+      code === 'auth/cancelled-popup-request' ||
+      code === 'auth/web-storage-unsupported' ||
+      code === 'auth/internal-error' ||
+      code === 'auth/network-request-failed';
+
+    if (inIframe && (isIframeRestrictedCode || code === 'auth/popup-closed-by-user')) {
+      const hostname = typeof window !== 'undefined' ? window.location?.hostname || '' : '';
+      const isClosed = code === 'auth/popup-closed-by-user';
+      const title = isClosed ? 'Sign-In Popup Closed Inside Preview' : 'Preview Iframe Blocked Sign-In Popup';
+      const msg = isClosed
+        ? `The Google Sign-In popup closed before completing inside the embedded preview (${hostname}). Click "Open App in New Tab" below if your browser prevented the preview popup from staying open.`
+        : `Sign-In popup could not complete inside the embedded preview (${hostname}, code: ${code}). Click "Open App in New Tab" below or allow popups & third-party cookies for this preview host.`;
+      const iframeErr = new Error(msg, { cause: err });
+      throw Object.assign(iframeErr, {
+        code: isClosed ? 'auth/popup-closed-by-user' : 'auth/popup-blocked',
+        authDiagnostic: {
+          code: isClosed ? 'auth/popup-closed-by-user' : 'auth/popup-blocked',
+          title,
+          explanation: 'Embedded preview iframes frequently restrict Google OAuth popups or third-party storage.',
+          remediation: 'Click "Open App in New Tab" below or allow popups for this site, then sign in with Google.',
+          hostname,
+          authDomain: firebaseConfig.authDomain,
+          formattedMessage: iframeErr.message,
+        },
+      });
+    }
+
+    if (
+      !inIframe &&
+      (code === 'auth/popup-blocked' ||
+        code === 'auth/operation-not-supported-in-this-environment' ||
+        code === 'auth/cancelled-popup-request')
     ) {
-      if (inIframe) {
-        const hostname = typeof window !== 'undefined' ? window.location?.hostname || '' : '';
-        const iframeErr = new Error(
-          `Sign-In popup was blocked inside the embedded preview (${hostname}). Click "Open App in New Tab" below or allow popups for this preview host to complete Google Sign-In.`,
-          { cause: err }
-        );
-        throw Object.assign(iframeErr, {
-          code: 'auth/popup-blocked',
-          authDiagnostic: {
-            code: 'auth/popup-blocked',
-            title: 'Preview Iframe Blocked Sign-In Popup',
-            explanation: 'Google Sign-In cannot redirect inside an embedded iframe because accounts.google.com blocks framing.',
-            remediation: 'Click "Open App in New Tab" below or allow popups for this site, then sign in with Google.',
-            hostname,
-            authDomain: firebaseConfig.authDomain,
-            formattedMessage: iframeErr.message,
-          },
-        });
-      }
       try {
         await signInWithRedirect(auth, googleProvider);
         return null;
@@ -558,6 +606,7 @@ export async function saveIdentityMetadata({ identityRef, displayName, registere
     } else {
       await updateDoc(ref, {
         displayName: cleanName,
+        status: 'active',
         registeredModalities: cleanModalities,
         featureVersion: String(featureVersion || 'v2.0-multimodal').slice(0, 32),
         updatedAt: serverTimestamp(),

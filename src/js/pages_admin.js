@@ -685,8 +685,8 @@ export function renderSettings(container, { appState, navigate, applyTheme, setD
               ? `
             <div class="divider-row">
               <div class="stack-sm" style="gap:2px;flex:1;">
-                <strong>Biometric Vault Key Rotation (v1 &rarr; v2)</strong>
-                <span class="meta-line">Re-encrypts stored biometric vaults under <span class="mono">BIOGUARD_VAULT_SECRET</span> using fresh per-vault 16-byte scrypt salts.</span>
+                <strong>Biometric Vault Encryption Upgrade (v1 &rarr; v2)</strong>
+                <span class="meta-line">Migrates any older biometric vault records to the built-in project AES-256-GCM cipher using fresh per-vault 16-byte scrypt salts.</span>
               </div>
               <button type="button" class="btn btn-secondary btn-sm" id="st-rotate-vault" ${appState.health?.vault_ready ? '' : 'disabled'}>Rotate Vault Keys</button>
             </div>`
@@ -760,8 +760,8 @@ export function renderSettings(container, { appState, navigate, applyTheme, setD
       },
       {
         label: 'Biometric Vault Storage',
-        status: comps.vaultStorage?.status || (h?.vault_ready ? 'OPERATIONAL' : 'NOT CONFIGURED'),
-        note: comps.vaultStorage?.detail || (h?.vault_ready ? `AES-256-GCM (${h.vault_mode || 'env_secret_v2'})` : 'BIOGUARD_VAULT_SECRET unset'),
+        status: comps.vaultStorage?.status || (h?.vault_ready !== false ? 'OPERATIONAL' : 'OFFLINE'),
+        note: comps.vaultStorage?.detail || `AES-256-GCM (${h?.vault_mode || 'app_managed_v2'})`,
       },
       {
         label: 'Rate Limiter Backend',
@@ -813,8 +813,8 @@ export function renderSettings(container, { appState, navigate, applyTheme, setD
 
   container.querySelector('#st-rotate-vault')?.addEventListener('click', () => {
     openModal({
-      title: 'Rotate Biometric Vault Keys?',
-      bodyHtml: `<p style="font-size:13.5px;color:var(--text-secondary);">This re-encrypts vault records with fresh per-vault 16-byte random scrypt salts using the current <span class="mono">BIOGUARD_VAULT_SECRET</span>. Any legacy v1 payloads or vaults encrypted under <span class="mono">BIOGUARD_VAULT_SECRET_PREVIOUS</span> will be upgraded in place.</p>`,
+      title: 'Upgrade / Rotate Biometric Vault Records?',
+      bodyHtml: `<p style="font-size:13.5px;color:var(--text-secondary);">This re-encrypts vault records with fresh per-vault 16-byte random scrypt salts using the built-in project AES-256-GCM cipher. Any legacy payloads will be upgraded in place without requiring any manual secret environment variables.</p>`,
       footerButtons: [
         { label: 'Cancel', variant: 'btn-secondary' },
         {

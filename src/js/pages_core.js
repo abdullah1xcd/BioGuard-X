@@ -420,6 +420,12 @@ export function renderEnrollment(container, { appState, navigate }) {
     return;
   }
 
+  const preselectedRef = appState.preselectedIdentityRef || '';
+  appState.preselectedIdentityRef = '';
+  const preselectedMeta = preselectedRef
+    ? appState.identities.find((i) => i.identityRef === preselectedRef) || null
+    : null;
+
   let currentStep = 1;
   let faceVec = null;
   let faceQuality = null;
@@ -427,7 +433,8 @@ export function renderEnrollment(container, { appState, navigate }) {
   let voiceQuality = null;
   let fpTemplate = null;
   let fpQuality = null;
-  let refEditedManually = false;
+  let refEditedManually = Boolean(preselectedRef);
+  let replaceOnKeyMismatch = false;
   let activeStream = null;
   let guidanceTimer = null;
   let lastWavUrl = null;
@@ -473,6 +480,8 @@ export function renderEnrollment(container, { appState, navigate }) {
       <button type="button" class="step-pill" data-step-btn="4"><span class="step-num">4</span>Fingerprint</button>
       <button type="button" class="step-pill" data-step-btn="5"><span class="step-num">5</span>Review &amp; Enroll</button>
     </div>
+
+    <div id="be-vault-mismatch-notice" class="notice-strip warning" hidden></div>
 
     <form id="be-form" class="stack-lg">
       <!-- STEP 1 -->
@@ -625,6 +634,51 @@ export function renderEnrollment(container, { appState, navigate }) {
   const fpSt = container.querySelector('#be-fp-st');
   const fpQEl = container.querySelector('#be-fp-q');
   const fpClearBtn = container.querySelector('#be-fp-clear');
+  const vaultMismatchNoticeEl = container.querySelector('#be-vault-mismatch-notice');
+
+  const showVaultMismatchNotice = (ref) => {
+    replaceOnKeyMismatch = true;
+    if (!vaultMismatchNoticeEl) return;
+    vaultMismatchNoticeEl.hidden = false;
+    vaultMismatchNoticeEl.innerHTML = `
+      <div class="stack-sm" style="gap:4px;width:100%;">
+        <strong>Existing Vault Record Encrypted With Obsolete Key (<span class="mono">${escapeHtml(ref)}</span>)</strong>
+        <div>The stored ciphertext for this identity cannot be decrypted under the current built-in app encryption. Completing enrollment will overwrite it cleanly with a fresh AES-256-GCM record (no manual secret setup required).</div>
+      </div>
+    `;
+    vaultMismatchNoticeEl.querySelector('#be-notice-settings')?.addEventListener('click', () => navigate('settings'));
+  };
+
+  const hideVaultMismatchNotice = () => {
+    replaceOnKeyMismatch = false;
+    if (vaultMismatchNoticeEl) {
+      vaultMismatchNoticeEl.hidden = true;
+      vaultMismatchNoticeEl.innerHTML = '';
+    }
+  };
+
+  const inspectVaultKeyCompatibility = async (ref) => {
+    const cleanRef = String(ref || '').trim();
+    if (!/^[a-zA-Z0-9_-]{2,64}$/.test(cleanRef)) {
+      hideVaultMismatchNotice();
+      return;
+    }
+    const status = await fetchIdentityVaultStatus(cleanRef).catch(() => null);
+    if (refInput.value.trim() !== cleanRef) return;
+    if (status?.inVault && status?.decryptable === false) {
+      showVaultMismatchNotice(cleanRef);
+    } else {
+      hideVaultMismatchNotice();
+    }
+  };
+
+  if (preselectedRef) {
+    refInput.value = preselectedRef;
+    if (preselectedMeta?.displayName) {
+      nameInput.value = preselectedMeta.displayName;
+    }
+    inspectVaultKeyCompatibility(preselectedRef);
+  }
 
   const haltCameraUI = () => {
     stopCamera();
@@ -718,10 +772,15 @@ export function renderEnrollment(container, { appState, navigate }) {
   consentInput.addEventListener('change', updateSummary);
   refInput.addEventListener('input', () => {
     refEditedManually = refInput.value.trim().length > 0;
+    hideVaultMismatchNotice();
+  });
+  refInput.addEventListener('blur', () => {
+    inspectVaultKeyCompatibility(refInput.value);
   });
   nameInput.addEventListener('input', () => {
     if (!refEditedManually) {
       refInput.value = slugifyIdentityRef(nameInput.value);
+      hideVaultMismatchNotice();
     }
   });
 
@@ -809,6 +868,8 @@ export function renderEnrollment(container, { appState, navigate }) {
       voiceClearBtn.hidden = false;
       updateSummary();
     } catch (err) {
+      if (wavUrl) URL.revokeObjectURL(wavUrl);
+      voiceAudioSlot.hidden = true;
       voiceVec = null;
       voiceQuality = null;
       voiceClearBtn.hidden = true;
@@ -1119,117 +1180,161 @@ export function renderEnrollment(container, { appState, navigate }) {
       return;
     }
 
-    submitBtn.disabled = true;
-    submitBtn.textContent = 'Validating, Encrypting & Verifying...';
-    const hadExistingMeta = appState.identities.some((i) => i.identityRef === identityRef);
-    try {
-      const apiRes = await enrollBiometricIdentity({ identityRef, consentRecorded, samples, quality });
-      let savedMeta;
+    const runEnrollSubmission = async (forceReplaceOnMismatch) => {
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Validating, Encrypting & Verifying...';
+      const hadExistingMeta = appState.identities.some((i) => i.identityRef === identityRef);
       try {
-        savedMeta = await saveIdentityMetadata({
+        const apiRes = await enrollBiometricIdentity({
           identityRef,
-          displayName,
-          registeredModalities: apiRes.registeredModalities,
-          featureVersion: apiRes.featureVersion,
+          consentRecorded,
+          samples,
+          quality,
+          replaceOnKeyMismatch: forceReplaceOnMismatch,
         });
-      } catch (metaErr) {
-        if (!hadExistingMeta) {
-          await deleteIdentityFromVault(identityRef).catch(() => null);
+        let savedMeta;
+        try {
+          savedMeta = await saveIdentityMetadata({
+            identityRef,
+            displayName,
+            registeredModalities: apiRes.registeredModalities,
+            featureVersion: apiRes.featureVersion,
+          });
+        } catch (metaErr) {
+          if (!hadExistingMeta) {
+            await deleteIdentityFromVault(identityRef).catch(() => null);
+          }
+          throw metaErr;
         }
-        throw metaErr;
+
+        const vaultReadBack = await fetchIdentityVaultStatus(identityRef).catch(() => null);
+        const readBackConfirmed = Boolean(
+          (apiRes.persistedVerified || vaultReadBack?.inVault === true) &&
+          savedMeta?.identityRef === identityRef
+        );
+
+        await appendAuditLog({
+          action: 'identity_enrolled',
+          resourceType: 'identity',
+          resourceId: identityRef,
+          result: `Enrolled [${apiRes.registeredModalities.join(', ')}] (${apiRes.featureVersion}, readBack=${readBackConfirmed}) in ${apiRes.processingTimeMs}ms`,
+          requestId: apiRes.requestId,
+        }).catch(() => null);
+        await pushNotification({
+          title: 'Identity Enrolled',
+          message: `${displayName} (${identityRef}) enrolled with [${apiRes.registeredModalities.join(', ')}].`,
+          type: 'success',
+        }).catch(() => null);
+
+        const usedSynthetic =
+          faceQuality?.captureSource === 'test_sample' ||
+          voiceQuality?.captureSource === 'test_sample' ||
+          fpQuality?.captureSource === 'test_sample';
+
+        const warnHtml = (apiRes.qualityWarnings || []).length
+          ? `<div style="font-size:12.5px;color:var(--status-warning);">Quality notes: ${escapeHtml(apiRes.qualityWarnings.join(' · '))}</div>`
+          : '';
+
+        hideVaultMismatchNotice();
+        const resContainer = container.querySelector('#be-result');
+        resContainer.innerHTML = `
+          <section class="panel stack-md" style="border-color:rgba(20, 184, 166, 0.4);">
+            <div class="row-between">
+              <div class="stack-sm" style="gap:2px;">
+                <span class="state-text state-success">${fpTemplate ? 'Fingerprint &amp; Biometric Profile Saved &amp; Verified' : 'Biometric Template Saved &amp; Verified'}</span>
+                <h3 class="panel-title">${escapeHtml(displayName)} (<span class="mono">${escapeHtml(apiRes.identityRef)}</span>)</h3>
+              </div>
+              <div class="row-wrap">
+                <button type="button" class="btn btn-primary btn-sm" id="be-verify-now">Verify This Identity</button>
+                <button type="button" class="btn btn-secondary btn-sm" id="be-view-list">View Identities</button>
+              </div>
+            </div>
+
+            <div class="divider-list" style="font-size:13.5px;">
+              <div class="divider-row">
+                <span>Enrolled Modalities</span>
+                <span class="mono" style="text-transform:capitalize;">${escapeHtml(apiRes.registeredModalities.join(', '))}</span>
+              </div>
+              <div class="divider-row">
+                <span>Vault Storage &amp; Read-Back Verification</span>
+                <span class="state-text state-success">${readBackConfirmed ? 'AES-256-GCM Encrypted &amp; Verified on Read-Back' : 'AES-256-GCM Encrypted'}</span>
+              </div>
+              <div class="divider-row">
+                <span>Pre-Submission Quality</span>
+                <span class="mono">Validated (${apiRes.processingTimeMs} ms)</span>
+              </div>
+            </div>
+            ${usedSynthetic ? `<div class="notice-strip warning"><div><strong>Developer QA Sample Notice</strong><div>This enrollment includes synthetic QA test data and should not be treated as a real subject biometric record.</div></div></div>` : ''}
+            ${warnHtml}
+          </section>
+        `;
+        resContainer.querySelector('#be-verify-now')?.addEventListener('click', () => {
+          navigate('verification', { identityRef: apiRes.identityRef });
+        });
+        resContainer.querySelector('#be-view-list')?.addEventListener('click', () => {
+          navigate('identities');
+        });
+        showToast(`Biometric template for "${identityRef}" saved and verified.`, 'success');
+        haltCameraUI();
+      } catch (err) {
+        const code = String(err?.code || '');
+        const diagCode = String(err?.diagnosticCode || '');
+        const stage = String(err?.operationStage || '');
+        const status = Number(err?.status || 0);
+        const isFirestoreDiag = new Set([
+          'wrong_firestore_database',
+          'user_profile_missing',
+          'account_suspended',
+          'unauthorized_role',
+          'identity_metadata_missing',
+          'identity_inactive',
+          'verification_record_schema_invalid',
+          'undeployed_or_outdated_security_rules',
+          'firestore_permission_denied',
+        ]).has(diagCode);
+        const isVaultMismatch = diagCode === 'vault_decryption_failed' || code === 'vault_decryption_failed';
+        const heading =
+          stage === 'identity_enrollment'
+            ? 'Identity Metadata Enrollment Failed'
+            : diagCode === 'vault_secret_not_configured' || code === 'vault_secret_not_configured'
+            ? 'Vault Encryption Secret Not Configured'
+            : isVaultMismatch
+            ? 'Existing Vault Record Decryption Mismatch'
+            : diagCode === 'vault_storage_error'
+            ? 'Biometric Vault Persistence Failed'
+            : diagCode === 'rate_limited' || diagCode === 'rate_limiter_unavailable'
+            ? 'Rate Limit / Throttle Restriction'
+            : isFirestoreDiag || code.startsWith('firestore_')
+            ? 'Firestore Configuration / Permission Error'
+            : status >= 500 || code === 'backend_unavailable' || code === 'network_failure' || diagCode === 'network_failure'
+            ? 'Backend / Storage Request Failed'
+            : 'Enrollment Quality / Validation Rejected';
+        const diagView = buildDiagnosticErrorView(err, heading);
+        const resContainer = container.querySelector('#be-result');
+        const recoveryHtml = isVaultMismatch
+          ? `<div class="row-wrap" style="margin-top:8px;">
+              <button type="button" class="btn btn-primary btn-sm" id="be-overwrite-enroll">Overwrite Unreadable Vault Record &amp; Enroll</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="be-open-settings">Open Vault Key Settings</button>
+            </div>`
+          : '';
+        resContainer.innerHTML = `${diagView.html}${recoveryHtml}`;
+        if (isVaultMismatch) {
+          showVaultMismatchNotice(identityRef);
+          resContainer.querySelector('#be-overwrite-enroll')?.addEventListener('click', () => {
+            runEnrollSubmission(true);
+          });
+          resContainer.querySelector('#be-open-settings')?.addEventListener('click', () => {
+            navigate('settings');
+          });
+        }
+        showToast(diagView.toastText, 'danger');
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Save Biometric Template';
       }
+    };
 
-      const vaultReadBack = await fetchIdentityVaultStatus(identityRef).catch(() => null);
-      const readBackConfirmed = Boolean(
-        (apiRes.persistedVerified || vaultReadBack?.inVault === true) &&
-        savedMeta?.identityRef === identityRef
-      );
-
-      await appendAuditLog({
-        action: 'identity_enrolled',
-        resourceType: 'identity',
-        resourceId: identityRef,
-        result: `Enrolled [${apiRes.registeredModalities.join(', ')}] (${apiRes.featureVersion}, readBack=${readBackConfirmed}) in ${apiRes.processingTimeMs}ms`,
-        requestId: apiRes.requestId,
-      }).catch(() => null);
-      await pushNotification({
-        title: 'Identity Enrolled',
-        message: `${displayName} (${identityRef}) enrolled with [${apiRes.registeredModalities.join(', ')}].`,
-        type: 'success',
-      }).catch(() => null);
-
-      const usedSynthetic =
-        faceQuality?.captureSource === 'test_sample' ||
-        voiceQuality?.captureSource === 'test_sample' ||
-        fpQuality?.captureSource === 'test_sample';
-
-      const warnHtml = (apiRes.qualityWarnings || []).length
-        ? `<div style="font-size:12.5px;color:var(--status-warning);">Quality notes: ${escapeHtml(apiRes.qualityWarnings.join(' · '))}</div>`
-        : '';
-
-      const resContainer = container.querySelector('#be-result');
-      resContainer.innerHTML = `
-        <section class="panel stack-md" style="border-color:rgba(20, 184, 166, 0.4);">
-          <div class="row-between">
-            <div class="stack-sm" style="gap:2px;">
-              <span class="state-text state-success">${fpTemplate ? 'Fingerprint &amp; Biometric Profile Saved &amp; Verified' : 'Biometric Template Saved &amp; Verified'}</span>
-              <h3 class="panel-title">${escapeHtml(displayName)} (<span class="mono">${escapeHtml(apiRes.identityRef)}</span>)</h3>
-            </div>
-            <div class="row-wrap">
-              <button type="button" class="btn btn-primary btn-sm" id="be-verify-now">Verify This Identity</button>
-              <button type="button" class="btn btn-secondary btn-sm" id="be-view-list">View Identities</button>
-            </div>
-          </div>
-
-          <div class="divider-list" style="font-size:13.5px;">
-            <div class="divider-row">
-              <span>Enrolled Modalities</span>
-              <span class="mono" style="text-transform:capitalize;">${escapeHtml(apiRes.registeredModalities.join(', '))}</span>
-            </div>
-            <div class="divider-row">
-              <span>Vault Storage &amp; Read-Back Verification</span>
-              <span class="state-text state-success">${readBackConfirmed ? 'AES-256-GCM Encrypted &amp; Verified on Read-Back' : 'AES-256-GCM Encrypted'}</span>
-            </div>
-            <div class="divider-row">
-              <span>Pre-Submission Quality</span>
-              <span class="mono">Validated (${apiRes.processingTimeMs} ms)</span>
-            </div>
-          </div>
-          ${usedSynthetic ? `<div class="notice-strip warning"><div><strong>Developer QA Sample Notice</strong><div>This enrollment includes synthetic QA test data and should not be treated as a real subject biometric record.</div></div></div>` : ''}
-          ${warnHtml}
-        </section>
-      `;
-      resContainer.querySelector('#be-verify-now')?.addEventListener('click', () => {
-        navigate('verification', { identityRef: apiRes.identityRef });
-      });
-      resContainer.querySelector('#be-view-list')?.addEventListener('click', () => {
-        navigate('identities');
-      });
-      showToast(`Biometric template for "${identityRef}" saved and verified.`, 'success');
-      haltCameraUI();
-    } catch (err) {
-      const code = String(err?.code || '');
-      const stage = String(err?.operationStage || '');
-      const status = Number(err?.status || 0);
-      const heading =
-        stage === 'identity_enrollment'
-          ? 'Identity Metadata Enrollment Failed'
-          : code === 'vault_secret_not_configured'
-          ? 'Vault Encryption Secret Not Configured'
-          : code.startsWith('firestore_') || err?.diagnosticCode
-          ? 'Firestore Configuration / Permission Error'
-          : status >= 500 || code === 'backend_unavailable' || code === 'network_failure'
-          ? 'Backend / Storage Request Failed'
-          : code === 'vault_decryption_failed'
-          ? 'Existing Vault Record Decryption Mismatch'
-          : 'Enrollment Quality / Validation Rejected';
-      const diagView = buildDiagnosticErrorView(err, heading);
-      container.querySelector('#be-result').innerHTML = diagView.html;
-      showToast(diagView.toastText, 'danger');
-    } finally {
-      submitBtn.disabled = false;
-      submitBtn.textContent = 'Save Biometric Template';
-    }
+    await runEnrollSubmission(replaceOnKeyMismatch);
   });
 
   updateSummary();
@@ -1639,6 +1744,8 @@ export function renderVerification(container, { appState, navigate }) {
       voiceSt.textContent = voiceQuality.feedbackLabel || statusText;
       voiceQEl.textContent = `${voiceQuality.feedbackLabel || 'Voice Ready'} · ${voiceQuality.durationSec}s · Q:${voiceQuality.voiceQualityScore}/100 · SNR:${voiceQuality.snrEstimateDb}dB`;
     } catch (err) {
+      if (wavUrl) URL.revokeObjectURL(wavUrl);
+      voiceAudioSlot.hidden = true;
       voiceVec = null;
       voiceQuality = null;
       voiceSt.className = 'state-text state-danger';
@@ -2517,7 +2624,19 @@ export function renderVerification(container, { appState, navigate }) {
     } catch (err) {
       const stage = String(err?.operationStage || '');
       const code = String(err?.code || '');
+      const diagCode = String(err?.diagnosticCode || '');
       const status = Number(err?.status || 0);
+      const isFirestoreDiag = new Set([
+        'wrong_firestore_database',
+        'user_profile_missing',
+        'account_suspended',
+        'unauthorized_role',
+        'identity_metadata_missing',
+        'identity_inactive',
+        'verification_record_schema_invalid',
+        'undeployed_or_outdated_security_rules',
+        'firestore_permission_denied',
+      ]).has(diagCode);
       const heading =
         stage === 'identity_lookup'
           ? 'Identity Metadata Lookup Failed'
@@ -2529,13 +2648,44 @@ export function renderVerification(container, { appState, navigate }) {
           ? 'Active Liveness Challenge Required'
           : stage === 'audit_logging'
           ? 'Audit Log Persistence Error'
-          : code.startsWith('firestore_') || err?.diagnosticCode
+          : diagCode === 'vault_secret_not_configured' || code === 'vault_secret_not_configured'
+          ? 'Vault Encryption Secret Not Configured'
+          : diagCode === 'vault_decryption_failed' || code === 'vault_decryption_failed'
+          ? 'Vault Decryption / Key Mismatch Error'
+          : diagCode === 'missing_vault_template' || code === 'missing_identity'
+          ? 'Vault Template Missing for Identity'
+          : diagCode === 'rate_limited' || diagCode === 'rate_limiter_unavailable'
+          ? 'Rate Limit / Throttle Restriction'
+          : isFirestoreDiag || code.startsWith('firestore_')
           ? 'Firestore Permission / Configuration Error'
-          : status >= 500 || code === 'network_failure'
+          : status >= 500 || code === 'network_failure' || diagCode === 'network_failure'
           ? 'Backend Verification Request Failed'
           : 'Verification / Quality Gate Rejected';
       const diagView = buildDiagnosticErrorView(err, heading);
-      resultEl.innerHTML = diagView.html;
+      const isVaultMismatch = diagCode === 'vault_decryption_failed' || code === 'vault_decryption_failed';
+      const isMissingVault = diagCode === 'missing_vault_template' || code === 'missing_identity';
+      const selectedRef = String(identityRef || idSel?.value || '').trim();
+      const recoveryActionsHtml = isVaultMismatch
+        ? `<div class="row-wrap" style="margin-top:8px;">
+            ${selectedRef && appState.permissions.includes('create_identity') ? `<button type="button" class="btn btn-primary btn-sm" id="mv-reenroll-reset">Re-Enroll &amp; Reset "${escapeHtml(selectedRef)}"</button>` : ''}
+            <button type="button" class="btn btn-secondary btn-sm" id="mv-open-vault-settings">Open Vault Key Settings</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="mv-open-identities">Manage in Identities</button>
+          </div>`
+        : isMissingVault && selectedRef && appState.permissions.includes('create_identity')
+        ? `<div class="row-wrap" style="margin-top:8px;">
+            <button type="button" class="btn btn-primary btn-sm" id="mv-reenroll-reset">Enroll "${escapeHtml(selectedRef)}"</button>
+          </div>`
+        : '';
+      resultEl.innerHTML = `${diagView.html}${recoveryActionsHtml}`;
+      resultEl.querySelector('#mv-reenroll-reset')?.addEventListener('click', () => {
+        navigate('enrollment', { identityRef: selectedRef });
+      });
+      resultEl.querySelector('#mv-open-vault-settings')?.addEventListener('click', () => {
+        navigate('settings');
+      });
+      resultEl.querySelector('#mv-open-identities')?.addEventListener('click', () => {
+        navigate('identities');
+      });
       showToast(diagView.toastText, 'danger');
     } finally {
       verifyingInFlight = false;

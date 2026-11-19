@@ -60,9 +60,12 @@
           Sign in with your verified Google account via Firebase Authentication to unlock the BioGuard X workspace (Dashboard, Biometric Enrollment, Multimodal Verification, Identity Search, and Analytics).
         </p>
 
-        <div id="auth-iframe-hint" class="notice-strip warning" hidden style="flex-direction:column;gap:4px;">
+        <div id="auth-iframe-hint" class="notice-strip warning" hidden style="flex-direction:column;gap:8px;">
           <strong>Embedded Preview Notice</strong>
-          <span>Browsers often block or silence Google Sign-In popups inside embedded iframes. If Sign in with Google does not respond, click <strong>Open App in New Tab</strong> below.</span>
+          <span>Browsers often block or silence Google Sign-In popups inside embedded iframes. If Sign in with Google does not open a popup, click <strong>Open App in New Tab</strong> below or copy the URL.</span>
+          <div>
+            <button id="copy-preview-url-btn" class="btn btn-secondary btn-sm" type="button">Copy App URL</button>
+          </div>
         </div>
 
         <div id="auth-error" class="notice-strip danger" hidden></div>

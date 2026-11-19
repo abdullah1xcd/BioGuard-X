@@ -23,7 +23,19 @@ export type DiagnosticCategory =
   | 'verification_record_schema_invalid'
   | 'undeployed_or_outdated_security_rules'
   | 'network_failure'
-  | 'firestore_permission_denied';
+  | 'firestore_permission_denied'
+  | 'vault_secret_not_configured'
+  | 'vault_decryption_failed'
+  | 'vault_storage_error'
+  | 'missing_vault_template'
+  | 'feature_version_mismatch'
+  | 'biometric_quality_rejected'
+  | 'biometric_sample_invalid'
+  | 'rate_limited'
+  | 'rate_limiter_unavailable'
+  | 'cors_origin_denied'
+  | 'ai_service_unavailable'
+  | 'api_request_error';
 
 export interface ClientFirebaseConfigInput {
   projectId?: unknown;
@@ -206,6 +218,47 @@ export function classifyFirestoreDiagnostic(ctx: DiagnosticContext): ClassifiedD
     );
   }
 
+  // 1b. Backend biometric vault decryption / legacy key mismatch (must run before generic BIOGUARD_VAULT_SECRET text match)
+  if (
+    code === 'vault_decryption_failed' ||
+    code === 'vault_record_corrupt' ||
+    stage === 'vault_decryption'
+  ) {
+    return build(
+      'vault_decryption_failed',
+      'Biometric Vault Legacy Record Mismatch',
+      msg || 'This stored biometric record was encrypted with an obsolete vault key and cannot be unlocked.',
+      'Click "Re-Enroll & Reset" below to overwrite this identity with a fresh template using the built-in app encryption, or delete the old record from Identities.',
+      ctx.httpStatus || 422
+    );
+  }
+
+  // 1c. Legacy vault secret configuration error (should no longer occur with app-managed vault)
+  if (
+    code === 'vault_secret_not_configured' ||
+    stage === 'vault_configuration' ||
+    /bioguard_vault_secret/i.test(lowerMsg)
+  ) {
+    return build(
+      'vault_secret_not_configured',
+      'Biometric Vault Service Unavailable',
+      msg || 'The backend API server could not initialize biometric vault encryption.',
+      'Refresh the page or restart the backend server to re-initialize the built-in app vault.',
+      ctx.httpStatus || 503
+    );
+  }
+
+  // 1d. Backend biometric vault persistence / read-back errors
+  if (code === 'vault_readback_failed' || code === 'vault_delete_verification_failed') {
+    return build(
+      'vault_storage_error',
+      'Biometric Vault Read-Back Verification Failed',
+      msg || `Biometric vault persistence check failed at path "${ctx.path || 'biometric_vault'}".`,
+      `Verify connectivity and deployed firestore.rules on project "${projectId}" database "${databaseId}", then retry the operation.`,
+      ctx.httpStatus || 500
+    );
+  }
+
   // 2. Network / Offline / Unavailable errors
   if (
     code === 'network_failure' ||
@@ -216,7 +269,7 @@ export function classifyFirestoreDiagnostic(ctx: DiagnosticContext): ClassifiedD
     code === 'firestore_deadline_exceeded' ||
     rawCode === 'unavailable' ||
     rawCode === 'deadline-exceeded' ||
-    /client is offline|network|failed to fetch|timed out|timeout|econnrefused|enotfound/i.test(lowerMsg)
+    /client is offline|network error|network failure|failed to fetch|timed out|timeout|econnrefused|enotfound/i.test(lowerMsg)
   ) {
     return build(
       'network_failure',
@@ -366,6 +419,110 @@ export function classifyFirestoreDiagnostic(ctx: DiagnosticContext): ClassifiedD
     );
   }
 
+  // 10b. Missing vault template or feature version mismatch (HTTP 404/409/422)
+  if (code === 'missing_identity' || code === 'not_found') {
+    return build(
+      'missing_vault_template',
+      'Biometric Template Missing in Encrypted Vault',
+      msg || 'No encrypted biometric template exists in the backend vault for this identity.',
+      'Re-enroll the identity in Guided Biometric Enrollment so its AES-256-GCM vault template and Firestore metadata are synchronized.',
+      ctx.httpStatus || 404
+    );
+  }
+
+  if (code === 'feature_version_mismatch' || code === 'no_compatible_modalities') {
+    return build(
+      'feature_version_mismatch',
+      'Incompatible Biometric Feature Version or Modalities',
+      msg || 'Enrolled template version or modalities are incompatible with this verification or comparison request.',
+      'Re-enroll the affected identity with current extractors or choose modalities shared by the enrolled profile.',
+      ctx.httpStatus || 409
+    );
+  }
+
+  // 10c. Biometric quality gates, sample validation, rate limits, CORS, and AI Analyst
+  if (code === 'quality_check_failed') {
+    return build(
+      'biometric_quality_rejected',
+      'Biometric Sample Quality Gate Rejected',
+      msg || 'Captured or uploaded biometric sample did not meet minimum quality thresholds.',
+      'Recapture in better lighting/focus (face), quiet speech >=0.8s (voice), or higher-contrast ridge print >=96x96px (fingerprint).',
+      ctx.httpStatus || 422
+    );
+  }
+
+  if (
+    code === 'invalid_face_sample' ||
+    code === 'invalid_voice_sample' ||
+    code === 'invalid_fingerprint_sample' ||
+    code === 'invalid_probe_sample' ||
+    code === 'no_modalities_provided' ||
+    code === 'missing_template_or_sample' ||
+    code === 'missing_face_modality' ||
+    code === 'same_identity_comparison_not_allowed' ||
+    code === 'consent_required' ||
+    code === 'duplicate_request_replay' ||
+    code === 'invalid_display_name' ||
+    code === 'invalid_biometric_parameters' ||
+    code === 'invalid_role' ||
+    code === 'invalid_uid' ||
+    code === 'self_suspend_blocked' ||
+    code === 'empty_update'
+  ) {
+    return build(
+      'biometric_sample_invalid',
+      'Biometric Request Validation Failed',
+      msg || 'Biometric sample or request parameters failed backend validation.',
+      'Verify all required modalities, consent checkbox, and probe capture quality before resubmitting.',
+      ctx.httpStatus || 422
+    );
+  }
+
+  if (code === 'rate_limit_exceeded' || ctx.httpStatus === 429) {
+    return build(
+      'rate_limited',
+      'Request Rate Limit Exceeded',
+      msg || 'Too many requests were submitted in a short window.',
+      'Wait briefly before retrying the operation.',
+      429
+    );
+  }
+
+  if (code === 'rate_limiter_unavailable') {
+    return build(
+      'rate_limiter_unavailable',
+      'Distributed Rate Limiter Unavailable',
+      msg || `Persistent Firestore rate limiter at "${ctx.path || 'users/{uid}/rate_limits'}" could not be updated.`,
+      `Confirm firestore.rules allow rate_limits writes on "${databaseId}" and retry.`,
+      ctx.httpStatus || 503
+    );
+  }
+
+  if (code === 'cors_origin_denied') {
+    return build(
+      'cors_origin_denied',
+      'Request Origin Not Permitted by CORS Policy',
+      msg || 'The backend rejected this request Origin header.',
+      'Ensure ALLOWED_ORIGINS includes your frontend deployment URL.',
+      403
+    );
+  }
+
+  if (
+    code === 'gemini_not_configured' ||
+    code === 'gemini_request_failed' ||
+    code === 'empty_model_response' ||
+    code === 'invalid_prompt'
+  ) {
+    return build(
+      'ai_service_unavailable',
+      'AI Security Analyst Service Unavailable',
+      msg || 'The Gemini AI Security Analyst could not complete the request.',
+      'Verify GEMINI_API_KEY in server environment variables and retry.',
+      ctx.httpStatus || 503
+    );
+  }
+
   // 11. Permission denied when all preconditions were verified -> undeployed or outdated firestore.rules on the named DB!
   const isPermDenied =
     rawCode === 'permission-denied' ||
@@ -403,6 +560,22 @@ export function classifyFirestoreDiagnostic(ctx: DiagnosticContext): ClassifiedD
       `Firestore rejected "${ctx.operationType || 'write'}" at "${ctx.path || 'unknown'}" in database "${databaseId}" (PERMISSION_DENIED).`,
       `Verify user authentication/role, referenced identity status, and confirm firestore.rules has been deployed to named database "${databaseId}".`,
       403
+    );
+  }
+
+  const isFirestoreContext =
+    rawCode.startsWith('firestore') ||
+    code.startsWith('firestore_') ||
+    /firestore|users\/|biometric_vault|verification_records|rate_limits/i.test(String(ctx.path || '')) ||
+    /verification_record|identity_enrollment|identity_lookup|audit_logging|workspace_policy/i.test(stage);
+
+  if (!isFirestoreContext && ctx.httpStatus && ctx.httpStatus >= 400) {
+    return build(
+      'api_request_error',
+      'Backend API Request Failed',
+      msg || `API request failed (${ctx.httpStatus}).`,
+      'Review the request details, backend logs, and server configuration before retrying.',
+      ctx.httpStatus
     );
   }
 
@@ -683,6 +856,51 @@ export function formatFirebaseAuthDiagnostic(
     const title = 'Sign-In Popup Closed';
     const explanation = 'The Google Sign-In popup window was closed before authentication completed.';
     const remediation = 'Click "Sign in with Google" and finish selecting your verified Google account.';
+    return {
+      code: rawCode,
+      title,
+      explanation,
+      remediation,
+      hostname,
+      authDomain,
+      formattedMessage: `${title}: ${explanation} ${remediation}`,
+    };
+  }
+
+  if (rawCode === 'auth/popup-blocked') {
+    const title = 'Google Sign-In Popup Blocked';
+    const explanation = `The browser blocked the Google Sign-In popup window on "${hostname}".`;
+    const remediation = 'Allow popups for this site or open BioGuard X directly in a standalone browser tab and sign in again.';
+    return {
+      code: rawCode,
+      title,
+      explanation,
+      remediation,
+      hostname,
+      authDomain,
+      formattedMessage: `${title}: ${explanation} ${remediation}`,
+    };
+  }
+
+  if (rawCode === 'auth/web-storage-unsupported' || rawCode === 'auth/operation-not-supported-in-this-environment') {
+    const title = 'Browser Storage Restricted for Sign-In';
+    const explanation = `Third-party cookies or web storage required by Firebase Auth popup are restricted on "${hostname}".`;
+    const remediation = 'Open BioGuard X in a new browser tab or enable cookies/storage for this site, then sign in with Google.';
+    return {
+      code: rawCode,
+      title,
+      explanation,
+      remediation,
+      hostname,
+      authDomain,
+      formattedMessage: `${title}: ${explanation} ${remediation}`,
+    };
+  }
+
+  if (rawCode === 'auth/cancelled-popup-request') {
+    const title = 'Previous Sign-In Request Cancelled';
+    const explanation = 'Another Google Sign-In request superseded the previous popup attempt.';
+    const remediation = 'Complete the sign-in flow in the active Google popup window or try again.';
     return {
       code: rawCode,
       title,

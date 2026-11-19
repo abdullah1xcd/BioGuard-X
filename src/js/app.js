@@ -2,6 +2,8 @@ import {
   onAuthChanged,
   signInWithGoogle,
   resolveAuthRedirect,
+  isEmbeddedPreview,
+  prewarmGoogleAuthPopup,
   signOutUser,
   testFirestoreConnection,
   provisionUserProfile,
@@ -555,20 +557,28 @@ function initApp() {
   const signInBtn = document.getElementById('google-signin-btn');
   const signInLabel = document.getElementById('google-signin-label');
 
-  let inIframe = false;
-  try {
-    inIframe = window.self !== window.top;
-  } catch {
-    inIframe = true;
-  }
+  const inIframe = isEmbeddedPreview();
+  void prewarmGoogleAuthPopup();
 
   const openTabLink = document.getElementById('open-tab-auth-link');
+  const copyUrlBtn = document.getElementById('copy-preview-url-btn');
   if (inIframe) {
     if (authIframeHint) authIframeHint.hidden = false;
     if (openTabLink) {
       openTabLink.href = window.location.href;
       openTabLink.hidden = false;
     }
+    copyUrlBtn?.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(window.location.href);
+        showToast('App URL copied — paste it into a new browser tab to sign in.', 'success');
+      } catch {
+        if (authStatus) {
+          authStatus.hidden = false;
+          authStatus.textContent = `Open this URL in a new tab: ${window.location.href}`;
+        }
+      }
+    });
   }
 
   resolveAuthRedirect().catch((err) => {
@@ -579,7 +589,10 @@ function initApp() {
     }
   });
 
+  let activeSignInAttempt = 0;
+
   signInBtn?.addEventListener('click', async () => {
+    const attemptSeq = ++activeSignInAttempt;
     if (authError) authError.hidden = true;
     if (authStatus) {
       authStatus.hidden = false;
@@ -590,22 +603,24 @@ function initApp() {
     signInBtn.disabled = true;
     if (signInLabel) signInLabel.textContent = 'Waiting for Google Sign-In...';
 
+    const stallDelayMs = inIframe ? 3000 : 7000;
     const stallTimer = setTimeout(() => {
-      if (!appState.fbUser && signInBtn.disabled) {
+      if (attemptSeq === activeSignInAttempt && !appState.fbUser && signInBtn.disabled) {
         signInBtn.disabled = false;
         if (signInLabel) signInLabel.textContent = 'Sign in with Google';
         if (authStatus) {
           authStatus.hidden = false;
           authStatus.textContent = inIframe
-            ? `No sign-in response yet inside preview (${window.location.hostname}). Your browser may have blocked the iframe popup — click "Open App in New Tab" below to sign in cleanly.`
+            ? `No popup response inside preview (${window.location.hostname}). Your browser or preview frame may be blocking popups — click "Open App in New Tab" below to sign in cleanly.`
             : 'Still waiting for Google Sign-In popup. Make sure popups are enabled and try again.';
         }
       }
-    }, 8000);
+    }, stallDelayMs);
 
     try {
       await signInWithGoogle();
     } catch (err) {
+      if (attemptSeq !== activeSignInAttempt) return;
       const displayMsg = err?.authDiagnostic?.formattedMessage || err.message || 'Google Sign-In failed.';
       if (authError) {
         authError.hidden = false;
@@ -620,8 +635,10 @@ function initApp() {
       }
     } finally {
       clearTimeout(stallTimer);
-      signInBtn.disabled = false;
-      if (signInLabel) signInLabel.textContent = 'Sign in with Google';
+      if (attemptSeq === activeSignInAttempt) {
+        signInBtn.disabled = false;
+        if (signInLabel) signInLabel.textContent = 'Sign in with Google';
+      }
     }
   });
 

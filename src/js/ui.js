@@ -333,6 +333,8 @@ export async function recordMicrophonePCM(durationMs = 2400, onProgress) {
   const source = ctx.createMediaStreamSource(stream);
   const inputChannels = Math.max(1, Math.min(2, source.channelCount || 1));
   const processor = ctx.createScriptProcessor(4096, inputChannels, 1);
+  const silenceGain = ctx.createGain();
+  silenceGain.gain.value = 0;
   const chunks = [];
   const startedAt = performance.now();
   let sampleRate;
@@ -361,7 +363,8 @@ export async function recordMicrophonePCM(durationMs = 2400, onProgress) {
     };
 
     source.connect(processor);
-    processor.connect(ctx.destination);
+    processor.connect(silenceGain);
+    silenceGain.connect(ctx.destination);
 
     await new Promise((resolve) => setTimeout(resolve, durationMs));
     sampleRate = ctx.sampleRate;
@@ -369,6 +372,11 @@ export async function recordMicrophonePCM(durationMs = 2400, onProgress) {
     try {
       processor.onaudioprocess = null;
       processor.disconnect();
+    } catch {
+      // Ignore disconnect errors
+    }
+    try {
+      silenceGain.disconnect();
     } catch {
       // Ignore disconnect errors
     }

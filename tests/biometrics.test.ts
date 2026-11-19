@@ -579,14 +579,24 @@ test('Server Vault AES-256-GCM v2 secret enforcement, key rotation, health diagn
   };
 
   try {
-    // 1. Fail-closed when BIOGUARD_VAULT_SECRET is unset or too short
+    // 1. Works seamlessly with BIOGUARD_VAULT_SECRET & BIOGUARD_VAULT_SECRET_PREVIOUS completely unset
     delete process.env.BIOGUARD_VAULT_SECRET;
     delete process.env.BIOGUARD_VAULT_SECRET_PREVIOUS;
-    assert.throws(() => encryptVaultMap(sampleVault), VaultSecretError);
-    process.env.BIOGUARD_VAULT_SECRET = 'too-short-secret';
-    assert.throws(() => encryptVaultMap(sampleVault), VaultSecretError);
+    const defaultEnc1 = encryptVaultMap(sampleVault);
+    const defaultEnc2 = encryptVaultMap(sampleVault);
+    const parsedDef1 = JSON.parse(defaultEnc1) as { v: number; kdf: string; alg: string; salt: string; ciphertext: string };
+    const parsedDef2 = JSON.parse(defaultEnc2) as { salt: string; ciphertext: string };
+    assert.equal(parsedDef1.v, 2);
+    assert.equal(parsedDef1.kdf, 'scrypt');
+    assert.equal(parsedDef1.alg, 'aes-256-gcm');
+    assert.notEqual(parsedDef1.salt, parsedDef2.salt);
+    assert.notEqual(parsedDef1.ciphertext, parsedDef2.ciphertext);
+    assert.deepEqual(decryptVaultMap(defaultEnc1), sampleVault);
 
-    // 2. HTTP /api/v1/health stays HTTP 200 with vault_ready=false when secret is unconfigured
+    // Explicit invalid overrideSecret (<32 chars) still rejects cleanly
+    assert.throws(() => encryptVaultMap(sampleVault, 'too-short-secret'), VaultSecretError);
+
+    // 2. HTTP /api/v1/health stays HTTP 200 with vault_ready=true & app_managed_v2 even with zero env secrets
     const unconfServer = http.createServer(app);
     await new Promise<void>((resolve) => unconfServer.listen(0, '127.0.0.1', resolve));
     const unconfAddr = unconfServer.address() as AddressInfo;
@@ -594,44 +604,32 @@ test('Server Vault AES-256-GCM v2 secret enforcement, key rotation, health diagn
       const hRes = await fetch(`http://127.0.0.1:${unconfAddr.port}/api/v1/health`);
       assert.equal(hRes.status, 200);
       const hJson = (await hRes.json()) as { vault_ready: boolean; vault_mode: string };
-      assert.equal(hJson.vault_ready, false);
-      assert.equal(hJson.vault_mode, 'not_configured');
+      assert.equal(hJson.vault_ready, true);
+      assert.equal(hJson.vault_mode, 'app_managed_v2');
     } finally {
       await new Promise<void>((resolve, reject) => unconfServer.close((err) => (err ? reject(err) : resolve())));
     }
 
-    // 3. Configure strong 32+ char vault secret -> v2 per-record random salt + scrypt AES-256-GCM
+    // 3. Explicit override encryption & legacy env-secret migration -> app-managed v2
     const oldSecret = 'old-test-vault-secret-minimum-32-characters-0001';
-    const newSecret = 'new-rotated-vault-secret-minimum-32-chars-0002';
+    const encLegacy = encryptVaultMap(sampleVault, oldSecret);
+    assert.deepEqual(decryptVaultMap(encLegacy, oldSecret), sampleVault);
+
+    // 4. Legacy BIOGUARD_VAULT_SECRET record decrypts via fallback and migrates cleanly to built-in app key
     process.env.BIOGUARD_VAULT_SECRET = oldSecret;
-
-    const enc1 = encryptVaultMap(sampleVault);
-    const enc2 = encryptVaultMap(sampleVault);
-    const parsed1 = JSON.parse(enc1) as { v: number; kdf: string; alg: string; salt: string; ciphertext: string };
-    const parsed2 = JSON.parse(enc2) as { salt: string; ciphertext: string };
-    assert.equal(parsed1.v, 2);
-    assert.equal(parsed1.kdf, 'scrypt');
-    assert.equal(parsed1.alg, 'aes-256-gcm');
-    assert.notEqual(parsed1.salt, parsed2.salt);
-    assert.notEqual(parsed1.ciphertext, parsed2.ciphertext);
-    assert.deepEqual(decryptVaultMap(enc1), sampleVault);
-
-    // 4. Key rotation: previous secret -> primary secret re-encryption
-    process.env.BIOGUARD_VAULT_SECRET = newSecret;
-    process.env.BIOGUARD_VAULT_SECRET_PREVIOUS = oldSecret;
-    const meta = decryptVaultMapWithMeta(enc1);
+    const meta = decryptVaultMapWithMeta(encLegacy);
     assert.equal(meta.rotatedFromPrevious, true);
     assert.equal(meta.needsRotation, true);
     assert.deepEqual(meta.map, sampleVault);
 
-    const rotatedPayload = encryptVaultMap(meta.map);
-    delete process.env.BIOGUARD_VAULT_SECRET_PREVIOUS;
-    const rotatedMeta = decryptVaultMapWithMeta(rotatedPayload);
-    assert.equal(rotatedMeta.rotatedFromPrevious, false);
-    assert.equal(rotatedMeta.needsRotation, false);
-    assert.deepEqual(rotatedMeta.map, sampleVault);
+    const migratedPayload = encryptVaultMap(meta.map);
+    delete process.env.BIOGUARD_VAULT_SECRET;
+    const migratedMeta = decryptVaultMapWithMeta(migratedPayload);
+    assert.equal(migratedMeta.rotatedFromPrevious, false);
+    assert.equal(migratedMeta.needsRotation, false);
+    assert.deepEqual(migratedMeta.map, sampleVault);
 
-    // 5. HTTP health (configured) + strict 401 auth enforcement on protected endpoints
+    // 5. HTTP health (app_managed_v2) + strict 401 auth enforcement on protected endpoints
     const server = http.createServer(app);
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     const addr = server.address() as AddressInfo;
@@ -649,7 +647,7 @@ test('Server Vault AES-256-GCM v2 secret enforcement, key rotation, health diagn
       assert.equal(health.status, 'ok');
       assert.equal(health.feature_version, FEATURE_VERSION);
       assert.equal(health.vault_ready, true);
-      assert.equal(health.vault_mode, 'env_secret_v2');
+      assert.equal(health.vault_mode, 'app_managed_v2');
 
       const protectedGets = ['/api/v1/auth/me', '/api/v1/diagnostics'];
       for (const ep of protectedGets) {
@@ -1250,28 +1248,34 @@ test('Production fail-closed signing keys, Firestore CAS rate limiter retries & 
   const prevUpTok = process.env.UPSTASH_REDIS_REST_TOKEN;
 
   try {
-    // 1. Fail closed in production when BIOGUARD_VAULT_SECRET is missing or short
+    // 1. Challenge tokens & benchmark provenance work in production with zero BIOGUARD_VAULT_SECRET required
     process.env.NODE_ENV = 'production';
     delete process.env.BIOGUARD_VAULT_SECRET;
     delete process.env.UPSTASH_REDIS_REST_URL;
     delete process.env.UPSTASH_REDIS_REST_TOKEN;
     delete process.env.BIOGUARD_ALLOW_MEMORY_RATE_LIMIT;
 
-    assert.throws(() => createChallengeToken({ uid: 'u_prod' }), VaultSecretError);
-    assert.throws(
-      () =>
-        signBenchmarkProvenance({
-          uid: 'u_prod',
-          identityRef: 'id_1',
-          datasetCategory: 'benchmark_eval',
-          groundTruth: 'genuine',
-          isTestProbe: false,
-          sampleHash: 'abc123',
-          score: 0.9,
-          finalDecision: 'VERIFIED',
-        }),
-      VaultSecretError
-    );
+    const prodCh = createChallengeToken({ uid: 'u_prod', modalities: ['face'] });
+    assert.ok(prodCh.challengeToken.includes('.'));
+    const prodChCheck = await verifyChallengeToken({
+      token: prodCh.challengeToken,
+      uid: 'u_prod',
+      expectedModalities: ['face'],
+      consume: false,
+    });
+    assert.equal(prodChCheck.valid, true);
+    const prodSig = signBenchmarkProvenance({
+      uid: 'u_prod',
+      identityRef: 'id_1',
+      datasetCategory: 'benchmark_eval',
+      groundTruth: 'genuine',
+      isTestProbe: false,
+      sampleHash: 'abc123',
+      score: 0.9,
+      finalDecision: 'VERIFIED',
+    });
+    assert.equal(prodSig.length, 64);
+    assert.throws(() => createChallengeToken({ uid: 'u_prod', secretOverride: 'short' }), VaultSecretError);
 
     // 2. Modality-bound challenge tokens reject cross-modality reuse
     const chSecret = 'prod-challenge-signing-secret-min-32-chars-999';
@@ -2915,6 +2919,21 @@ test('Firebase Auth diagnostic helper explains auth/unauthorized-domain and auth
   );
   assert.equal(netDiag.code, 'auth/network-request-failed');
   assert.match(netDiag.title, /Network Failure/i);
+
+  const blockedDiag = formatFirebaseAuthDiagnostic(
+    { code: 'auth/popup-blocked', message: 'Popup blocked' },
+    'ais-dev.run.app'
+  );
+  assert.equal(blockedDiag.code, 'auth/popup-blocked');
+  assert.match(blockedDiag.explanation, /blocked/i);
+  assert.match(blockedDiag.remediation, /new browser tab|Allow popups/i);
+
+  const storageDiag = formatFirebaseAuthDiagnostic(
+    { code: 'auth/web-storage-unsupported', message: 'Storage blocked' },
+    'ais-dev.run.app'
+  );
+  assert.equal(storageDiag.code, 'auth/web-storage-unsupported');
+  assert.match(storageDiag.title, /Storage Restricted/i);
 });
 
 test('Server CORS allows configured Vercel deployment hosts without wildcards and rejects arbitrary hosts', async () => {
@@ -3311,5 +3330,432 @@ test('Submission UI & safety wiring: core 7-page sidebar, enrollment rollback, a
   // 1:1 Comparison guards against same-identity comparison
   assert.match(cmpText, /refA === refB/);
 });
+
+test('Diagnostic classifier cleanly distinguishes vault, quality, rate-limit, and AI errors from Firestore permissions', async () => {
+  const { classifyFirestoreDiagnostic } = await import('../src/shared/firestoreDiagnostics.ts');
+
+  const vaultMissing = classifyFirestoreDiagnostic({
+    code: 'vault_secret_not_configured',
+    operationStage: 'vault_configuration',
+    operationType: 'POST',
+    path: '/api/v1/identities/enroll',
+    httpStatus: 503,
+    message: 'BIOGUARD_VAULT_SECRET (>=32 chars) is missing or too short on the backend.',
+  });
+  assert.equal(vaultMissing.diagnosticCode, 'vault_secret_not_configured');
+  assert.equal(vaultMissing.diagnosticTitle, 'Biometric Vault Service Unavailable');
+  assert.notEqual(vaultMissing.diagnosticTitle, 'Firestore Operation Failed');
+
+  assert.equal(
+    classifyFirestoreDiagnostic({ code: 'vault_decryption_failed', httpStatus: 422, message: 'Key mismatch' }).diagnosticCode,
+    'vault_decryption_failed'
+  );
+  const vaultDecryptTextDiag = classifyFirestoreDiagnostic({
+    code: 'vault_decryption_failed',
+    operationStage: 'vault_decryption',
+    httpStatus: 422,
+    message:
+      'Unable to decrypt existing encrypted vault record with the current BIOGUARD_VAULT_SECRET. Configure BIOGUARD_VAULT_SECRET_PREVIOUS if the secret changed, or enroll under a new Identity Reference ID.',
+  });
+  assert.equal(vaultDecryptTextDiag.diagnosticCode, 'vault_decryption_failed');
+  assert.equal(vaultDecryptTextDiag.diagnosticTitle, 'Biometric Vault Legacy Record Mismatch');
+  assert.notEqual(vaultDecryptTextDiag.diagnosticCode, 'vault_secret_not_configured');
+  assert.notEqual(vaultDecryptTextDiag.diagnosticCode, 'firestore_permission_denied');
+  assert.equal(
+    classifyFirestoreDiagnostic({ code: 'vault_readback_failed', httpStatus: 500, message: 'Readback failed' }).diagnosticCode,
+    'vault_storage_error'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({ code: 'missing_identity', httpStatus: 404, message: 'No vault entry' }).diagnosticCode,
+    'missing_vault_template'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({ code: 'feature_version_mismatch', httpStatus: 409, message: 'Old template' }).diagnosticCode,
+    'feature_version_mismatch'
+  );
+  // Regression check: message containing "network" must not hijack explicit quality rejection
+  assert.equal(
+    classifyFirestoreDiagnostic({
+      code: 'quality_check_failed',
+      httpStatus: 422,
+      message: 'Neural network face quality score too low.',
+    }).diagnosticCode,
+    'biometric_quality_rejected'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({ code: 'invalid_probe_sample', httpStatus: 422, message: 'Bad probe' }).diagnosticCode,
+    'biometric_sample_invalid'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({ code: 'rate_limit_exceeded', httpStatus: 429, message: 'Slow down' }).diagnosticCode,
+    'rate_limited'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({ code: 'rate_limiter_unavailable', httpStatus: 503, message: 'Rate limiter fail' }).diagnosticCode,
+    'rate_limiter_unavailable'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({ code: 'gemini_not_configured', httpStatus: 503, message: 'No Gemini key' }).diagnosticCode,
+    'ai_service_unavailable'
+  );
+  assert.equal(
+    classifyFirestoreDiagnostic({ code: 'unexpected_server_error', httpStatus: 500, path: '/api/v1/health', message: 'Boom' }).diagnosticCode,
+    'api_request_error'
+  );
+});
+
+test('End-to-end Face + Voice + Fingerprint HTTP vault pipeline, production 503 secret check, key rotation error, and UI capture guards', async () => {
+  const prevSecret = process.env.BIOGUARD_VAULT_SECRET;
+  const prevPrevSecret = process.env.BIOGUARD_VAULT_SECRET_PREVIOUS;
+  const prevNodeEnv = process.env.NODE_ENV;
+  const origFetch = globalThis.fetch;
+
+  const { default: app } = await import('../server.ts');
+
+  const firestoreDocs = new Map<string, Record<string, unknown>>();
+  const tokens: Record<string, { localId: string; email: string; emailVerified: boolean; role: string }> = {
+    'tok-tri-op': { localId: 'uid_tri_1', email: 'tri_operator@bioguard.test', emailVerified: true, role: 'operator' },
+  };
+  firestoreDocs.set('users/uid_tri_1', {
+    fields: {
+      role: { stringValue: 'operator' },
+      status: { stringValue: 'active' },
+    },
+  });
+  firestoreDocs.set('users/uid_tri_1/system_settings/default', {
+    fields: {
+      strictLiveness: { booleanValue: false },
+    },
+  });
+
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<globalThis.Response> => {
+    const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    if (urlStr.startsWith('https://identitytoolkit.googleapis.com/v1/accounts:lookup')) {
+      const parsed = JSON.parse(String(init?.body || '{}')) as { idToken?: string };
+      const u = parsed.idToken ? tokens[parsed.idToken] : undefined;
+      if (!u) return new Response(JSON.stringify({ error: { message: 'INVALID_ID_TOKEN' } }), { status: 400 });
+      return new Response(JSON.stringify({ users: [{ localId: u.localId, email: u.email, emailVerified: u.emailVerified }] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (urlStr.startsWith('https://firestore.googleapis.com/v1/')) {
+      const marker = '/documents/';
+      const idx = urlStr.indexOf(marker);
+      const docPath = decodeURIComponent(idx >= 0 ? urlStr.slice(idx + marker.length).split('?')[0] : '');
+      const method = (init?.method || 'GET').toUpperCase();
+      if (method === 'GET' && /\/biometric_vault$/.test(docPath)) {
+        const prefix = `${docPath}/`;
+        const documents = Array.from(firestoreDocs.entries())
+          .filter(([k]) => k.startsWith(prefix))
+          .map(([k, v]) => ({ name: k, ...v }));
+        return new Response(JSON.stringify({ documents }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (method === 'GET') {
+        const doc = firestoreDocs.get(docPath);
+        if (!doc) return new Response(JSON.stringify({ error: { code: 404, status: 'NOT_FOUND', message: 'Not found' } }), { status: 404 });
+        return new Response(JSON.stringify({ name: docPath, updateTime: '2026-01-01T00:00:00Z', ...doc }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (method === 'PATCH') {
+        const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+        firestoreDocs.set(docPath, body);
+        return new Response(JSON.stringify({ name: docPath, ...body }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (method === 'DELETE') {
+        const existed = firestoreDocs.delete(docPath);
+        if (!existed) {
+          return new Response(JSON.stringify({ error: { code: 404, status: 'NOT_FOUND', message: 'Not found' } }), { status: 404 });
+        }
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+    }
+    return origFetch(input as RequestInfo, init);
+  }) as typeof fetch;
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address() as AddressInfo;
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+  const authHeaders = () => ({ Authorization: 'Bearer tok-tri-op', 'Content-Type': 'application/json' });
+
+  const makeFaceVec = (seedOffset: number, jitterSeed = 0): number[] => {
+    const vec = new Array<number>(1024);
+    let s = (seedOffset * 733 + jitterSeed * 29 + 11) >>> 0;
+    let norm = 0;
+    for (let i = 0; i < 1024; i++) {
+      s = (s * 1664525 + 1013904223) >>> 0;
+      const noise = jitterSeed === 0 ? 0 : ((s / 0xffffffff) - 0.5) * 0.035;
+      const v = Math.cos((i + 2) * (0.041 + seedOffset * 0.17)) + 0.4 * Math.sin((i + 5) * (0.067 + seedOffset * 0.21)) + noise;
+      vec[i] = v;
+      norm += v * v;
+    }
+    const scale = 1 / (Math.sqrt(norm) || 1);
+    return vec.map((v) => Number((v * scale).toFixed(6)));
+  };
+
+  try {
+    // 1. Liveness challenge succeeds in production with zero BIOGUARD_VAULT_SECRET configured
+    process.env.NODE_ENV = 'production';
+    delete process.env.BIOGUARD_VAULT_SECRET;
+    delete process.env.BIOGUARD_VAULT_SECRET_PREVIOUS;
+
+    const prodChalRes = await origFetch(`${baseUrl}/api/v1/liveness/challenge`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ modalities: ['face', 'voice'] }),
+    });
+    assert.equal(prodChalRes.status, 201);
+    const prodChalJson = (await prodChalRes.json()) as { challengeToken: string; faceChallenge: string };
+    assert.ok(prodChalJson.challengeToken);
+
+    // 2. Enroll real Face + Voice + Fingerprint templates without any env secret
+    process.env.NODE_ENV = 'test';
+
+    const faceEnroll = makeFaceVec(3, 0);
+    const faceProbe = makeFaceVec(3, 2);
+    const voiceEnrollFeat = extractVoiceFeaturesV2(
+      synthesizeSpeakerPcm({ sampleRate: 48000, durationSec: 1.8, f0Hz: 132, formantBias: 0.65, seed: 801 }),
+      48000,
+      'microphone'
+    );
+    const voiceProbeFeat = extractVoiceFeaturesV2(
+      synthesizeSpeakerPcm({ sampleRate: 16000, durationSec: 1.8, f0Hz: 132, formantBias: 0.65, noiseLevel: 0.01, seed: 802 }),
+      16000,
+      'microphone'
+    );
+    const fpEnroll = extractFingerprintTemplateFromGray128(synthesizeFingerprintGray128({ seed: 1 }));
+    const fpProbe = extractFingerprintTemplateFromGray128(synthesizeFingerprintGray128({ seed: 1, rotationDeg: 12 }));
+    assert.equal(fpEnroll.validPrint, true);
+    assert.equal(fpProbe.validPrint, true);
+
+    const enrollRes = await origFetch(`${baseUrl}/api/v1/identities/enroll`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        identityRef: 'tri_modal_user',
+        consentRecorded: true,
+        samples: {
+          face: faceEnroll,
+          voice: voiceEnrollFeat.vector,
+          fingerprint: fpEnroll,
+        },
+        quality: {
+          face: { faceQualityScore: 88, contrastStd: 38, sharpness: 19, isLiveCapture: true, antispoofScore: 0.92, livenessNetScore: 0.90, frameMotionScore: 0.03 },
+          voice: voiceEnrollFeat.stats,
+          fingerprint: {
+            qualityScore: fpEnroll.qualityScore,
+            qualityLabel: 'Good Quality',
+            validPrint: fpEnroll.validPrint,
+            sharpness: fpEnroll.sharpness,
+            ridgeDensity: fpEnroll.ridgeDensity,
+            meanCoherence: fpEnroll.meanCoherence,
+            minutiaeHeuristicCount: fpEnroll.minutiae.length,
+            captureSource: 'upload',
+          },
+        },
+      }),
+    });
+    assert.equal(enrollRes.status, 201);
+    const enrollJson = (await enrollRes.json()) as { registeredModalities: string[]; persistedVerified: boolean };
+    assert.equal(enrollJson.persistedVerified, true);
+    assert.deepEqual(enrollJson.registeredModalities, ['face', 'voice', 'fingerprint']);
+
+    // 3. Single-modality Voice verification (strictLiveness: false for voice-only) -> VERIFIED
+    const voiceRes = await origFetch(`${baseUrl}/api/v1/verification/multimodal`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        identityRef: 'tri_modal_user',
+        pipeline: 'voice_only',
+        strictLiveness: false,
+        samples: { voice: voiceProbeFeat.vector },
+        quality: { voice: voiceProbeFeat.stats },
+      }),
+    });
+    assert.equal(voiceRes.status, 200);
+    const voiceJson = (await voiceRes.json()) as { outcome: string; finalDecision: string; score: number };
+    assert.equal(voiceJson.outcome, 'match');
+    assert.equal(voiceJson.finalDecision, 'VERIFIED');
+    assert.ok(voiceJson.score >= 0.78, `Expected genuine voice score >= 0.78, got ${voiceJson.score}`);
+
+    // 4. Single-modality Fingerprint verification -> VERIFIED with NOT SUPPORTED hardware PAD honesty
+    const fpRes = await origFetch(`${baseUrl}/api/v1/verification/multimodal`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        identityRef: 'tri_modal_user',
+        pipeline: 'fingerprint_only',
+        strictLiveness: false,
+        samples: { fingerprint: fpProbe },
+        quality: {
+          fingerprint: {
+            qualityScore: fpProbe.qualityScore,
+            qualityLabel: 'Good Quality',
+            validPrint: fpProbe.validPrint,
+            sharpness: fpProbe.sharpness,
+            ridgeDensity: fpProbe.ridgeDensity,
+            meanCoherence: fpProbe.meanCoherence,
+            minutiaeHeuristicCount: fpProbe.minutiae.length,
+            captureSource: 'upload',
+          },
+        },
+      }),
+    });
+    assert.equal(fpRes.status, 200);
+    const fpJson = (await fpRes.json()) as { outcome: string; finalDecision: string; livenessStatus: string };
+    assert.equal(fpJson.outcome, 'match');
+    assert.equal(fpJson.finalDecision, 'VERIFIED');
+    assert.equal(fpJson.livenessStatus, 'NOT SUPPORTED');
+
+    // 5. Three-modal genuine verification with live face challenge -> VERIFIED across all 3 modalities
+    const chRes = await origFetch(`${baseUrl}/api/v1/liveness/challenge`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ modalities: ['face', 'voice'] }),
+    });
+    assert.equal(chRes.status, 201);
+    const chJson = (await chRes.json()) as { challengeToken: string; faceChallenge: string };
+    const frames =
+      chJson.faceChallenge === 'blink'
+        ? [{ tMs: 0, yawDeg: 0, ear: 0.32 }, { tMs: 250, yawDeg: 0.3, ear: 0.16 }, { tMs: 520, yawDeg: 0.1, ear: 0.31 }]
+        : chJson.faceChallenge === 'turn_left'
+        ? [{ tMs: 0, yawDeg: 0, ear: 0.30 }, { tMs: 250, yawDeg: -9, ear: 0.30 }, { tMs: 520, yawDeg: -14, ear: 0.30 }]
+        : [{ tMs: 0, yawDeg: 0, ear: 0.30 }, { tMs: 250, yawDeg: 9, ear: 0.30 }, { tMs: 520, yawDeg: 14, ear: 0.30 }];
+
+    const triRes = await origFetch(`${baseUrl}/api/v1/verification/multimodal`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        identityRef: 'tri_modal_user',
+        pipeline: 'three_modal',
+        strictLiveness: false,
+        challengeToken: chJson.challengeToken,
+        samples: {
+          face: faceProbe,
+          voice: voiceProbeFeat.vector,
+          fingerprint: fpProbe,
+        },
+        quality: {
+          face: { faceQualityScore: 89, contrastStd: 37, sharpness: 18, isLiveCapture: true, frameMotionScore: 0.04, antispoofScore: 0.91, livenessNetScore: 0.90, challengeEvidence: { frames } },
+          voice: voiceProbeFeat.stats,
+          fingerprint: {
+            qualityScore: fpProbe.qualityScore,
+            qualityLabel: 'Good Quality',
+            validPrint: fpProbe.validPrint,
+            sharpness: fpProbe.sharpness,
+            ridgeDensity: fpProbe.ridgeDensity,
+            meanCoherence: fpProbe.meanCoherence,
+            minutiaeHeuristicCount: fpProbe.minutiae.length,
+            captureSource: 'upload',
+          },
+        },
+      }),
+    });
+    assert.equal(triRes.status, 200);
+    const triJson = (await triRes.json()) as { outcome: string; finalDecision: string; modalitiesEvaluated: string[] };
+    assert.equal(triJson.outcome, 'match');
+    assert.equal(triJson.finalDecision, 'VERIFIED');
+    assert.deepEqual(triJson.modalitiesEvaluated, ['face', 'voice', 'fingerprint']);
+
+    // 6. Legacy record encrypted with an obsolete lost key yields HTTP 422 vault_decryption_failed and recovers cleanly
+    const { encryptVaultMap: encryptWithOverride } = await import('../server.ts');
+    const obsoletePayload = encryptWithOverride(
+      {
+        tri_modal_user: {
+          identityRef: 'tri_modal_user',
+          featureVersion: FEATURE_VERSION,
+          enrolledAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          modalities: { face: [faceEnroll] },
+        },
+      },
+      'obsolete-lost-secret-never-configured-anywhere-0001'
+    );
+    firestoreDocs.set('users/uid_tri_1/biometric_vault/tri_modal_user', {
+      fields: {
+        identityRef: { stringValue: 'tri_modal_user' },
+        encryptedPayload: { stringValue: obsoletePayload },
+      },
+    });
+    const mismatchRes = await origFetch(`${baseUrl}/api/v1/verification/multimodal`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        identityRef: 'tri_modal_user',
+        pipeline: 'face_only',
+        strictLiveness: false,
+        samples: { face: faceProbe },
+      }),
+    });
+    assert.equal(mismatchRes.status, 422);
+    const mismatchJson = (await mismatchRes.json()) as { error: string; authorizationStage?: string };
+    assert.equal(mismatchJson.error, 'vault_decryption_failed');
+    assert.equal(mismatchJson.authorizationStage, 'vault_decryption');
+
+    // 6b. Vault status returns inspectable decryptable=false instead of HTTP 422, and replaceOnKeyMismatch=true + DELETE recover cleanly
+    const mismatchStatusRes = await origFetch(`${baseUrl}/api/v1/identities/tri_modal_user/vault`, {
+      headers: authHeaders(),
+    });
+    assert.equal(mismatchStatusRes.status, 200);
+    const mismatchStatusJson = (await mismatchStatusRes.json()) as { inVault: boolean; decryptable?: boolean; error?: string };
+    assert.equal(mismatchStatusJson.inVault, true);
+    assert.equal(mismatchStatusJson.decryptable, false);
+    assert.equal(mismatchStatusJson.error, 'vault_decryption_failed');
+
+    const overwriteEnrollRes = await origFetch(`${baseUrl}/api/v1/identities/enroll`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        identityRef: 'tri_modal_user',
+        consentRecorded: true,
+        replaceOnKeyMismatch: true,
+        samples: { face: faceEnroll },
+        quality: { face: { faceQualityScore: 88, contrastStd: 38, sharpness: 19, isLiveCapture: true, antispoofScore: 0.92, livenessNetScore: 0.90, frameMotionScore: 0.03 } },
+      }),
+    });
+    assert.equal(overwriteEnrollRes.status, 201);
+
+    // Put obsolete ciphertext back and confirm DELETE still cleans up the unreadable vault doc
+    firestoreDocs.set('users/uid_tri_1/biometric_vault/tri_modal_user', {
+      fields: {
+        identityRef: { stringValue: 'tri_modal_user' },
+        encryptedPayload: { stringValue: obsoletePayload },
+      },
+    });
+    const delMismatchRes = await origFetch(`${baseUrl}/api/v1/identities/tri_modal_user`, {
+      method: 'DELETE',
+      headers: authHeaders(),
+    });
+    assert.equal(delMismatchRes.status, 200);
+    const delMismatchJson = (await delMismatchRes.json()) as { confirmedDeleted: boolean };
+    assert.equal(delMismatchJson.confirmedDeleted, true);
+
+    // 7. Static source regression assertions for Voice feedback loop, identity reactivation, and diagnostic headings
+    const uiText = fs.readFileSync(path.join(process.cwd(), 'src/js/ui.js'), 'utf8');
+    assert.match(uiText, /createGain\(\)/);
+    assert.equal(/processor\.connect\(ctx\.destination\)/.test(uiText), false, 'Microphone capture must route through muted GainNode, never directly to ctx.destination');
+
+    const fbText = fs.readFileSync(path.join(process.cwd(), 'src/js/firebase.js'), 'utf8');
+    assert.match(fbText, /updateDoc\(ref,\s*\{[\s\S]*?status:\s*'active'/);
+
+    const coreText = fs.readFileSync(path.join(process.cwd(), 'src/js/pages_core.js'), 'utf8');
+    assert.match(coreText, /replaceOnKeyMismatch/);
+    assert.equal(/Biometric Vault Secret Missing on Backend/.test(coreText), false);
+    assert.equal(/code\.startsWith\('firestore_'\) \|\| err\?\.diagnosticCode\b/.test(coreText), false);
+  } finally {
+    globalThis.fetch = origFetch;
+    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    if (prevSecret === undefined) delete process.env.BIOGUARD_VAULT_SECRET;
+    else process.env.BIOGUARD_VAULT_SECRET = prevSecret;
+    if (prevPrevSecret === undefined) delete process.env.BIOGUARD_VAULT_SECRET_PREVIOUS;
+    else process.env.BIOGUARD_VAULT_SECRET_PREVIOUS = prevPrevSecret;
+    if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prevNodeEnv;
+  }
+});
+
 
 

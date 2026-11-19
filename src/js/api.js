@@ -119,11 +119,23 @@ export function requestLivenessChallenge(modalities) {
   });
 }
 
-export function enrollBiometricIdentity({ identityRef, consentRecorded, samples, quality }) {
+export function enrollBiometricIdentity({
+  identityRef,
+  consentRecorded,
+  samples,
+  quality,
+  replaceOnKeyMismatch = false,
+}) {
   return apiFetch('/api/v1/identities/enroll', {
     method: 'POST',
     headers: { 'Idempotency-Key': makeIdempotencyKey() },
-    body: JSON.stringify({ identityRef, consentRecorded, samples, quality }),
+    body: JSON.stringify({
+      identityRef,
+      consentRecorded,
+      samples,
+      quality,
+      ...(replaceOnKeyMismatch ? { replaceOnKeyMismatch: true } : {}),
+    }),
   });
 }
 

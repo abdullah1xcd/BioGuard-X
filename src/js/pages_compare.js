@@ -12,6 +12,30 @@ import { appendAuditLog } from './firebase.js';
 import { FUSION_POLICIES } from './config.js';
 import { escapeHtml, fmtPct, showToast, loadImageFile, recordMicrophonePCM, openCameraStream, createLiveVideoElement } from './ui.js';
 
+function renderCompareDiagnosticError(err, fallbackHeading) {
+  const diagCode = String(err?.diagnosticCode || '');
+  const diagTitle = String(err?.diagnosticTitle || fallbackHeading || 'Operation Failed');
+  const diagExplanation = String(err?.diagnosticExplanation || err?.message || 'Request failed.');
+  const diagRemediation = String(err?.diagnosticRemediation || '');
+  const stage = String(err?.operationStage || '');
+  const status = Number(err?.status || 0);
+  const projectId = String(err?.projectId || '');
+  const databaseId = String(err?.databaseId || '');
+  const reqId = String(err?.requestId || '');
+  const parts = [
+    diagCode ? `diag=${diagCode}` : '',
+    stage ? `stage=${stage}` : '',
+    status ? `http=${status}` : '',
+    projectId ? `project=${projectId}` : '',
+    databaseId ? `db=${databaseId}` : '',
+    reqId ? `req=${reqId}` : '',
+  ].filter(Boolean);
+  return {
+    html: `<div class="notice-strip danger"><div><strong>${escapeHtml(diagTitle)}</strong><div style="margin-top:3px;">${escapeHtml(diagExplanation)}</div>${diagRemediation ? `<div style="font-size:12.5px;margin-top:6px;"><strong>Recommended Fix:</strong> ${escapeHtml(diagRemediation)}</div>` : ''}${parts.length ? `<div class="meta-line mono" style="margin-top:6px;">${escapeHtml(parts.join(' · '))}</div>` : ''}</div></div>`,
+    toastText: `${diagTitle}: ${diagExplanation}`.slice(0, 220),
+  };
+}
+
 export function renderCompareIdentities(container, { appState, navigate }) {
   if (!appState.permissions.includes('perform_verification')) {
     container.innerHTML = `<div class="notice-strip danger"><div><strong>Permission Denied</strong><div>Your role (${escapeHtml(appState.profile?.role)}) does not have permission for 1:1 comparison or 1:N identification search.</div></div></div>`;
@@ -367,8 +391,9 @@ export function renderCompareIdentities(container, { appState, navigate }) {
         </div>
       `;
     } catch (err) {
-      outEl.innerHTML = `<div class="notice-strip danger"><div><strong>Comparison Unavailable</strong><div>${escapeHtml(err.message)}</div></div></div>`;
-      showToast(err.message, 'danger');
+      const diag = renderCompareDiagnosticError(err, '1:1 Comparison Unavailable');
+      outEl.innerHTML = diag.html;
+      showToast(diag.toastText, 'danger');
     } finally {
       btn.disabled = false;
       btn.textContent = 'Compare Identities (1:1)';
@@ -688,8 +713,9 @@ export function renderCompareIdentities(container, { appState, navigate }) {
         b.addEventListener('click', () => navigate('verification', { identityRef: b.dataset.verifyCand }));
       });
     } catch (err) {
-      outEl.innerHTML = `<div class="notice-strip danger"><div><strong>1:N Search Error</strong><div>${escapeHtml(err.message)}</div></div></div>`;
-      showToast(err.message, 'danger');
+      const diag = renderCompareDiagnosticError(err, '1:N Vault Search Unavailable');
+      outEl.innerHTML = diag.html;
+      showToast(diag.toastText, 'danger');
     } finally {
       btn.disabled = false;
       btn.textContent = 'Search Vault (1:N)';
